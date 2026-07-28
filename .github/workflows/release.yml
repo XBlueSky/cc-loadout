@@ -51,6 +51,32 @@ jobs:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+      # release-plz only bumps Cargo.toml/Cargo.lock/CHANGELOG.md, but
+      # .claude-plugin/plugin.json carries the same version and
+      # tests/test_plugin_manifest.sh asserts the two match. Without this the
+      # release PR would land a version mismatch and turn master red.
+      - name: sync plugin.json onto the release PR
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          branch="$(gh pr list --state open --json headRefName,title \
+            --jq '[.[] | select(.title | startswith("chore: release"))][0].headRefName')"
+          if [ -z "$branch" ] || [ "$branch" = "null" ]; then
+            echo "no open release PR — nothing to sync"; exit 0
+          fi
+          git fetch origin "$branch"
+          git checkout -B "$branch" "origin/$branch"
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          current="$(sed -n 's/.*"version": "\(.*\)".*/\1/p' .claude-plugin/plugin.json | head -1)"
+          if [ "$version" = "$current" ]; then
+            echo "plugin.json already at ${version}"; exit 0
+          fi
+          sed -i "s/\"version\": \"${current}\"/\"version\": \"${version}\"/" .claude-plugin/plugin.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: sync plugin.json version to ${version}" .claude-plugin/plugin.json
+          git push origin "$branch"
+          echo "synced plugin.json ${current} -> ${version} on ${branch}"
 
   # Decide whether there is a release awaiting binaries. Derived from
   # Cargo.toml + the GitHub API rather than from action outputs, so it stays
