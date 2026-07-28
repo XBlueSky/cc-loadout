@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-07-28
+
+### CI/CD
+
+- align release targets and asset layout with cc-uplink
+- sync plugin.json version onto the release PR
+- bump actions/checkout to v5
+
 ## [0.1.17] - 2026-07-28
 
 ### Features
