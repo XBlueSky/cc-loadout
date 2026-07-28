@@ -1,0 +1,14 @@
+{
+  "name": "cc-loadout",
+  "owner": {
+    "name": "XBlueSky",
+    "email": "xbluesky@users.noreply.github.com"
+  },
+  "plugins": [
+    {
+      "name": "cc-loadout",
+      "source": "./",
+      "description": "Guided Claude Code profile creation plus multi-account switching"
+    }
+  ]
+}

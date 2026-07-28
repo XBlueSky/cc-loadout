@@ -1,0 +1,5 @@
+# Cargo Audit configuration.
+# https://github.com/rustsec/rustsec/blob/main/cargo-audit/audit.toml.example
+[advisories]
+# No accepted-risk advisories yet; cc-loadout's dependency set is minimal.
+ignore = []

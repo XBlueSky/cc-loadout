@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel superseded runs on the same ref (e.g. a force-push to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # Mirrors the check gate documented in CONTRIBUTING.md. The toolchain comes
+  # from rust-toolchain.toml (stable + rustfmt + clippy), which rustup installs
+  # automatically on first cargo invocation.
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --verbose --all-features
+        timeout-minutes: 30
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt -- --check
+
+  # Bash installer/registry tests. Needs bash, jq and git — all present on the
+  # GitHub-hosted Ubuntu image.
+  shell-tests:
+    name: shell tests
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: ./tests/run.sh
+
+  # Advisory-only, matching the previous CI: a new upstream advisory should be
+  # visible without blocking an unrelated change. See .cargo/audit.toml.
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  # Proves the release target still compiles on every change, so a tag push
+  # cannot be the first time we discover a musl break.
+  build:
+    name: build (musl)
+    runs-on: ubuntu-latest
+    needs: [test, clippy, fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --target x86_64-unknown-linux-musl --verbose
+      - name: verify binary exists
+        run: test -f target/x86_64-unknown-linux-musl/release/cc-loadout

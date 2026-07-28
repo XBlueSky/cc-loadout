@@ -1,0 +1,27 @@
+[package]
+name = "cc-loadout"
+version = "0.1.17"
+edition = "2021"
+description = "Claude Code loadout manager (account + plugin profiles)"
+license = "MIT"
+repository = "https://github.com/xbluesky/cc-loadout"
+rust-version = "1.80"
+
+[[bin]]
+name = "cc-loadout"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+fs2 = "0.4"
+anyhow = "1"
+time = { version = "0.3", features = ["local-offset", "formatting"] }
+ratatui = "0.29"
+uuid = { version = "1.20.0", features = ["v4"] }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"

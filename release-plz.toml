@@ -1,0 +1,49 @@
+[workspace]
+publish = false
+git_only = true
+git_tag_enable = true
+git_release_enable = true
+git_tag_name = "v{{ version }}"
+release_always = true
+semver_check = true
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+"""
+body = """
+## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.breaking %}**BREAKING** {% endif %}{{ commit.message }}
+{%- endfor %}
+{% endfor %}
+"""
+
+[[changelog.commit_parsers]]
+message = "^feat"
+group = "Features"
+[[changelog.commit_parsers]]
+message = "^fix"
+group = "Bug Fixes"
+[[changelog.commit_parsers]]
+message = "^docs"
+group = "Documentation"
+[[changelog.commit_parsers]]
+message = "^refactor"
+group = "Refactoring"
+[[changelog.commit_parsers]]
+message = "^test"
+group = "Testing"
+[[changelog.commit_parsers]]
+message = "^chore"
+group = "Miscellaneous"
+[[changelog.commit_parsers]]
+message = "^ci"
+group = "CI/CD"
+[[changelog.commit_parsers]]
+message = "\\[skip ci\\]"
+skip = true

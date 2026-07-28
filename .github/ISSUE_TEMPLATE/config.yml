@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/xbluesky/cc-loadout/security/advisories/new
+    about: >-
+      cc-loadout handles Claude Code credentials. Report security problems
+      privately here, never as a public issue. See SECURITY.md for what to
+      include and what to redact.

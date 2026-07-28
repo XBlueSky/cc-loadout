@@ -1,0 +1,20 @@
+# User-customized config (template lives at profiles.example.json).
+# install.sh seeds ~/.claude/profiles/profiles.json from the template; the
+# canonical config thereafter lives there, not in the repo working tree.
+/profiles.json
+
+# Superpowers / brainstorming intermediate artifacts — kept locally, not committed
+docs/superpowers/
+*.plan.md
+plans/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Rust build output
+/target
+
+# Cargo cache in CI (keep audit.toml tracked)
+/.cargo/*
+!/.cargo/audit.toml

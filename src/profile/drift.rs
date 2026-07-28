@@ -1,0 +1,228 @@
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use crate::profile::config::Profiles;
+use crate::profile::detect;
+use crate::profile::discover::{Inventory, RepoSignal, SuggestedProfile};
+use crate::profile::plugins::managed_keys;
+
+/// Managed plugin keys that are no longer installed (dead references in the config).
+pub fn stale_refs(inv: &Inventory, working: &Profiles) -> Vec<String> {
+    let installed: BTreeSet<&str> = inv.plugins.iter().map(|p| p.key.as_str()).collect();
+    let mut out: Vec<String> = managed_keys(working)
+        .into_iter()
+        .filter(|k| !installed.contains(k.as_str()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Managed, profile-specific (non-universal) plugins that are still enabled at
+/// global scope — i.e. global settings drifted from what this config expects.
+pub fn global_drift(working: &Profiles, global_enabled: &[String]) -> Vec<String> {
+    let universal: BTreeSet<&str> = working.universal.iter().map(String::as_str).collect();
+    let enabled: BTreeSet<&str> = global_enabled.iter().map(String::as_str).collect();
+    let mut out: Vec<String> = managed_keys(working)
+        .into_iter()
+        .filter(|k| !universal.contains(k.as_str()) && enabled.contains(k.as_str()))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Uncovered repos as they would be AFTER merging `suggested` profiles into
+/// `working` — the post-scan drift. Mirrors the working-merge in
+/// `ProfileView::apply_scan`, so the value can be computed once on the job
+/// thread and reused by the UI thread without a second per-repo filesystem walk.
+pub fn uncovered_post_merge(
+    working: &Profiles,
+    suggested: &[SuggestedProfile],
+    repos: &[RepoSignal],
+) -> Vec<String> {
+    let mut merged = working.clone();
+    for sp in suggested {
+        merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
+            crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
+        });
+    }
+    let inv = Inventory {
+        plugins: Vec::new(),
+        repos: repos.to_vec(),
+        suggested_profiles: Vec::new(),
+    };
+    uncovered_repos(&inv, &merged)
+}
+
+/// Scanned repos that match no profile in `working` (sorted by path).
+pub fn uncovered_repos(inv: &Inventory, working: &Profiles) -> Vec<String> {
+    let mut out: Vec<String> = inv
+        .repos
+        .iter()
+        .filter(|r| detect::detect_profiles(Path::new(&r.path), working).is_empty())
+        .map(|r| r.path.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The four re-edit drift signals.
+pub struct Drift {
+    pub new_unassigned: Vec<String>,
+    pub stale: Vec<String>,
+    pub uncovered: Vec<String>,
+    pub global: Vec<String>,
+}
+
+impl Drift {
+    pub fn review_count(&self) -> usize {
+        self.new_unassigned.len() + self.stale.len() + self.uncovered.len() + self.global.len()
+    }
+
+    // Only called from tests; the binary render path uses review_count() directly.
+    #[allow(dead_code)]
+    pub fn is_clean(&self) -> bool {
+        self.review_count() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::config::Profiles;
+    use crate::profile::discover::{Inventory, PluginInfo, SharedSignals, SuggestedProfile};
+
+    #[test]
+    fn uncovered_post_merge_covers_repos_via_suggested_profiles() {
+        // A repo that matches no EXISTING profile but IS covered by a suggested
+        // one (merged in) must not count as uncovered — mirroring apply_scan.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("svc");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
+        let path = repo.to_string_lossy().into_owned();
+        let signal = RepoSignal {
+            path: path.clone(),
+            marker_files: vec!["Cargo.toml".into()],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+        };
+        // Empty working, but a suggested profile keyed on Cargo.toml.
+        let suggested = vec![SuggestedProfile {
+            name: "rust".into(),
+            repos: vec![path.clone()],
+            shared_signals: SharedSignals {
+                marker_files: vec!["Cargo.toml".into()],
+                ..Default::default()
+            },
+        }];
+        let out = uncovered_post_merge(
+            &Profiles::default(),
+            &suggested,
+            std::slice::from_ref(&signal),
+        );
+        assert!(
+            out.is_empty(),
+            "repo covered by a merged suggested profile is not uncovered: {out:?}"
+        );
+
+        // With NO suggested profile to merge, the same repo IS uncovered.
+        let out2 = uncovered_post_merge(&Profiles::default(), &[], &[signal]);
+        assert_eq!(
+            out2,
+            vec![path],
+            "unmatched repo must be reported uncovered"
+        );
+    }
+
+    fn inv(keys: &[&str]) -> Inventory {
+        Inventory {
+            plugins: keys
+                .iter()
+                .map(|k| PluginInfo {
+                    key: k.to_string(),
+                    scopes: vec![],
+                    description: None,
+                })
+                .collect(),
+            repos: vec![],
+            suggested_profiles: vec![],
+        }
+    }
+    fn cfg() -> Profiles {
+        serde_json::from_str(
+            r#"{"universal":["serena@x"],"profiles":{"rust":{"plugins":["ra@x","gone@x"],"detect":{}}}}"#,
+        ).unwrap()
+    }
+
+    #[test]
+    fn stale_refs_are_managed_minus_installed() {
+        // installed: serena, ra (NOT gone). managed: serena, ra, gone. stale = [gone].
+        let got = stale_refs(&inv(&["serena@x", "ra@x"]), &cfg());
+        assert_eq!(got, vec!["gone@x".to_string()]);
+    }
+
+    #[test]
+    fn global_drift_is_nonuniversal_managed_enabled_globally() {
+        // managed: serena(universal), ra, gone. global currently enables ra@x and serena@x.
+        // serena is universal (allowed); ra is profile-specific but globally enabled → drift.
+        let got = global_drift(&cfg(), &["serena@x".to_string(), "ra@x".to_string()]);
+        assert_eq!(got, vec!["ra@x".to_string()]);
+    }
+
+    #[test]
+    fn uncovered_repos_are_those_matching_no_profile() {
+        use crate::profile::discover::RepoSignal;
+        let tmp = tempfile::tempdir().unwrap();
+        let rust = tmp.path().join("rusty");
+        std::fs::create_dir_all(&rust).unwrap();
+        std::fs::write(rust.join("Cargo.toml"), "[package]").unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let mut inv = inv(&[]);
+        inv.repos = vec![
+            RepoSignal {
+                path: rust.display().to_string(),
+                marker_files: vec!["Cargo.toml".into()],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+            },
+            RepoSignal {
+                path: plain.display().to_string(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+            },
+        ];
+        let working: Profiles = serde_json::from_str(
+            r#"{"profiles":{"rust":{"plugins":[],"detect":{"marker_files":["Cargo.toml"]}}}}"#,
+        )
+        .unwrap();
+        let got = uncovered_repos(&inv, &working);
+        // the rust repo matches; the plain repo does not.
+        assert_eq!(got.len(), 1);
+        assert!(got[0].ends_with("plain"));
+    }
+
+    #[test]
+    fn review_count_sums_all_four() {
+        let d = Drift {
+            new_unassigned: vec!["a".into()],
+            stale: vec!["b".into(), "c".into()],
+            uncovered: vec![],
+            global: vec!["d".into()],
+        };
+        assert_eq!(d.review_count(), 4);
+        assert!(!d.is_clean());
+        assert!(Drift {
+            new_unassigned: vec![],
+            stale: vec![],
+            uncovered: vec![],
+            global: vec![]
+        }
+        .is_clean());
+    }
+}

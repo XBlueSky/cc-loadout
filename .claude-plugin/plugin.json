@@ -1,0 +1,11 @@
+{
+  "name": "cc-loadout",
+  "description": "Guided Claude Code profile creation plus multi-account switching. Bundles the /cc-loadout:init skill; the cc-loadout CLI does the discovery and writing.",
+  "version": "0.1.17",
+  "author": {
+    "name": "XBlueSky",
+    "email": "xbluesky@users.noreply.github.com"
+  },
+  "homepage": "https://github.com/xbluesky/cc-loadout",
+  "license": "MIT"
+}

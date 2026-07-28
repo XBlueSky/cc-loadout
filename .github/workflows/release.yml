@@ -1,0 +1,115 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+  # Lets you re-run asset upload for the current Cargo.toml version without
+  # waiting for a new release commit.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Never let two release runs race on tags or on the release PR.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # release-plz derives the next version and the CHANGELOG from Conventional
+  # Commit subjects. `release` tags + creates the GitHub Release once a version
+  # bump has landed on master; `release-pr` then opens/refreshes the PR that
+  # carries the next bump. Config lives in release-plz.toml (publish = false —
+  # nothing is pushed to crates.io).
+  #
+  # NOTE: with the default GITHUB_TOKEN, PRs and tags created here do not
+  # trigger other workflows. Add a PAT as the RELEASE_PLZ_TOKEN secret to get
+  # CI running on the release PR; asset upload below does not depend on it.
+  release-plz:
+    name: release-plz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # release-plz needs full history + every v* tag to find the last
+          # release and compute the next version; a shallow clone makes it
+          # treat the run as an initial release and silently skip the bump.
+          fetch-depth: 0
+      - name: release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+
+  # Decide whether there is a release awaiting binaries. Derived from
+  # Cargo.toml + the GitHub API rather than from action outputs, so it stays
+  # correct on a manual workflow_dispatch too.
+  check:
+    name: check for release
+    runs-on: ubuntu-latest
+    needs: [release-plz]
+    outputs:
+      tag: ${{ steps.probe.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: probe
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$version" ] || { echo "could not read version from Cargo.toml" >&2; exit 1; }
+          if gh release view "v${version}" >/dev/null 2>&1; then
+            echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+            echo "release v${version} exists — will attach binaries"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "no release for v${version} yet — nothing to attach"
+          fi
+
+  assets:
+    name: ${{ matrix.target }}
+    needs: [check]
+    if: needs.check.outputs.tag != ''
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }} --verbose
+      - name: stage asset
+        run: |
+          bin="target/${{ matrix.target }}/release/cc-loadout"
+          test -f "$bin" || { echo "missing binary: $bin" >&2; exit 1; }
+          cp "$bin" "cc-loadout-${{ matrix.target }}"
+      - name: upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.check.outputs.tag }}" \
+            "cc-loadout-${{ matrix.target }}" --clobber

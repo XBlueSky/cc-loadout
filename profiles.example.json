@@ -1,0 +1,66 @@
+{
+  "scan_roots": [
+    "/home/you/code",
+    "/home/you/work"
+  ],
+  "universal": [
+    "cortex@cortex",
+    "superpowers@claude-plugins-official",
+    "code-review@claude-plugins-official",
+    "repomix-mcp@repomix",
+    "repomix-commands@repomix",
+    "repomix-explorer@repomix",
+    "serena@claude-plugins-official",
+    "learning-output-style@claude-plugins-official",
+    "document-skills@anthropic-agent-skills",
+    "obsidian@obsidian-skills"
+  ],
+  "profiles": {
+    "frontend": {
+      "plugins": [
+        "ui-ux-pro-max@ui-ux-pro-max-skill",
+        "impeccable@impeccable",
+        "frontend-design@claude-plugins-official"
+      ],
+      "detect": {
+        "marker_globs": ["*.vue"],
+        "content": [
+          { "file": "package.json", "word": "react" },
+          { "file": "package.json", "word": "vue" },
+          { "file": "package.json", "word": "svelte" }
+        ]
+      }
+    },
+    "plugin-dev": {
+      "plugins": [
+        "plugin-dev@claude-plugins-official",
+        "skill-creator@claude-plugins-official"
+      ],
+      "detect": {
+        "marker_files": [".claude-plugin/marketplace.json", "plugin.json"]
+      }
+    },
+    "ai-side": {
+      "plugins": [
+        "rag@ai-research-skills",
+        "prompt-engineering@ai-research-skills"
+      ],
+      "detect": {
+        "content": [
+          { "file": "requirements.txt", "word": "langchain" },
+          { "file": "requirements.txt", "word": "openai" },
+          { "file": "pyproject.toml", "word": "anthropic" },
+          { "file": "pyproject.toml", "word": "llamaindex" }
+        ]
+      }
+    },
+    "work": {
+      "plugins": [
+        "your-internal-tooling@your-marketplace"
+      ],
+      "detect": {
+        "path_prefixes": ["/home/you/work/"]
+      }
+    }
+  }
+}

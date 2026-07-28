@@ -1,0 +1,933 @@
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::path::Path;
+
+fn write_login(home: &Path, email: &str) {
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(
+        home.join(".claude").join(".credentials.json"),
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"tok-{email}"}}}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".claude.json"),
+        format!(r#"{{"oauthAccount":{{"emailAddress":"{email}"}}}}"#),
+    )
+    .unwrap();
+}
+
+/// The ONLY constructor for the cc-loadout binary under test. It pins HOME and
+/// XDG_DATA_HOME to throwaway temp dirs and removes CLAUDE_CONFIG_DIR, so no test
+/// (and no `claude` subprocess it might spawn) can ever read or write the
+/// developer's real ~/.claude config. It ALSO puts a file-backed fake `crontab`
+/// first on PATH, so no test can splice the developer's real user crontab — even one
+/// that forgets to patch PATH itself (the gap that once wiped a live prime schedule).
+/// Do NOT call `Command::cargo_bin("cc-loadout")` directly anywhere in this file —
+/// always go through `cmd()` and chain extra `.env(...)` / `.current_dir(...)` as
+/// needed. A test that must inspect the table overrides PATH with its own
+/// `fake_crontab_path(dir)` and reads that dir's `tab`.
+fn cmd(home: &Path, data: &Path) -> Command {
+    let mut c = Command::cargo_bin("cc-loadout").unwrap();
+    // Default crontab isolation. The fake bin lives under the caller-owned `data`
+    // temp dir (test lifetime) so it outlives the spawned command; a tempdir created
+    // here would be dropped on return, leaving PATH pointing at a deleted directory.
+    let fakebin = data.join(".fakebin");
+    std::fs::create_dir_all(&fakebin).unwrap();
+    let fake_path = fake_crontab_path(&fakebin);
+    c.env("HOME", home)
+        .env("XDG_DATA_HOME", data)
+        .env("PATH", fake_path)
+        .env_remove("CLAUDE_CONFIG_DIR");
+    c
+}
+
+/// Install a file-backed fake `crontab` in `bin_dir` and return the PATH string to
+/// hand the command (fake dir first). Unlike a `>/dev/null` stub, this persists the
+/// table to `bin_dir/tab`, so the binary's write-then-read-back verification (which
+/// guards against a `crontab` that silently swallows writes) round-trips instead of
+/// failing — while still never touching the developer's real user crontab.
+fn fake_crontab_path(bin_dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let store = bin_dir.join("tab");
+    let script = format!(
+        "#!/bin/sh\nSTORE='{s}'\nif [ \"$1\" = '-l' ]; then [ -f \"$STORE\" ] && cat \"$STORE\" || exit 1; elif [ \"$1\" = '-' ]; then cat > \"$STORE\"; else exit 2; fi\n",
+        s = store.display()
+    );
+    let bin = bin_dir.join("crontab");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
+#[test]
+fn full_account_cycle() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    write_login(home, "personal@x");
+    cmd(home, data)
+        .args(["account", "add", "personal"])
+        .assert()
+        .success();
+
+    cmd(home, data)
+        .args(["account", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("work@x").and(predicate::str::contains("personal@x")));
+
+    cmd(home, data)
+        .args(["account", "use", "work"])
+        .assert()
+        .success();
+
+    let cfg = std::fs::read_to_string(home.join(".claude.json")).unwrap();
+    assert!(cfg.contains("work@x"));
+    let creds = std::fs::read_to_string(home.join(".claude").join(".credentials.json")).unwrap();
+    assert!(creds.contains("tok-work@x"));
+
+    cmd(home, data)
+        .args(["account", "current"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("work"));
+
+    cmd(home, data)
+        .args(["account", "rm", "personal"])
+        .assert()
+        .success();
+    cmd(home, data)
+        .args(["account", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("personal@x").not());
+}
+
+fn write_profiles(home: &Path) -> std::path::PathBuf {
+    let p = home.join("profiles.json");
+    std::fs::write(
+        &p,
+        r#"{
+            "scan_roots": [],
+            "universal": ["u@m"],
+            "profiles": {
+                "frontend": {"plugins": ["fe@m"], "detect": {"marker_globs": ["*.vue"]}},
+                "backend": {"plugins": ["be@m"], "detect": {"marker_files": ["INFO"]}}
+            }
+        }"#,
+    )
+    .unwrap();
+    p
+}
+
+#[test]
+fn profile_detect_and_apply_cycle() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let profiles = write_profiles(hdir.path());
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+
+    let run = |args: &[&str]| {
+        let mut c = cmd(hdir.path(), ddir.path());
+        c.env("CC_LOADOUT_PROFILES", &profiles).args(args);
+        c
+    };
+
+    run(&["profile", "detect", repo.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("frontend"));
+
+    run(&["profile", "apply", repo.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(repo.path().join(".claude").join("settings.local.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(settings["enabledPlugins"]["fe@m"], serde_json::json!(true));
+    assert_eq!(settings["enabledPlugins"]["u@m"], serde_json::json!(true));
+    assert_eq!(settings["enabledPlugins"]["be@m"], serde_json::json!(false));
+
+    run(&["profile", "status", repo.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fe@m"));
+}
+
+#[test]
+fn account_use_does_not_touch_profile_settings() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    // Two accounts.
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    write_login(home, "personal@x");
+    cmd(home, data)
+        .args(["account", "add", "personal"])
+        .assert()
+        .success();
+
+    // A repo with an existing per-repo settings.local.json (profile slot state).
+    let settings = repo.path().join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings,
+        r#"{"enabledPlugins":{"ondemand@m":true},"theme":"dark"}"#,
+    )
+    .unwrap();
+    let before = std::fs::read(&settings).unwrap();
+
+    // Switch the ACCOUNT slot.
+    cmd(home, data)
+        .args(["account", "use", "work"])
+        .assert()
+        .success();
+
+    // The PROFILE slot's file must be byte-identical.
+    let after = std::fs::read(&settings).unwrap();
+    assert_eq!(
+        before, after,
+        "account use must not mutate profile settings.local.json"
+    );
+}
+
+#[test]
+fn profile_apply_does_not_touch_account_credentials() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+    let profiles = write_profiles(home);
+
+    // Account slot state: a live login.
+    write_login(home, "work@x");
+    let creds_path = home.join(".claude").join(".credentials.json");
+    let config_path = home.join(".claude.json");
+    let creds_before = std::fs::read(&creds_path).unwrap();
+    let config_before = std::fs::read(&config_path).unwrap();
+
+    // A repo that matches a profile.
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+
+    // Apply the PROFILE slot.
+    cmd(home, data)
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .args(["profile", "apply", repo.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    // The ACCOUNT slot's files must be byte-identical.
+    assert_eq!(
+        creds_before,
+        std::fs::read(&creds_path).unwrap(),
+        "profile apply must not mutate ~/.claude/.credentials.json"
+    );
+    assert_eq!(
+        config_before,
+        std::fs::read(&config_path).unwrap(),
+        "profile apply must not mutate ~/.claude.json (incl. oauthAccount)"
+    );
+}
+
+#[test]
+fn profile_force_writes_override() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let profiles = write_profiles(hdir.path());
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .current_dir(repo.path())
+        .args(["profile", "force", "backend"])
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(repo.path().join(".claude").join("profile")).unwrap();
+    assert_eq!(body, "backend\n");
+}
+
+#[test]
+fn profile_inventory_json() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let roots = tempfile::tempdir().unwrap();
+
+    let app = roots.path().join("app");
+    std::fs::create_dir_all(app.join(".git")).unwrap();
+    std::fs::write(
+        app.join("package.json"),
+        r#"{"dependencies":{"react":"18"}}"#,
+    )
+    .unwrap();
+
+    let profiles = hdir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        format!(
+            r#"{{"scan_roots":["{}"],"universal":[],"profiles":{{}}}}"#,
+            roots.path().display()
+        ),
+    )
+    .unwrap();
+
+    std::fs::create_dir_all(hdir.path().join(".claude").join("plugins")).unwrap();
+    std::fs::write(
+        hdir.path()
+            .join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json"),
+        r#"{"plugins":{"serena@official":[{"scope":"user"}]}}"#,
+    )
+    .unwrap();
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .args(["profile", "inventory", "--json"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("serena@official")
+                .and(predicate::str::contains("suggested_profiles"))
+                .and(predicate::str::contains("frontend"))
+                .and(predicate::str::contains("\"schema_version\"")),
+        );
+}
+
+#[test]
+fn profile_inventory_works_without_existing_profiles_file() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let roots = tempfile::tempdir().unwrap();
+    let app = roots.path().join("app");
+    std::fs::create_dir_all(app.join(".git")).unwrap();
+    std::fs::write(app.join("Cargo.toml"), "[package]").unwrap();
+
+    // CC_LOADOUT_PROFILES points at a path that does NOT exist
+    let missing = hdir.path().join("nope").join("profiles.json");
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &missing)
+        .args([
+            "profile",
+            "inventory",
+            "--json",
+            "--root",
+            roots.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"rust\""));
+}
+
+#[test]
+fn status_shows_both_slots() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+    let profiles = write_profiles(home);
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+
+    cmd(home, data)
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .current_dir(repo.path())
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Account:")
+                .and(predicate::str::contains("work@x"))
+                .and(predicate::str::contains("Profile (cwd:"))
+                .and(predicate::str::contains("frontend")),
+        );
+}
+
+#[test]
+fn account_list_json_emits_versioned_envelope() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    let out = cmd(home, data)
+        .args(["account", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["accounts"][0]["alias"], serde_json::json!("work"));
+    assert_eq!(v["accounts"][0]["email"], serde_json::json!("work@x"));
+    assert_eq!(v["accounts"][0]["active"], serde_json::json!(true));
+}
+
+#[test]
+fn account_current_json_reports_active_alias() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    let out = cmd(home, data)
+        .args(["account", "current", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["active"], serde_json::json!("work"));
+}
+
+#[test]
+fn status_json_has_two_sections_and_version() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+    let profiles = write_profiles(home);
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+
+    let out = cmd(home, data)
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .current_dir(repo.path())
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(
+        v["account"]["accounts"][0]["alias"],
+        serde_json::json!("work")
+    );
+    assert!(v["profile"]["cwd"].is_string());
+    assert_eq!(v["profile"]["matched"], serde_json::json!(["frontend"]));
+}
+
+#[test]
+fn profile_detect_json_lists_matched_and_plugins() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let profiles = write_profiles(hdir.path());
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+
+    let out = cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .args(["profile", "detect", repo.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["repos"][0]["matched"], serde_json::json!(["frontend"]));
+    assert!(v["repos"][0]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "fe@m"));
+}
+
+#[test]
+fn profile_apply_then_status_json() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let profiles = write_profiles(hdir.path());
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+    let run = |args: &[&str]| {
+        let mut c = cmd(hdir.path(), ddir.path());
+        c.env("CC_LOADOUT_PROFILES", &profiles).args(args);
+        c
+    };
+
+    let out = run(&["profile", "apply", repo.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["repos"][0]["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["plugin"] == "fe@m" && c["to"] == serde_json::json!(true)));
+
+    let out2 = run(&["profile", "status", repo.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let v2: serde_json::Value = serde_json::from_slice(&out2.stdout).unwrap();
+    assert_eq!(v2["schema_version"], serde_json::json!(1));
+    assert!(v2["repos"][0]["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "fe@m"));
+}
+
+#[test]
+fn profile_detect_json_reports_signals() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    let profiles = write_profiles(hdir.path());
+    std::fs::write(repo.path().join("App.vue"), "x").unwrap();
+
+    let out = cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .args(["profile", "detect", repo.path().to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["repos"][0]["signals"][0]["profile"],
+        serde_json::json!("frontend")
+    );
+    assert_eq!(
+        v["repos"][0]["signals"][0]["rule"],
+        serde_json::json!("marker_glob")
+    );
+    assert_eq!(
+        v["repos"][0]["signals"][0]["value"],
+        serde_json::json!("*.vue")
+    );
+}
+
+#[test]
+fn schedule_list_json_has_next_fire_and_last_primed() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    let bin = tempfile::tempdir().unwrap();
+    let patched_path = fake_crontab_path(bin.path());
+    cmd(home, data)
+        .env("PATH", &patched_path)
+        .args(["account", "schedule", "set", "work", "06:00", "23:59"])
+        .assert()
+        .success();
+
+    let out = cmd(home, data)
+        .env("PATH", &patched_path)
+        .args(["account", "schedule", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema_version"], serde_json::json!(1));
+    assert_eq!(v["schedule"]["work"], serde_json::json!(["06:00", "23:59"]));
+    assert!(v["next_fire"]["work"].is_string());
+    assert_eq!(v["last_primed"]["work"], serde_json::json!(null));
+}
+
+#[test]
+fn cmd_isolates_crontab_from_the_real_system_by_default() {
+    // Regression for the wipe: a crontab-WRITING subcommand run through cmd() with NO
+    // explicit PATH patch must land on cmd()'s built-in fake crontab, never the
+    // developer's real user crontab. Before this guard, an unpatched write test spliced
+    // the live prime schedule out of the real crontab.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    // Deliberately NO .env("PATH", ...) — this is the footgun path. It must still be
+    // isolated by cmd() itself.
+    cmd(home, data)
+        .args(["account", "schedule", "set", "work", "06:00"])
+        .assert()
+        .success();
+
+    let tab = std::fs::read_to_string(data.join(".fakebin").join("tab"))
+        .expect("cmd() must install a fake crontab store under the data dir");
+    assert!(
+        tab.contains("task run work --quiet"),
+        "the schedule write must land on the fake crontab, not the real one; got: {tab}"
+    );
+}
+
+#[test]
+fn status_json_has_priming_section() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    let bin = tempfile::tempdir().unwrap();
+    let patched_path = fake_crontab_path(bin.path());
+    cmd(home, data)
+        .env("PATH", &patched_path)
+        .args(["account", "schedule", "set", "work", "06:00"])
+        .assert()
+        .success();
+
+    let out = cmd(home, data)
+        .env("PATH", &patched_path)
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["priming"]["work"]["next_fire"].is_string());
+    assert_eq!(v["priming"]["work"]["last_primed"], serde_json::json!(null));
+    assert!(v["account"]["accounts"].is_array());
+    assert!(v["profile"]["cwd"].is_string());
+}
+
+#[test]
+fn use_launch_without_claude_on_path_warns_but_swaps() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    write_login(home, "personal@x");
+    cmd(home, data)
+        .args(["account", "add", "personal"])
+        .assert()
+        .success();
+
+    // Force an empty PATH so `claude` is unresolvable; the swap must still succeed.
+    cmd(home, data)
+        .env("PATH", "")
+        .args(["account", "use", "work", "--launch"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("not found on PATH"));
+
+    // Credentials actually swapped to work.
+    let creds = std::fs::read_to_string(home.join(".claude").join(".credentials.json")).unwrap();
+    assert!(creds.contains("tok-work@x"));
+}
+
+#[test]
+fn bare_account_non_tty_does_not_launch_tui() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    // Non-TTY: prints the headless hint and exits 0.
+    cmd(hdir.path(), ddir.path())
+        .args(["account"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "is interactive and needs a terminal",
+        ));
+}
+
+#[test]
+fn bare_schedule_non_tty_uses_fallback() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    // Non-TTY: prints the headless hint and exits 0.
+    cmd(hdir.path(), ddir.path())
+        .args(["account", "schedule"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "is interactive and needs a terminal",
+        ));
+}
+
+#[test]
+fn bare_task_non_tty_uses_fallback() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    // Non-TTY: `cc-loadout task` with no subcommand prints the headless hint
+    // (does not launch the Tasks-tab TUI) and exits 0.
+    cmd(hdir.path(), ddir.path())
+        .args(["task"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "is interactive and needs a terminal",
+        ));
+}
+
+#[test]
+fn profile_init_non_tty_uses_fallback_not_tui() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let roots = tempfile::tempdir().unwrap();
+    let profiles = hdir.path().join("profiles.json");
+    // Non-TTY: prints the headless hint and exits 0 (deterministic; no hang).
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .args(["profile", "init", "--root", roots.path().to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "is interactive and needs a terminal",
+        ));
+}
+
+#[test]
+fn bare_command_non_tty_prints_status_snapshot() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    // No args + captured (non-tty) stdout -> must degrade to the status snapshot,
+    // never block on a TUI.
+    cmd(home, data)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Account:").and(predicate::str::contains("work@x")));
+}
+
+#[test]
+fn profile_init_noninteractive_writes_and_applies_global() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    // installed-plugin registry
+    let pdir = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&pdir).unwrap();
+    std::fs::write(
+        pdir.join("installed_plugins.json"),
+        r#"{"plugins":{"serena@official":[{"scope":"user"}],"rust-analyzer@community":[{"scope":"user"}]}}"#,
+    )
+    .unwrap();
+
+    // scan root with a rust repo
+    let root = home.join("repos");
+    let repo = root.join("app");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
+
+    // assignment file
+    let assign = home.join("assign.json");
+    std::fs::write(
+        &assign,
+        r#"{"universal":["serena@official"],"profiles":{"rust":["rust-analyzer@community"]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .args([
+            "profile",
+            "init",
+            "--root",
+            root.to_str().unwrap(),
+            "--assign",
+            assign.to_str().unwrap(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("rust-analyzer@community")
+                .and(predicate::str::contains("apply --all")),
+        );
+
+    // profiles.json written under ~/.claude/profiles/
+    let cfg = std::fs::read_to_string(home.join(".claude").join("profiles").join("profiles.json"))
+        .unwrap();
+    assert!(cfg.contains("rust") && cfg.contains("Cargo.toml"));
+    // global settings.json applied (universal on, profile-specific off)
+    let s = std::fs::read_to_string(home.join(".claude").join("settings.json")).unwrap();
+    assert!(
+        s.contains("\"serena@official\": true"),
+        "universal plugin enabled globally: {s}"
+    );
+    assert!(
+        s.contains("\"rust-analyzer@community\": false"),
+        "profile-specific plugin disabled globally: {s}"
+    );
+
+    // --assign without --root is an error
+    cmd(home, ddir.path())
+        .args(["profile", "init", "--assign", assign.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--root"));
+}
+
+#[test]
+fn on_demand_acquire_then_release_round_trips_enabled_plugins() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+
+    let profiles = hdir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"scan_roots":[],"universal":[],"profiles":{},"on_demand":["pixijs@x"]}"#,
+    )
+    .unwrap();
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .env("CC_LOADOUT_SESSION_ID", "sess-cli-1")
+        .current_dir(repo.path())
+        .args(["profile", "on-demand", "acquire", "pixijs@x"])
+        .assert()
+        .success();
+
+    let settings =
+        std::fs::read_to_string(repo.path().join(".claude").join("settings.local.json")).unwrap();
+    // write_enabled (Task 3) serializes with serde_json::to_vec_pretty, so the
+    // colon has a trailing space — not the compact `"pixijs@x":true` form.
+    assert!(settings.contains("\"pixijs@x\": true"));
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .env("CC_LOADOUT_SESSION_ID", "sess-cli-1")
+        .current_dir(repo.path())
+        .args(["profile", "on-demand", "release", "pixijs@x"])
+        .assert()
+        .success();
+
+    let settings =
+        std::fs::read_to_string(repo.path().join(".claude").join("settings.local.json")).unwrap();
+    assert!(!settings.contains("\"pixijs@x\": true"));
+}
+
+#[test]
+fn on_demand_acquire_rejects_key_not_in_on_demand_list() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+
+    let profiles = hdir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"scan_roots":[],"universal":[],"profiles":{},"on_demand":[]}"#,
+    )
+    .unwrap();
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .env("CC_LOADOUT_SESSION_ID", "sess-cli-1")
+        .current_dir(repo.path())
+        .args(["profile", "on-demand", "acquire", "pixijs@x"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not in on_demand"));
+}
+
+#[test]
+fn task_add_and_list() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    // Set up an account snapshot so task add can validate the account exists.
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+
+    // Provide a fake crontab binary so task add doesn't fail in the test env.
+    let bin = tempfile::tempdir().unwrap();
+    let patched_path = fake_crontab_path(bin.path());
+
+    // task add creates the task.
+    cmd(home, data)
+        .env("PATH", &patched_path)
+        .args([
+            "task",
+            "add",
+            "weekly",
+            "--account",
+            "work",
+            "--at",
+            "07:00",
+            "--prompt",
+            "/cortex:weekly",
+            "--cwd",
+            cwd_dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("weekly"));
+
+    // task list --json reports the task with its prompt.
+    cmd(home, data)
+        .args(["task", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("weekly").and(predicate::str::contains("/cortex:weekly")));
+}
