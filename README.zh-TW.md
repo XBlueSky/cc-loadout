@@ -237,7 +237,7 @@ cargo fmt --check
 demo/record.sh                                          # 重新產生 README demo GIF(需要 vhs、ttyd、ffmpeg)
 ```
 
-CI(`.github/workflows/ci.yml`)會跑同一套檢查。打 tag 時 `release.yml` 會建出靜態 Linux(musl)與 macOS 執行檔,並以 GitHub Release 資產發佈;版號與 changelog 由 `release-plz` 依 commit type 推導。
+CI(`.github/workflows/ci.yml`)會跑同一套檢查。`release.yml` 會以 `.tar.gz` + `.sha256` 發佈四個 target —— `x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`(兩者皆為完全靜態)、`x86_64-apple-darwin`、`aarch64-apple-darwin`;版號與 changelog 由 `release-plz` 依 commit type 推導。target 清單與資產格式與 [cc-uplink](https://github.com/xbluesky/cc-uplink) 一致,因此同一套 `uname` → target 映射可以解析兩邊的執行檔。
 
 ## 參與貢獻(Contributing)
 

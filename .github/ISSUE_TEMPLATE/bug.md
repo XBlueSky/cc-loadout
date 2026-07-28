@@ -27,7 +27,7 @@ labels: bug
 ### Environment
 
 - `cc-loadout --version`:
-- OS / architecture (Linux x86_64 and macOS arm64/x86_64 have published binaries):
+- OS / architecture (Linux and macOS, x86_64 and arm64, all have published binaries):
 - Claude Code version:
 - Installed from: <!-- source build / published installer -->
 

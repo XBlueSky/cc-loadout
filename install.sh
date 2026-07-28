@@ -42,14 +42,16 @@ build_from_source() {
 }
 
 # Map this machine to one of the release asset targets. Anything else has to
-# build from source — there is no published binary to fall back to.
+# build from source — there is no published binary to fall back to. The mapping
+# matches cc-uplink's plugin launcher so both projects resolve the same way.
 detect_target() {
   local os arch
   os="$(uname -s)"; arch="$(uname -m)"
-  case "${os}/${arch}" in
-    Linux/x86_64)   echo "x86_64-unknown-linux-musl" ;;
-    Darwin/arm64)   echo "aarch64-apple-darwin" ;;
-    Darwin/x86_64)  echo "x86_64-apple-darwin" ;;
+  case "${os}-${arch}" in
+    Linux-x86_64)   echo "x86_64-unknown-linux-musl" ;;
+    Linux-aarch64)  echo "aarch64-unknown-linux-musl" ;;
+    Darwin-arm64)   echo "aarch64-apple-darwin" ;;
+    Darwin-x86_64)  echo "x86_64-apple-darwin" ;;
     *) err "no published binary for ${os}/${arch}; build from source instead: git clone https://github.com/${REPO} && cd cc-loadout && ./install.sh" ;;
   esac
 }
@@ -64,19 +66,45 @@ latest_version() {
 install_from_release() {
   step "Downloading cc-loadout from GitHub Releases..."
   command -v curl >/dev/null 2>&1 || err "curl not found"
+  command -v tar  >/dev/null 2>&1 || err "tar not found"
   local target; target="$(detect_target)"
   local version="${VERSION:-$(latest_version)}"
   [ -n "$version" ] || err "could not determine the latest version (set VERSION=...)"
   info "Version: ${version} (${target})"
-  mkdir -p "$INSTALL_DIR"
-  local tmp; tmp="$(mktemp)"
+
+  local asset="${BINARY_NAME}-${target}.tar.gz"
+  # The checksum file is named without .tar.gz but its body references the
+  # archive, so `-c` works from the download dir.
+  local sum="${BINARY_NAME}-${target}.sha256"
+  local base="${RELEASES_BASE}/download/v${version}"
+
+  local tmp; tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064  # expand $tmp now, not at trap time
+  trap "rm -rf '$tmp'" EXIT
+
   # -f so an HTTP error page is a failure instead of a "binary" written to disk.
-  curl -fsSL "${RELEASES_BASE}/download/v${version}/${BINARY_NAME}-${target}" -o "$tmp" \
-    || { rm -f "$tmp"; err "download failed for ${BINARY_NAME}-${target} at v${version}"; }
-  # ELF on Linux, Mach-O on macOS.
-  file "$tmp" | grep -qE 'ELF|Mach-O' || { rm -f "$tmp"; err "downloaded file is not a binary"; }
-  mv "$tmp" "${INSTALL_DIR}/${BINARY_NAME}"
-  chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+  curl -fsSL --proto '=https' --proto-redir '=https' -o "${tmp}/${asset}" "${base}/${asset}" \
+    || err "download failed for ${asset} at v${version}"
+  curl -fsSL --proto '=https' --proto-redir '=https' -o "${tmp}/${sum}" "${base}/${sum}" \
+    || err "download failed for ${sum} at v${version}"
+
+  # Verify BEFORE extracting anything from the archive. The checksum ships
+  # beside the tarball, so it guards download integrity — not authenticity;
+  # the trust root is the pinned version plus HTTPS.
+  step "Verifying checksum..."
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$tmp" && sha256sum -c "$sum" ) >/dev/null || err "checksum mismatch for ${asset}"
+  elif command -v shasum >/dev/null 2>&1; then
+    ( cd "$tmp" && shasum -a 256 -c "$sum" ) >/dev/null || err "checksum mismatch for ${asset}"
+  else
+    err "neither sha256sum nor shasum found — cannot verify the download"
+  fi
+
+  tar -xzf "${tmp}/${asset}" -C "$tmp" "${BINARY_NAME}" || err "could not extract ${BINARY_NAME} from ${asset}"
+  mkdir -p "$INSTALL_DIR"
+  chmod +x "${tmp}/${BINARY_NAME}"
+  mv -f "${tmp}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  rm -rf "$tmp"; trap - EXIT
   info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
 }
 

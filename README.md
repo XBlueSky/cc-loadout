@@ -266,7 +266,7 @@ cargo fmt --check
 demo/record.sh                                          # re-render the README demo GIF (needs vhs, ttyd, ffmpeg)
 ```
 
-CI (`.github/workflows/ci.yml`) runs the same checks. On a tag, `release.yml` builds static Linux (musl) and macOS binaries and publishes them as GitHub Release assets; `release-plz` derives the version and changelog from commit types.
+CI (`.github/workflows/ci.yml`) runs the same checks. `release.yml` publishes four targets as `.tar.gz` + `.sha256` Release assets — `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl` (both fully static), `x86_64-apple-darwin`, `aarch64-apple-darwin` — and `release-plz` derives the version and changelog from commit types. The target list and asset layout match [cc-uplink](https://github.com/xbluesky/cc-uplink), so the same `uname` → target mapping resolves either project's binaries.
 
 ## Contributing
 

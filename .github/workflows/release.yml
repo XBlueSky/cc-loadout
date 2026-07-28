@@ -103,6 +103,9 @@ jobs:
             echo "no release for v${version} yet — nothing to attach"
           fi
 
+  # Target list, runner choice and asset layout are kept identical to
+  # XBlueSky/cc-uplink, so a plugin launcher that pins one repo's binaries can
+  # resolve the other's with the same uname -> target mapping.
   assets:
     name: ${{ matrix.target }}
     needs: [check]
@@ -112,30 +115,57 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # musl => fully static: runs on any Linux with kernel >= 3.2,
+          # including old-glibc hosts that gnu builds from ubuntu-22.04+
+          # runners (glibc >= 2.35) cannot reach.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            musl: true
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-latest
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          # macos-13 (last Intel runner) is retired — cross-compile the
+          # x86_64 slice on Apple Silicon instead (SDKs are multi-arch).
+          - os: macos-14
             target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - if: matrix.musl
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+          {
+            echo "CC_x86_64_unknown_linux_musl=musl-gcc"
+            echo "CC_aarch64_unknown_linux_musl=musl-gcc"
+            echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc"
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc"
+          } >> "$GITHUB_ENV"
       - run: rustup target add ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }} --verbose
-      - name: stage asset
+      # Archive layout and checksum naming match
+      # taiki-e/upload-rust-binary-action (what cc-uplink publishes with): the
+      # bare binary at the archive root, and a `<bin>-<target>.sha256` whose
+      # body names the .tar.gz so `sha256sum -c` works from the download dir.
+      - name: package asset
         run: |
           bin="target/${{ matrix.target }}/release/cc-loadout"
           test -f "$bin" || { echo "missing binary: $bin" >&2; exit 1; }
-          cp "$bin" "cc-loadout-${{ matrix.target }}"
+          asset="cc-loadout-${{ matrix.target }}.tar.gz"
+          sum="cc-loadout-${{ matrix.target }}.sha256"
+          tar -czf "$asset" -C "target/${{ matrix.target }}/release" cc-loadout
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$sum"
+          else
+            shasum -a 256 "$asset" > "$sum"
+          fi
+          cat "$sum"
       - name: upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.check.outputs.tag }}" \
-            "cc-loadout-${{ matrix.target }}" --clobber
+            "cc-loadout-${{ matrix.target }}.tar.gz" \
+            "cc-loadout-${{ matrix.target }}.sha256" --clobber
