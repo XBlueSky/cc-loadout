@@ -24,11 +24,20 @@ bin="$(command -v cc-loadout 2>/dev/null || true)"
 # install — never prints, precisely when the install is broken. An unusable
 # binary must be indistinguishable from a missing one.
 #
-# `-f` is required alongside `-x` at both sites: `-x` alone returns true for
-# a directory too (the traversal bit is set by default), so a stray
-# directory named cc-loadout would otherwise be "found" and exec'd, failing
-# the same way with "Is a directory" instead of "Permission denied". This is
-# not redundant — do not simplify it back to a bare `-x`.
+# `-f` is required alongside `-x` at the $HOME/.local/bin fallback site below:
+# `-x` alone returns true for a directory too (the traversal bit is set by
+# default), so a stray directory named cc-loadout there would otherwise be
+# "found" and exec'd, failing the same way with "Is a directory" instead of
+# "Permission denied". This is not redundant — do not simplify it back to a
+# bare `-x`.
+#
+# That directory hazard cannot occur at THIS site, though: bash's PATH search
+# never hands `command -v` a directory (measured — a directory placed on PATH
+# yields no match at all). `-f` is still required here, for a different
+# reason: `command -v` also succeeds for a shell function or alias, printing
+# a bare name with no filesystem meaning behind it (measured — a defined
+# `cc-loadout` shell function makes `command -v cc-loadout` print the bare
+# name, rc=0). `-f` is what rejects that name instead of treating it as usable.
 #
 # Deliberately out of scope: an executable regular file containing garbage
 # (mode 755, invalid program) still reaches `"$bin" hook "$event"` below and
@@ -57,5 +66,17 @@ EOF
   exit 0
 fi
 
-"$bin" hook "$event" || true
+if ! "$bin" hook "$event"; then
+  # Non-zero from `hook` means the binary did not understand the subcommand:
+  # every fallible step inside session_start/session_end is deliberately
+  # swallowed (see src/hooks/mod.rs), so a current binary always exits 0 here.
+  # Almost always an installed CLI older than this plugin. Same tone as the
+  # missing-binary hint above: point, don't scold; session-start only.
+  if [ "$event" = "session-start" ]; then
+    cat <<'EOF'
+cc-loadout: the installed CLI is too old for this plugin, so scope upkeep is off. Update it with:
+curl -sSL https://raw.githubusercontent.com/xbluesky/cc-loadout/master/install.sh | bash
+EOF
+  fi
+fi
 exit 0
