@@ -66,7 +66,8 @@ pub fn promote_keys_to_user(registry_path: &Path, keys: &[String]) -> Result<Pro
     }
     let bytes = match std::fs::read(registry_path) {
         Ok(b) => b,
-        Err(_) => return Ok(report),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", registry_path.display())),
     };
     let mut root: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing {}", registry_path.display()))?;
@@ -92,11 +93,10 @@ pub fn promote_keys_to_user(registry_path: &Path, keys: &[String]) -> Result<Pro
             }
             let mut winner = entries
                 .iter()
-                .max_by_key(|e| {
-                    e.get("lastUpdated")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string()
+                .max_by(|a, b| {
+                    let a_updated = a.get("lastUpdated").and_then(Value::as_str).unwrap_or("");
+                    let b_updated = b.get("lastUpdated").and_then(Value::as_str).unwrap_or("");
+                    a_updated.cmp(b_updated)
                 })
                 .cloned()
                 .expect("entries is non-empty");
@@ -110,6 +110,7 @@ pub fn promote_keys_to_user(registry_path: &Path, keys: &[String]) -> Result<Pro
     }
 
     if report.changed() {
+        // Backup is best-effort insurance; the write proceeds regardless if it fails.
         let _ = std::fs::copy(registry_path, backup_path(registry_path));
         let out = serde_json::to_vec_pretty(&root)?;
         atomicfile::write_atomic(registry_path, &out, 0o644)?;
@@ -137,7 +138,6 @@ pub fn keys_needing_promotion(cfg: &Profiles, registry_path: &Path) -> Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile::config::Profiles;
 
     fn write_registry(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         let p = dir.join("installed_plugins.json");
@@ -252,5 +252,13 @@ mod tests {
             1,
             "exactly one fixed-name backup, never a growing set"
         );
+    }
+
+    #[test]
+    fn propagates_read_errors_other_than_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory path will fail with a non-NotFound error when passed to std::fs::read.
+        let result = promote_keys_to_user(dir.path(), &["a@m".to_string()]);
+        assert!(result.is_err(), "should propagate the read error");
     }
 }
