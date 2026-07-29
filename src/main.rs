@@ -57,6 +57,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<TaskAction>,
     },
+    /// Hook entry points for the bundled plugin's shims (not for direct use)
+    #[command(hide = true)]
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +96,14 @@ enum TaskAction {
     },
     /// Reopen the most recent session for a task
     Resume { id: String },
+}
+
+#[derive(Subcommand)]
+enum HookAction {
+    /// Publish the session id, re-assert plugin scope, finish legacy migration
+    SessionStart,
+    /// Release every on-demand hold this session took out
+    SessionEnd,
 }
 
 #[derive(Subcommand)]
@@ -929,6 +943,17 @@ fn run() -> Result<()> {
                     }
                 }
             },
+            Command::Hook { action } => {
+                use std::io::Read;
+                let mut raw = String::new();
+                let _ = std::io::stdin().read_to_string(&mut raw);
+                match action {
+                    HookAction::SessionStart => {
+                        hooks::session_start(&home, config_override.as_deref(), &raw)?
+                    }
+                    HookAction::SessionEnd => hooks::session_end(&raw)?,
+                }
+            }
         }, // Some(command) => match command
     }
     Ok(())

@@ -931,3 +931,108 @@ fn task_add_and_list() {
         .success()
         .stdout(predicate::str::contains("weekly").and(predicate::str::contains("/cortex:weekly")));
 }
+
+#[test]
+fn hook_session_start_exports_the_session_id() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let env_file = ddir.path().join("env");
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .write_stdin(r#"{"session_id":"sess-abc"}"#)
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        body.contains("export CC_LOADOUT_SESSION_ID=sess-abc"),
+        "env file was: {body}"
+    );
+}
+
+#[test]
+fn hook_session_start_promotes_managed_plugins_to_user_scope() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    std::fs::create_dir_all(home.join(".claude").join("profiles")).unwrap();
+    std::fs::write(
+        home.join(".claude").join("profiles").join("profiles.json"),
+        r#"{"scan_roots":[],"universal":["u@m"],"profiles":{},"on_demand":[]}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".claude").join("plugins")).unwrap();
+    let reg = home
+        .join(".claude")
+        .join("plugins")
+        .join("installed_plugins.json");
+    std::fs::write(
+        &reg,
+        r#"{"version":2,"plugins":{"u@m":[{"scope":"local","projectPath":"/p","lastUpdated":"1"}]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .write_stdin(r#"{"session_id":"s"}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&reg).unwrap()).unwrap();
+    assert_eq!(v["plugins"]["u@m"][0]["scope"], "user");
+}
+
+#[test]
+fn hook_session_start_migrates_legacy_settings_hooks() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    let settings = home.join(".claude").join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"SessionStart":[
+            {"hooks":[{"type":"command","command":"bash \"/old/lib/session-start-hook.sh\""}]}
+        ]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .write_stdin(r#"{"session_id":"s"}"#)
+        .assert()
+        .success();
+
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert!(
+        v["hooks"].get("SessionStart").is_none(),
+        "the retired entry should be gone: {v}"
+    );
+}
+
+#[test]
+fn hook_session_start_survives_garbage_stdin() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    cmd(hdir.path(), ddir.path())
+        .args(["hook", "session-start"])
+        .write_stdin("not json at all")
+        .assert()
+        .success();
+}
+
+#[test]
+fn hook_session_end_is_a_noop_without_a_session_id() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    cmd(hdir.path(), ddir.path())
+        .args(["hook", "session-end"])
+        .write_stdin(r#"{"cwd":"/tmp"}"#)
+        .assert()
+        .success();
+}
