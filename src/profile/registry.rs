@@ -30,9 +30,19 @@ impl PromoteReport {
     }
 }
 
-/// Every key cc-loadout manages: universal, on-demand, and all profile plugins.
-fn managed_keys(cfg: &Profiles) -> Vec<String> {
-    let mut keys: Vec<String> = Vec::new();
+/// cc-loadout's own plugin key, always managed regardless of what the user's
+/// profiles.json lists. If this entry drifts to `scope: local` the plugin —
+/// and therefore its own SessionStart hook — stops resolving outside the repo
+/// it is bound to, so it can never repair itself. `doctor --fix` and the
+/// board's scope-drift banner are the only recovery, and both read this set.
+const SELF_KEY: &str = "cc-loadout@cc-loadout";
+
+/// Every key cc-loadout manages: its own plugin key, universal, on-demand, and
+/// all profile plugins. Named distinctly from the sibling
+/// `profile::plugins::managed_keys` (which excludes `on_demand` and has no
+/// self key) — the two sets serve different callers and must not be confused.
+fn promotable_keys(cfg: &Profiles) -> Vec<String> {
+    let mut keys: Vec<String> = vec![SELF_KEY.to_string()];
     keys.extend(cfg.universal.iter().cloned());
     keys.extend(cfg.on_demand.iter().cloned());
     for p in cfg.profiles.values() {
@@ -111,14 +121,14 @@ pub fn promote_keys_to_user(registry_path: &Path, keys: &[String]) -> Result<Pro
 
 /// Promote every key cc-loadout manages.
 pub fn promote_all(cfg: &Profiles, registry_path: &Path) -> Result<PromoteReport> {
-    promote_keys_to_user(registry_path, &managed_keys(cfg))
+    promote_keys_to_user(registry_path, &promotable_keys(cfg))
 }
 
 /// Read-only counterpart of `promote_all`: the managed keys that are installed
 /// but lack a user-scope entry. Used by `doctor` without `--fix`.
 pub fn keys_needing_promotion(cfg: &Profiles, registry_path: &Path) -> Vec<String> {
     let installed = crate::profile::discover::list_plugins(registry_path);
-    let managed = managed_keys(cfg);
+    let managed = promotable_keys(cfg);
     installed
         .into_iter()
         .filter(|p| managed.contains(&p.key) && !p.scopes.iter().any(|s| s == "user"))

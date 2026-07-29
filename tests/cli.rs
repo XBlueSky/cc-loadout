@@ -1327,3 +1327,51 @@ fn doctor_prune_backups_removes_them() {
     assert!(!bak.exists(), "registry backups are reclaimed");
     assert!(!sbak.exists(), "settings backups are reclaimed too");
 }
+
+#[test]
+fn doctor_promotes_cc_loadouts_own_registry_key_even_though_no_profiles_json_names_it() {
+    // This is the mitigation for the branch's one accepted residual risk: if
+    // cc-loadout@cc-loadout itself drifts to scope: local, the plugin stops
+    // resolving outside the repo it is bound to, and its own SessionStart hook
+    // never runs there to repair it. `doctor`/`doctor --fix` are the only
+    // recovery, so the self key must be treated as managed even though no
+    // profiles.json — not even the seeded template — ever lists it.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    let profiles_dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    std::fs::write(
+        profiles_dir.join("profiles.json"),
+        r#"{"scan_roots":[],"universal":["other@x"],"profiles":{}}"#,
+    )
+    .unwrap();
+
+    let plugins_dir = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+    let registry_path = plugins_dir.join("installed_plugins.json");
+    std::fs::write(
+        &registry_path,
+        r#"{"version":2,"plugins":{"cc-loadout@cc-loadout":[{"scope":"local","lastUpdated":"1"}]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cc-loadout@cc-loadout"));
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    assert_eq!(
+        v["plugins"]["cc-loadout@cc-loadout"][0]["scope"], "user",
+        "the self key must be promoted even though profiles.json never names it"
+    );
+}
