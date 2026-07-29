@@ -5,7 +5,7 @@
 //! it stops loading outside the repo it is bound to, so its own SessionStart
 //! hook stops running there. `doctor --fix` puts it back.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 /// The seed template, embedded rather than read from disk: a binary installed
@@ -27,31 +27,46 @@ pub struct DoctorReport {
 
 /// Timestamped registry backups left by cc-loadout versions before the
 /// fixed-name scheme. One machine accumulated 108 of these (1.7 MB).
-fn find_stale_backups(registry_path: &Path) -> Vec<PathBuf> {
-    let dir = match registry_path.parent() {
+///
+/// The suffix after `.bak.` must be entirely ASCII digits — the retired
+/// installer always wrote `.bak.<epoch>` — so a user's own sidecar such as
+/// `settings.json.bak.before-migration` is never swept up and, under
+/// `--fix --prune-backups`, deleted. Absence of the containing directory is
+/// not an error (a fresh install has neither `~/.claude/plugins/` nor
+/// `~/.claude/settings.json` yet); any other read failure propagates, same
+/// rule as everywhere else in this module.
+fn find_stale_backups(path: &Path) -> Result<Vec<PathBuf>> {
+    let dir = match path.parent() {
         Some(d) => d,
-        None => return Vec::new(),
+        None => return Ok(Vec::new()),
     };
     let prefix = format!(
         "{}.bak.",
-        registry_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
+        path.file_name().unwrap_or_default().to_string_lossy()
     );
-    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().starts_with(&prefix))
-                .unwrap_or(false)
-        })
-        .collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("reading a directory entry in {}", dir.display()))?;
+        let entry_path = entry.path();
+        let name = entry_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        let is_stale_backup = name
+            .as_deref()
+            .and_then(|n| n.strip_prefix(prefix.as_str()))
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()));
+        if is_stale_backup {
+            out.push(entry_path);
+        }
+    }
     out.sort();
-    out
+    Ok(out)
 }
 
 pub fn run(
@@ -70,8 +85,29 @@ pub fn run(
         }
     }
 
+    // Explicit `Option`, not `if let Ok(cfg) = load(...)`: that idiom is correct
+    // in `hooks::session_start` (a hook must never block a session) but wrong
+    // here — it would swallow a corrupt profiles.json exactly like an absent
+    // one, and `doctor` is the one place a diagnostic must not report health
+    // during a real failure. `cfg_path.exists()` is re-checked (not cached from
+    // above) because `--fix` may have just seeded it in the block above.
+    let cfg = if cfg_path.exists() {
+        Some(
+            crate::profile::config::load(&cfg_path)
+                .with_context(|| format!("loading profiles from {}", cfg_path.display()))?,
+        )
+    } else {
+        None
+    };
+
     let registry = crate::profile::discover::resolve_registry_path(home, config_override);
-    if let Ok(cfg) = crate::profile::config::load(&cfg_path) {
+    // Probed once, unconditionally, before the fix/read-only split below:
+    // `keys_needing_promotion` is built on the infallible `discover::list_plugins`
+    // (empty vec on a corrupt file, indistinguishable from "nothing installed"),
+    // while `promote_all` does propagate a parse error. Without this probe the
+    // two paths would disagree about the same corrupt file.
+    crate::profile::registry::probe_registry(&registry)?;
+    if let Some(cfg) = cfg {
         if fix {
             let r = crate::profile::registry::promote_all(&cfg, &registry)?;
             report.promoted = r.promoted;
@@ -92,8 +128,8 @@ pub fn run(
     // installer: `installed_plugins.json.bak.<epoch>` from promote_keys_to_user
     // and `settings.json.bak.<epoch>` from install_session_hook. Reclaiming
     // only the first would leave the user staring at the other half forever.
-    report.stale_backups = find_stale_backups(&registry);
-    report.stale_backups.extend(find_stale_backups(&settings));
+    report.stale_backups = find_stale_backups(&registry)?;
+    report.stale_backups.extend(find_stale_backups(&settings)?);
     report.stale_backups.sort();
     if fix && prune_backups {
         for p in &report.stale_backups {
@@ -140,12 +176,24 @@ pub fn print(report: &DoctorReport, fix: bool) {
     }
     if !report.stale_backups.is_empty() {
         if report.pruned_backups > 0 {
-            println!("pruned {} stale registry backup(s)", report.pruned_backups);
-        } else {
+            println!("pruned {} stale backup(s):", report.pruned_backups);
+        } else if fix {
+            // Only --fix was given: --prune-backups is the missing ingredient.
             println!(
-                "{} stale registry backup(s) reclaimable with --prune-backups",
+                "{} stale backup(s) found (pass --prune-backups to delete):",
                 report.stale_backups.len()
             );
+        } else {
+            // Nothing ran at all without --fix, regardless of whether the user
+            // already passed --prune-backups — name the ingredient that is
+            // actually missing instead of repeating a flag they may have given.
+            println!(
+                "{} stale backup(s) found (run with --fix --prune-backups to delete):",
+                report.stale_backups.len()
+            );
+        }
+        for p in &report.stale_backups {
+            println!("  {}", p.display());
         }
     }
     if !fix {

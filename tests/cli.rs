@@ -1214,6 +1214,100 @@ fn doctor_fix_reports_stale_backups_but_leaves_them_on_disk() {
 }
 
 #[test]
+fn doctor_errors_on_corrupt_profiles_json_with_and_without_fix() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("profiles.json"), "{not valid json").unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("profiles.json"));
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("profiles.json"));
+}
+
+#[test]
+fn doctor_errors_on_corrupt_registry_the_same_way_with_and_without_fix() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("installed_plugins.json"), "{not valid json").unwrap();
+
+    // Same diagnosis whether or not --fix is passed: one tool must not give two
+    // different verdicts about the same corrupt file.
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("installed_plugins.json"));
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("installed_plugins.json"));
+}
+
+#[test]
+fn doctor_prune_backups_ignores_a_sidecar_with_a_non_numeric_suffix() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    // A user's own sidecar, not one the retired installer wrote.
+    let user_sidecar = home
+        .join(".claude")
+        .join("settings.json.bak.before-migration");
+    std::fs::write(&user_sidecar, "{}").unwrap();
+    let stale = home.join(".claude").join("settings.json.bak.1700000001");
+    std::fs::write(&stale, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix", "--prune-backups"])
+        .assert()
+        .success();
+
+    assert!(
+        user_sidecar.exists(),
+        "a non-epoch suffix must never be treated as one of ours"
+    );
+    assert!(
+        !stale.exists(),
+        "the epoch-suffixed sidecar is still reclaimed"
+    );
+}
+
+#[test]
+fn doctor_prints_stale_backup_paths_not_just_a_count() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let bak = plugins.join("installed_plugins.json.bak.1700000000");
+    std::fs::write(&bak, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "installed_plugins.json.bak.1700000000",
+        ));
+}
+
+#[test]
 fn doctor_prune_backups_removes_them() {
     let hdir = tempfile::tempdir().unwrap();
     let ddir = tempfile::tempdir().unwrap();
