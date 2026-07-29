@@ -124,12 +124,15 @@ pub fn run(
         crate::hooks::legacy::count_legacy_hooks(&settings)?
     };
 
-    // Both files accumulated timestamped backups from the retired shell
-    // installer: `installed_plugins.json.bak.<epoch>` from promote_keys_to_user
-    // and `settings.json.bak.<epoch>` from install_session_hook. Reclaiming
-    // only the first would leave the user staring at the other half forever.
+    // Three files accumulate timestamped backups: `installed_plugins.json.bak.<epoch>`
+    // and `settings.json.bak.<epoch>` from the retired shell installer, plus
+    // `profiles.json.bak.<epoch>` from every `write_profiles` call (board
+    // deploys, `profile init`) — the exact unbounded backup scheme this tool
+    // exists to reclaim. Reclaiming only two of the three would leave the
+    // user staring at the remaining pile forever.
     report.stale_backups = find_stale_backups(&registry)?;
     report.stale_backups.extend(find_stale_backups(&settings)?);
+    report.stale_backups.extend(find_stale_backups(&cfg_path)?);
     report.stale_backups.sort();
     if fix && prune_backups {
         for p in &report.stale_backups {
@@ -158,6 +161,12 @@ pub fn print(report: &DoctorReport, fix: bool) {
                 println!("  {k}");
             }
         }
+    } else if report.seeded_profiles {
+        // Without --fix, profiles.json was never written, so nothing was ever
+        // loaded to check scope against. Reporting "already consistent" here
+        // would be the same anti-pattern C1 exists to kill: a diagnostic
+        // claiming health it never established.
+        println!("plugin scope: no profiles.json — nothing to check");
     } else if report.needs_promotion.is_empty() {
         println!("plugin scope: already consistent");
     } else {
