@@ -119,3 +119,29 @@ else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a directory at \$HOME/.local/bin/cc-loadout (exit=$hook_exit, out=$hook_out)"
 fi
 rm -rf "$hook_scratch"
+
+# Regression guard: an installed binary too old to understand `hook` must not
+# fail silently. clap exits non-zero on an unrecognised subcommand; the old
+# `"$bin" hook "$event" || true` swallowed that unconditionally, so a plugin
+# update against a stale binary produced no signal at all (no session id, no
+# scope promotion, no legacy migration) with nothing to explain why. A stub
+# binary that exits 2 stands in for that stale binary here.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/bin"
+printf '#!/bin/bash\nexit 2\n' > "$hook_scratch/bin/cc-loadout"
+chmod +x "$hook_scratch/bin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
+hook_exit=$?
+if [[ "$hook_out" == *"cc-loadout: the installed CLI is too old"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh prints an upgrade hint at session-start when the binary rejects the hook subcommand"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the upgrade hint for a binary exiting 2 on session-start (exit=$hook_exit, out=$hook_out)"
+fi
+hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-end 2>&1)"
+hook_exit=$?
+if [[ -z "$hook_out" && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh stays silent at session-end for the same old binary"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh was not silent at session-end for a binary exiting 2 (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
