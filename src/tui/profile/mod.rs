@@ -231,6 +231,7 @@ impl ProfileView {
             stale: crate::profile::drift::stale_refs(&self.inv, &self.working),
             uncovered: self.uncovered.clone(),
             global: crate::profile::drift::global_drift(&self.working, &snap.global_enabled),
+            scope: snap.scope_drift.clone(),
         }
     }
 
