@@ -126,6 +126,23 @@ pub fn keys_needing_promotion(cfg: &Profiles, registry_path: &Path) -> Vec<Strin
         .collect()
 }
 
+/// Confirm the registry is readable and parseable, tolerating absence.
+///
+/// `keys_needing_promotion` is built on `discover::list_plugins`, which is
+/// infallible and yields an empty vec for a corrupt file — indistinguishable
+/// from "nothing installed". Without this probe, `doctor` would report a
+/// healthy installation while `doctor --fix` errors on the very same file.
+pub fn probe_registry(registry_path: &Path) -> Result<()> {
+    let bytes = match std::fs::read(registry_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", registry_path.display())),
+    };
+    let _: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", registry_path.display()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
