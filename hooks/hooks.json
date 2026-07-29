@@ -1,0 +1,27 @@
+{
+  "description": "cc-loadout plugin hooks — plugin scope upkeep and on-demand release",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/hook.sh session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/hook.sh session-end",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

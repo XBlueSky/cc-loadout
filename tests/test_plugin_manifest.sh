@@ -53,3 +53,36 @@ if [[ -n "$cargo_ver" && "$cargo_ver" == "$plugin_ver" ]]; then
 else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: plugin.json version ($plugin_ver) != Cargo.toml ($cargo_ver)"
 fi
+
+# The plugin now owns its hooks; the manifest and the shim must exist.
+hkp="$ROOT/hooks/hooks.json"
+if jq -e . "$hkp" >/dev/null 2>&1; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hooks/hooks.json is valid JSON"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hooks/hooks.json invalid or missing"
+fi
+
+# Each event must point at the shared shim, plugin-root relative, and pass its
+# own event name through as the argument the binary expects.
+for ev in SessionStart:session-start SessionEnd:session-end; do
+  key="${ev%%:*}"; arg="${ev##*:}"
+  c="$(jq -r --arg e "$key" '.hooks[$e][0].hooks[0].command // ""' "$hkp" 2>/dev/null)"
+  if [[ "$c" == *'${CLAUDE_PLUGIN_ROOT}/hooks/hook.sh '* && "$c" == *" $arg" ]]; then
+    TEST_PASS=$((TEST_PASS+1)); echo "  ok: $key invokes hook.sh with '$arg'"
+  else
+    TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: $key command wrong: $c"
+  fi
+done
+
+if [[ -f "$ROOT/hooks/hook.sh" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hooks/hook.sh present"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hooks/hook.sh missing (hooks.json would point at nothing)"
+fi
+
+# Regression guard: no shim may reference the deleted lib/ scripts.
+if grep -rq "lib/session-.*-hook.sh" "$ROOT/hooks/" 2>/dev/null; then
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: a shim still references the retired lib/ hook scripts"
+else
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: no shim references the retired lib/ scripts"
+fi
