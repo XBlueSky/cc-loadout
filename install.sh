@@ -139,10 +139,17 @@ bootstrap() {
 }
 
 main() {
-  if [ "${1:-}" = "--print-mode" ]; then
-    detect_mode
-    exit 0
-  fi
+  # An unknown option must be a hard error, not a fall-through to a real
+  # install: that fall-through is exactly what happened once during this
+  # project's own development, running a full install against a developer's
+  # real environment (see tests/test_install.sh's isolation comment above
+  # print_mode()). An explicit case makes "only $1 is ever consulted" a
+  # stated contract too, not an accident of a single `if`.
+  case "${1:-}" in
+    --print-mode) detect_mode; exit 0 ;;
+    "") ;;
+    *) err "unknown option: $1 (supported: --print-mode)" ;;
+  esac
   echo -e "${BLUE}cc-loadout installer${NC}"
   local mode; mode="$(detect_mode)"
   info "Mode: $mode"

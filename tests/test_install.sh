@@ -49,6 +49,27 @@ assert_eq "$(print_mode "$cachedir/install.sh")" "binary" \
   "a plugin-cache copy without .git is detected as binary mode"
 rm -rf "$cachedir"
 
+# --- unknown flag -----------------------------------------------------------
+# An unknown option must fail loudly rather than falling through to a real
+# install — that fall-through is breach #2 of this branch's own development
+# (an installer that ignored an unknown flag ran a full install against a
+# developer's real environment). Isolated unconditionally, same as
+# print_mode() above, so this assertion never depends on the fix already
+# being correct.
+s="$(mktemp -d)"
+if INSTALL_DIR="$s/.local/bin" HOME="$s" XDG_DATA_HOME="$s/data" \
+  bash "$ROOT/install.sh" --bogus-flag >/dev/null 2>&1; then
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: install.sh accepted an unknown flag instead of erroring"
+else
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: install.sh errors on an unknown flag"
+fi
+if [[ -e "$s/.claude" ]]; then
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: install.sh performed a real install despite the unknown flag"
+else
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: install.sh did not touch HOME when handed an unknown flag"
+fi
+rm -rf "$s"
+
 # --- bootstrap ------------------------------------------------------------
 fake_bin="$(mktemp -d)"
 cat > "$fake_bin/cargo" <<STUBEOF
