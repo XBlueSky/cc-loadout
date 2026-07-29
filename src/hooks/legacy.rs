@@ -18,7 +18,7 @@ const EVENTS: [&str; 2] = ["SessionStart", "SessionEnd"];
 
 /// True for cc-loadout's own retired hook commands, and nothing else.
 ///
-/// Two shapes exist in the wild: the `lib/session-{start,end}-hook.sh` wrapper,
+/// Two shapes exist in the wild: the `/lib/session-{start,end}-hook.sh` wrapper,
 /// and the older inline one-liner that sourced `registry.sh` and called
 /// `promote_universal_to_user`. All three markers are anchored strictly to avoid
 /// false positives: the hook path deletion runs automatically on every session
@@ -72,12 +72,17 @@ fn strip(root: &mut Value) -> usize {
                 removed += before - list.len();
             }
         }
-        // A group whose hooks list is now empty carries no meaning.
+        // A group whose hooks list is now empty carries no meaning, so it is
+        // dropped. `unwrap_or(true)` — not `false` — for a group with no
+        // `hooks` array at all: that shape was never touched by `strip()`
+        // above, so it is not ours to judge empty. Treating "absent" as
+        // "empty" would delete a group this pass never emptied, in a file
+        // cc-loadout does not own; keep what you do not understand.
         groups.retain(|g| {
             g.get("hooks")
                 .and_then(Value::as_array)
                 .map(|l| !l.is_empty())
-                .unwrap_or(false)
+                .unwrap_or(true)
         });
         if groups.is_empty() {
             hooks.remove(event);
@@ -205,6 +210,30 @@ mod tests {
         );
         assert_eq!(hooks[0]["type"], "prompt");
         assert!(hooks[0].get("command").is_none());
+    }
+
+    #[test]
+    fn preserves_a_group_that_never_had_a_hooks_key_while_removing_a_legacy_group() {
+        // A group need not carry a `hooks` array at all. `strip()` must not
+        // treat "no hooks key" as "empty hooks" — that would delete a group
+        // this pass never touched, from a file cc-loadout does not own.
+        let (_d, p) = settings_with(
+            r#"{"hooks":{"SessionStart":[
+                {"hooks":[{"type":"command","command":"bash \"/x/lib/session-start-hook.sh\""}]},
+                {"matcher":"unrelated"}
+            ]}}"#,
+        );
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let groups = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "the emptied legacy group is dropped, the hooks-less group survives"
+        );
+        assert_eq!(groups[0]["matcher"], "unrelated");
+        assert!(groups[0].get("hooks").is_none());
     }
 
     #[test]
