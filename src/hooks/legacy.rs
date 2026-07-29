@@ -26,13 +26,29 @@ const EVENTS: [&str; 2] = ["SessionStart", "SessionEnd"];
 /// silently deleted from `~/.claude/settings.json`, a file shared by all plugins.
 /// A false negative leaves one of our zombies behind; a false positive destroys
 /// someone else's hook and never surfaces a diagnostic. Asymmetric risk demands
-/// strict matching on all branches. The wrapper scripts anchor to `lib/` (always
-/// present in our installer paths, never in another plugin's legitimate use of
-/// those basenames). The inline form requires both `registry.sh` and
-/// `promote_universal_to_user` (a collision with both markers is implausible).
+/// strict matching on all branches.
+///
+/// A plugin-relative command (containing `${CLAUDE_PLUGIN_ROOT}`) is never ours.
+/// Our installer wrote absolute paths derived from the clone, long before
+/// plugin-owned hooks existed. If that variable appears, the entry belongs to
+/// another plugin, so reject it immediately.
+///
+/// The wrapper scripts anchor to `/lib/` with a leading slash to enforce path
+/// segment boundaries (always present in our installer paths like
+/// `/clone/lib/session-start-hook.sh`, never in legitimate uses like
+/// `/opt/other/mylib/session-start-hook.sh`). The inline form requires both
+/// `registry.sh` and `promote_universal_to_user` (a collision with both markers
+/// is implausible).
 pub fn is_legacy_command(command: &str) -> bool {
-    command.contains("lib/session-start-hook.sh")
-        || command.contains("lib/session-end-hook.sh")
+    // A plugin-relative command is never ours. install.sh wrote an
+    // absolute path derived from the clone, and did so long before
+    // plugin-owned hooks existed, so ${CLAUDE_PLUGIN_ROOT} appearing at
+    // all means this entry belongs to some other plugin.
+    if command.contains("CLAUDE_PLUGIN_ROOT") {
+        return false;
+    }
+    command.contains("/lib/session-start-hook.sh")
+        || command.contains("/lib/session-end-hook.sh")
         || (command.contains("registry.sh") && command.contains("promote_universal_to_user"))
 }
 
@@ -227,6 +243,21 @@ mod tests {
         ));
         assert!(!is_legacy_command(
             r#"bash "/opt/other-plugin/session-end-hook.sh""#
+        ));
+        // The early return rejects plugin-relative commands entirely: our installer
+        // wrote absolute paths derived from the clone, so ${CLAUDE_PLUGIN_ROOT} at
+        // all means another plugin. This guards both the wrapper-script and
+        // inline-registry branches.
+        assert!(!is_legacy_command(
+            r#"bash "${CLAUDE_PLUGIN_ROOT}/lib/session-start-hook.sh""#
+        ));
+        assert!(!is_legacy_command(
+            r#"bash -c 'source ${CLAUDE_PLUGIN_ROOT}/lib/registry.sh && promote_universal_to_user'"#
+        ));
+        // Directory boundary: /mylib/session-start-hook.sh must not match /lib/
+        // anchor, ensuring lib is a whole path segment, not a suffix.
+        assert!(!is_legacy_command(
+            r#"bash "/opt/other/mylib/session-start-hook.sh""#
         ));
     }
 
