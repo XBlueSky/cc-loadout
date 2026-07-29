@@ -51,6 +51,7 @@ cc-loadout
 - `profile init` / `edit` —— 一塊互動式**看板**(也可以執行 `cc-loadout` 後切到 Profile 分頁進入),透過把已安裝的 plugin 歸類到各 profile 來建出 `profiles.json`,並提供選用的 `✨` AI 草稿(由 Claude 提議分組)和一個會標示飄移(新裝/已移除的 plugin、未命中的 repo、全域飄移)的二次編輯檢視。原子性寫入;會備份既有檔案;並調整全域啟用集,讓非-universal 的 plugin 不再到處載入。`profile init --root <dir> --assign <file>` 則以非互動方式跑同一套設定,供 agent / CI 使用。
 - **在看板裡編輯偵測規則** —— 打開某個 profile 的 Detail 檢視 → Rules 分頁,不用手寫 JSON 就能編寫它要命中什麼:四種規則類型(`path under` / `has file` / `has any` / `contains`)、邊打邊更新的命中數與 **near-miss(差一點)** 面板、`?` 解釋某個 repo 為何命中(或不命中)、`f` 從範例 repo 反推規則,以及 `path under` 值的路徑 ghost 補全。
 - `profile detect` / `apply` —— 每個 repo 的 plugin 偵測(路徑前綴、marker 檔案、marker glob,以及檔案內容比對 —— 某個檔案含某個字;舊設定的 `package.json` 相依 / 相依關鍵字規則仍會命中),可手動覆寫;universal + profile 的 plugin 集合採疊加;以外科手術式的合併保留你的 on-demand 與無關設定。`--all` 會掃過你 scan root 下的每一個 git repo。
+- `doctor` / `doctor --fix` —— 檢查並修復 cc-loadout 自己的安裝狀態:補上缺少的 `profiles.json`、把飄移到 `scope: local` 的受管理 plugin(包含 cc-loadout 自己)提升回 `scope: user`、清掉舊版本留在 `settings.json` 裡的 hook 項目,並回報(加 `--prune-backups` 可刪除)舊版本留下的逾時備份檔。
 - 也以 Claude Code plugin 形式發佈:內附的 `/cc-loadout:init` skill 透過跟 Claude 對話幫你建 profile(不需要 TTY);看板裡的 `✨` AI 草稿是 TUI 內的等價做法。
 
 ## 安裝(Install)
