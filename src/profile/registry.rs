@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::profile::config::Profiles;
 use crate::util::atomicfile;
