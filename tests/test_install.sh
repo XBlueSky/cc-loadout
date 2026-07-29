@@ -104,7 +104,15 @@ else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: install.sh overwrote a user-edited profiles.json"
 fi
 
-if "$cc_bin" --help >/dev/null 2>&1 || "$cc_bin" --version >/dev/null 2>&1; then
+# HOME/XDG_DATA_HOME isolation here is provably inert today — Cli::parse()
+# handles --help/--version and exits before run() ever reaches resolve_env(),
+# the only place $HOME is read — but that safety comes from an implementation
+# detail one layer down, not from this test's own isolation. A test must not
+# depend on the correctness of anything it is testing, nor on a contract in a
+# library it does not control (the same class of gap as the --print-mode
+# incident above). Reuses $fakehome, since $cc_bin already lives inside it.
+if HOME="$fakehome" XDG_DATA_HOME="$fakehome/.local/share" "$cc_bin" --help >/dev/null 2>&1 \
+  || HOME="$fakehome" XDG_DATA_HOME="$fakehome/.local/share" "$cc_bin" --version >/dev/null 2>&1; then
   TEST_PASS=$((TEST_PASS+1)); echo "  ok: installed binary runs and responds to --help/--version"
 else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: installed binary did not run or returned non-zero"
