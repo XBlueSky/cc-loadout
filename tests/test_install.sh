@@ -17,26 +17,37 @@ if [[ ! -x "$REAL_BINARY" ]]; then
 fi
 
 # --- mode detection -------------------------------------------------------
-# --print-mode is defined to exit before touching HOME at all, but these two
-# invocations still isolate HOME/XDG_DATA_HOME defensively: an agent running
-# this suite against an install.sh that does NOT yet understand --print-mode
-# (i.e. mid-refactor, before Step 3 lands) will fall through to the real
-# main() and install into whatever HOME is set — which, unisolated, is the
-# developer's real ~/.claude. That happened once during this task's own
-# development. See task-6-report.md for the incident.
-modehome="$(mktemp -d)"
+# Isolation here must NOT be conditional on install.sh already having the
+# --print-mode fix: an assertion whose safety depends on the code under test
+# already being correct is not a safe assertion. --print-mode is defined to
+# exit before touching HOME at all, but only once install.sh actually
+# understands the flag — against the old install.sh (mid-refactor, before
+# Step 3 lands) an unknown flag falls through to the real main(), which
+# installs into whatever HOME is set. Unisolated, that is the developer's
+# real ~/.claude, and it happened once during this task's own development
+# (see task-6-report.md). So print_mode() isolates HOME/XDG_DATA_HOME/
+# INSTALL_DIR to a scratch dir unconditionally, on every call, regardless of
+# whether the fix is in place yet.
+print_mode() {
+  local install_sh="$1"
+  local s; s="$(mktemp -d)"
+  local out
+  out="$(INSTALL_DIR="$s/.local/bin" HOME="$s" XDG_DATA_HOME="$s/data" bash "$install_sh" --print-mode)"
+  rm -rf "$s"
+  echo "$out"
+}
 
 # A real clone (Cargo.toml + .git) is source mode.
-assert_eq "$(HOME="$modehome" XDG_DATA_HOME="$modehome/.local/share" bash "$ROOT/install.sh" --print-mode)" "source" \
+assert_eq "$(print_mode "$ROOT/install.sh")" "source" \
   "a clone with .git is detected as source mode"
 
 # A plugin-cache-shaped copy (Cargo.toml, no .git) must NOT demand a toolchain.
 cachedir="$(mktemp -d)"
 cp "$ROOT/install.sh" "$cachedir/"
 cp "$ROOT/Cargo.toml" "$cachedir/"
-assert_eq "$(HOME="$modehome" XDG_DATA_HOME="$modehome/.local/share" bash "$cachedir/install.sh" --print-mode)" "binary" \
+assert_eq "$(print_mode "$cachedir/install.sh")" "binary" \
   "a plugin-cache copy without .git is detected as binary mode"
-rm -rf "$cachedir" "$modehome"
+rm -rf "$cachedir"
 
 # --- bootstrap ------------------------------------------------------------
 fake_bin="$(mktemp -d)"
