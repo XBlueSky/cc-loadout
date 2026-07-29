@@ -13,6 +13,7 @@ pub mod init;
 pub mod json;
 pub mod on_demand;
 pub mod plugins;
+pub mod registry;
 pub mod scan;
 pub mod scan_cache;
 
