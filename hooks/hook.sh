@@ -23,10 +23,23 @@ bin="$(command -v cc-loadout 2>/dev/null || true)"
 # and the install hint — the one message that exists to explain a broken
 # install — never prints, precisely when the install is broken. An unusable
 # binary must be indistinguishable from a missing one.
-if [ -n "$bin" ] && [ ! -x "$bin" ]; then
+#
+# `-f` is required alongside `-x` at both sites: `-x` alone returns true for
+# a directory too (the traversal bit is set by default), so a stray
+# directory named cc-loadout would otherwise be "found" and exec'd, failing
+# the same way with "Is a directory" instead of "Permission denied". This is
+# not redundant — do not simplify it back to a bare `-x`.
+#
+# Deliberately out of scope: an executable regular file containing garbage
+# (mode 755, invalid program) still reaches `"$bin" hook "$event"` below and
+# fails with "Exec format error". No filesystem check can distinguish a
+# valid program from an invalid one without running it, the failure is
+# already contained (exit 0, stderr only, no stdout pollution), and
+# swallowing the shell's message would hide a real diagnostic along with it.
+if [ -n "$bin" ] && { [ ! -f "$bin" ] || [ ! -x "$bin" ]; }; then
   bin=""
 fi
-if [ -z "$bin" ] && [ -x "$HOME/.local/bin/cc-loadout" ]; then
+if [ -z "$bin" ] && [ -f "$HOME/.local/bin/cc-loadout" ] && [ -x "$HOME/.local/bin/cc-loadout" ]; then
   bin="$HOME/.local/bin/cc-loadout"
 fi
 
