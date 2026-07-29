@@ -1036,3 +1036,104 @@ fn hook_session_end_is_a_noop_without_a_session_id() {
         .assert()
         .success();
 }
+
+#[test]
+fn hook_session_start_rejects_a_hostile_session_id_in_the_env_file() {
+    // `$CLAUDE_ENV_FILE` is sourced by a shell later in the session. A session
+    // id is JSON-string input from Claude Code, which can legally contain a
+    // newline (splits into a second command line) or `$(...)`/backticks
+    // (command substitution). Regression test for the fix: the hook must
+    // never write such a value into the file, even though it must still
+    // exit successfully (a hook must never block a session).
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let env_file = ddir.path().join("env");
+
+    let hostile = "abc\n$(touch /tmp/pwned)";
+    let stdin = serde_json::json!({ "session_id": hostile }).to_string();
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .write_stdin(stdin)
+        .assert()
+        .success();
+
+    if env_file.exists() {
+        let body = std::fs::read_to_string(&env_file).unwrap();
+        assert!(
+            !body
+                .lines()
+                .any(|l| l.starts_with("export CC_LOADOUT_SESSION_ID=abc")),
+            "a hostile session id must never be written into the sourced env file: {body}"
+        );
+    }
+}
+
+#[test]
+fn hook_session_end_releases_the_sessions_on_demand_holds() {
+    // Positive-path coverage for session_end's actual wiring to
+    // `profile::on_demand::release_all` — the earlier noop test only covers
+    // the early-return guard. Drives `acquire` through the real CLI (not
+    // hand-written state) so the round trip through `hook session-end`
+    // exercises the same on-demand state and settings.local.json the CLI
+    // itself would produce.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+
+    let profiles = hdir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"scan_roots":[],"universal":[],"profiles":{},"on_demand":["pixijs@x"]}"#,
+    )
+    .unwrap();
+
+    // A prior value the release must restore.
+    let settings = repo.path().join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"enabledPlugins":{"pixijs@x":false}}"#).unwrap();
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .env("CC_LOADOUT_SESSION_ID", "sess-hookend-1")
+        .current_dir(repo.path())
+        .args(["profile", "on-demand", "acquire", "pixijs@x"])
+        .assert()
+        .success();
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(after["enabledPlugins"]["pixijs@x"], serde_json::json!(true));
+
+    let stdin = format!(
+        r#"{{"session_id":"sess-hookend-1","cwd":"{}"}}"#,
+        repo.path().display()
+    );
+    cmd(hdir.path(), ddir.path())
+        .args(["hook", "session-end"])
+        .write_stdin(stdin)
+        .assert()
+        .success();
+
+    let state_path = repo
+        .path()
+        .join(".claude")
+        .join(".cc-loadout")
+        .join("on-demand.json");
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(
+        state.get("pixijs@x").is_none(),
+        "the released key must be dropped from on-demand state: {state}"
+    );
+
+    let restored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(
+        restored["enabledPlugins"]["pixijs@x"],
+        serde_json::json!(false),
+        "settings.local.json must be restored to its pre-acquire value"
+    );
+}
