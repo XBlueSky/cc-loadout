@@ -67,11 +67,18 @@ cd ~/code/cc-loadout
 
 `install.sh`:
 
-- builds the release binary with `cargo` and copies it to `~/.local/bin/cc-loadout`;
-- seeds `~/.claude/profiles/profiles.json` from `profiles.example.json` (only if absent — your edits are safe);
-- promotes universal plugins to `scope: user` and installs a SessionStart hook to keep them that way.
+- installs the release binary to `~/.local/bin/cc-loadout` — building it with
+  `cargo` from a clone, or downloading a pre-built one otherwise;
+- runs `cc-loadout doctor --fix`, which seeds `~/.claude/profiles/profiles.json`
+  (only if absent — your edits are safe) and promotes managed plugins to
+  `scope: user`.
 
-It is idempotent — re-run after pulling a new version, or whenever plugin registry scope drifts. Your `profiles.json` is never overwritten.
+The SessionStart/SessionEnd hooks that keep plugin scope healthy ship with the
+plugin, so install it too (below). Older versions wrote those hooks into
+`~/.claude/settings.json`; `doctor --fix` removes them.
+
+It is idempotent — re-run after pulling a new version, or run `cc-loadout doctor`
+any time to see whether plugin scope has drifted.
 
 ### Pre-built (once a release is published)
 
@@ -91,8 +98,9 @@ Add it as a marketplace, then install:
 /plugin install cc-loadout@cc-loadout
 ```
 
-Then run `/cc-loadout:init` — or just ask Claude to "set up my cc-loadout profiles". The
-skill drives the `cc-loadout` CLI, so install the binary too (above). The interactive
+Then run `/cc-loadout:init` — or just ask Claude to "set up my cc-loadout profiles".
+The skill drives the `cc-loadout` CLI, so install the binary too (above); the
+plugin's SessionStart hook will tell you if it is missing. The interactive
 `cc-loadout profile init` TUI is the no-agent alternative.
 
 ## Usage
