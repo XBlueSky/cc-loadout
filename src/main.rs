@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 
 mod account;
+mod hooks;
 mod json;
 mod profile;
 mod status;

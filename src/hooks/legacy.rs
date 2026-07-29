@@ -1,0 +1,207 @@
+//! One-time removal of the `settings.json` hook entries older cc-loadout
+//! versions installed from `install.sh`.
+//!
+//! Those entries embed an absolute path into whatever clone ran the installer,
+//! and nothing ever removed them — uninstalling the plugin or moving the clone
+//! left a silently-failing hook behind forever. The plugin now owns the hooks,
+//! so these must go. This is the one write cc-loadout still makes to
+//! `settings.json`, and it is self-terminating: once removed, every later call
+//! is a no-op that touches nothing.
+
+use anyhow::{Context, Result};
+use serde_json::Value;
+use std::path::Path;
+
+use crate::util::atomicfile;
+
+const EVENTS: [&str; 2] = ["SessionStart", "SessionEnd"];
+
+/// True for cc-loadout's own retired hook commands, and nothing else.
+///
+/// Two shapes exist in the wild: the `lib/session-{start,end}-hook.sh` wrapper,
+/// and the older inline one-liner that sourced `registry.sh` and called
+/// `promote_universal_to_user`. Matching `registry.sh` alone would be too broad
+/// — another plugin could legitimately ship a file by that name — so the inline
+/// form requires both markers.
+pub fn is_legacy_command(command: &str) -> bool {
+    command.contains("session-start-hook.sh")
+        || command.contains("session-end-hook.sh")
+        || (command.contains("registry.sh") && command.contains("promote_universal_to_user"))
+}
+
+fn strip(root: &mut Value) -> usize {
+    let mut removed = 0usize;
+    let hooks = match root.get_mut("hooks").and_then(Value::as_object_mut) {
+        Some(h) => h,
+        None => return 0,
+    };
+    for event in EVENTS {
+        let groups = match hooks.get_mut(event).and_then(Value::as_array_mut) {
+            Some(g) => g,
+            None => continue,
+        };
+        for group in groups.iter_mut() {
+            if let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = list.len();
+                list.retain(|h| {
+                    !is_legacy_command(h.get("command").and_then(Value::as_str).unwrap_or(""))
+                });
+                removed += before - list.len();
+            }
+        }
+        // A group whose hooks list is now empty carries no meaning.
+        groups.retain(|g| {
+            g.get("hooks")
+                .and_then(Value::as_array)
+                .map(|l| !l.is_empty())
+                .unwrap_or(false)
+        });
+        if groups.is_empty() {
+            hooks.remove(event);
+        }
+    }
+    removed
+}
+
+/// `Ok(None)` means the file is absent — a normal state on a machine that never
+/// ran an older installer. Every other failure (unreadable file, malformed
+/// JSON) propagates, per the "Absent is not unreadable" constraint. The hook
+/// path swallows the error at its call site because a hook must never block a
+/// session; `doctor` surfaces it, because a diagnostic that reports health
+/// during a real failure is worse than no diagnostic at all.
+fn load(settings_path: &Path) -> Result<Option<Value>> {
+    let bytes = match std::fs::read(settings_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", settings_path.display())),
+    };
+    let root = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", settings_path.display()))?;
+    Ok(Some(root))
+}
+
+/// How many retired entries `settings_path` still holds. Never writes.
+pub fn count_legacy_hooks(settings_path: &Path) -> Result<usize> {
+    match load(settings_path)? {
+        Some(mut root) => Ok(strip(&mut root)),
+        None => Ok(0),
+    }
+}
+
+/// Remove the retired entries. Returns how many went; 0 means the file was not
+/// touched. An absent `settings.json` yields 0; one that exists but cannot be
+/// read or parsed is an error.
+pub fn remove_legacy_hooks(settings_path: &Path) -> Result<usize> {
+    let mut root = match load(settings_path)? {
+        Some(r) => r,
+        None => return Ok(0),
+    };
+    let removed = strip(&mut root);
+    if removed > 0 {
+        let out = serde_json::to_vec_pretty(&root)?;
+        atomicfile::write_atomic(settings_path, &out, 0o644)?;
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OTHER_PLUGIN: &str =
+        r#"bash ${CLAUDE_PLUGIN_ROOT}/hooks/scripts/session-start-inject.sh"#;
+
+    fn settings_with(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        std::fs::write(&p, body).unwrap();
+        (dir, p)
+    }
+
+    #[test]
+    fn recognises_every_retired_cc_loadout_command_shape() {
+        assert!(is_legacy_command(r#"bash "/x/lib/session-start-hook.sh""#));
+        assert!(is_legacy_command(r#"bash "/x/lib/session-end-hook.sh""#));
+        assert!(is_legacy_command(
+            r#"bash -c 'source /x/lib/registry.sh && promote_universal_to_user'"#
+        ));
+    }
+
+    #[test]
+    fn leaves_other_plugins_hooks_alone() {
+        assert!(!is_legacy_command(OTHER_PLUGIN));
+        assert!(!is_legacy_command("bash /x/lib/registry.sh"));
+    }
+
+    #[test]
+    fn removes_only_cc_loadout_entries_and_keeps_the_neighbour() {
+        let (_d, p) = settings_with(&format!(
+            r#"{{"hooks":{{"SessionStart":[
+                {{"hooks":[{{"type":"command","command":"bash \"/x/lib/session-start-hook.sh\""}}]}},
+                {{"hooks":[{{"type":"command","command":"{OTHER_PLUGIN}"}}]}}
+            ]}}}}"#
+        ));
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let groups = v["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "the emptied cc-loadout group is dropped");
+        assert_eq!(groups[0]["hooks"][0]["command"], OTHER_PLUGIN);
+    }
+
+    #[test]
+    fn drops_the_event_key_when_it_becomes_empty() {
+        let (_d, p) = settings_with(
+            r#"{"hooks":{"SessionEnd":[
+                {"hooks":[{"type":"command","command":"bash \"/x/lib/session-end-hook.sh\""}]}
+            ]}}"#,
+        );
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 1);
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        assert!(v["hooks"].get("SessionEnd").is_none());
+    }
+
+    #[test]
+    fn is_idempotent_and_does_not_rewrite_a_clean_file() {
+        let (_d, p) = settings_with(&format!(
+            r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{OTHER_PLUGIN}"}}]}}]}}}}"#
+        ));
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn a_missing_settings_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            remove_legacy_hooks(&dir.path().join("nope.json")).unwrap(),
+            0
+        );
+        assert_eq!(
+            count_legacy_hooks(&dir.path().join("nope.json")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_malformed_settings_file_propagates_as_an_error() {
+        // Absent is not unreadable: a settings.json that exists but cannot be
+        // parsed is a real problem `doctor` must report, not a silent zero.
+        let (_d, p) = settings_with("not json");
+        assert!(remove_legacy_hooks(&p).is_err());
+        assert!(count_legacy_hooks(&p).is_err());
+    }
+
+    #[test]
+    fn count_does_not_mutate() {
+        let (_d, p) = settings_with(
+            r#"{"hooks":{"SessionStart":[
+                {"hooks":[{"type":"command","command":"bash \"/x/lib/session-start-hook.sh\""}]}
+            ]}}"#,
+        );
+        let before = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(count_legacy_hooks(&p).unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+    }
+}
