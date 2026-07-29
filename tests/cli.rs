@@ -1137,3 +1137,99 @@ fn hook_session_end_releases_the_sessions_on_demand_holds() {
         "settings.local.json must be restored to its pre-acquire value"
     );
 }
+
+#[test]
+fn doctor_without_fix_reports_but_writes_nothing() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let profiles = home.join(".claude").join("profiles").join("profiles.json");
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("profiles.json"));
+
+    assert!(!profiles.exists(), "doctor without --fix must not seed");
+}
+
+#[test]
+fn doctor_fix_seeds_profiles_from_the_embedded_template() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    let profiles = home.join(".claude").join("profiles").join("profiles.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&profiles).unwrap()).unwrap();
+    assert!(v.get("universal").is_some(), "seeded file: {v}");
+}
+
+#[test]
+fn doctor_fix_never_overwrites_an_existing_profiles_json() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    let profiles = dir.join("profiles.json");
+    std::fs::write(&profiles, r#"{"sentinel":"mine","profiles":{}}"#).unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    assert!(std::fs::read_to_string(&profiles)
+        .unwrap()
+        .contains("sentinel"));
+}
+
+#[test]
+fn doctor_fix_reports_stale_backups_but_leaves_them_on_disk() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let bak = plugins.join("installed_plugins.json.bak.1700000000");
+    std::fs::write(&bak, "{}").unwrap();
+    // The retired installer left timestamped backups beside BOTH files.
+    let sbak = home.join(".claude").join("settings.json.bak.1700000001");
+    std::fs::write(&sbak, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--prune-backups"));
+
+    assert!(bak.exists(), "--fix must not delete backups");
+    assert!(sbak.exists(), "--fix must not delete backups");
+}
+
+#[test]
+fn doctor_prune_backups_removes_them() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let bak = plugins.join("installed_plugins.json.bak.1700000000");
+    std::fs::write(&bak, "{}").unwrap();
+    let sbak = home.join(".claude").join("settings.json.bak.1700000001");
+    std::fs::write(&sbak, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix", "--prune-backups"])
+        .assert()
+        .success();
+
+    assert!(!bak.exists(), "registry backups are reclaimed");
+    assert!(!sbak.exists(), "settings backups are reclaimed too");
+}

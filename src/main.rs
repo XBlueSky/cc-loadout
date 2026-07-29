@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 
 mod account;
+mod doctor;
 mod hooks;
 mod json;
 mod profile;
@@ -62,6 +63,15 @@ enum Command {
     Hook {
         #[command(subcommand)]
         action: HookAction,
+    },
+    /// Check and repair cc-loadout's own installation
+    Doctor {
+        /// Apply the repairs instead of only reporting them
+        #[arg(long)]
+        fix: bool,
+        /// Also delete stale timestamped registry backups (requires --fix)
+        #[arg(long = "prune-backups")]
+        prune_backups: bool,
     },
 }
 
@@ -953,6 +963,10 @@ fn run() -> Result<()> {
                     }
                     HookAction::SessionEnd => hooks::session_end(&raw)?,
                 }
+            }
+            Command::Doctor { fix, prune_backups } => {
+                let report = doctor::run(&home, config_override.as_deref(), fix, prune_backups)?;
+                doctor::print(&report, fix);
             }
         }, // Some(command) => match command
     }
