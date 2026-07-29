@@ -65,11 +65,16 @@ cd ~/code/cc-loadout
 
 `install.sh` 會:
 
-- 用 `cargo` 建出 release 執行檔並複製到 `~/.local/bin/cc-loadout`;
-- 從 `profiles.example.json` 種一份 `~/.claude/profiles/profiles.json`(只在不存在時 —— 你的修改是安全的);
-- 把 universal plugin 提升到 `scope: user`,並安裝一個 SessionStart hook 維持這個狀態。
+- 把 release 執行檔安裝到 `~/.local/bin/cc-loadout`——如果是從 clone 安裝就用 `cargo`
+  建置,否則就下載預先建好的版本;
+- 執行 `cc-loadout doctor --fix`,它會種一份 `~/.claude/profiles/profiles.json`
+  (只在不存在時 —— 你的修改是安全的),並把受管理的 plugin 提升到 `scope: user`。
 
-它是冪等的 —— 拉新版本後、或 plugin registry scope 飄移時,重跑即可。你的 `profiles.json` 永遠不會被覆寫。
+維持 plugin scope 健康的 SessionStart/SessionEnd hook 現在隨 plugin 一起發佈,所以也要
+把 plugin 裝起來(見下)。舊版本會把這些 hook 寫進 `~/.claude/settings.json`;
+`doctor --fix` 會把它們移除。
+
+它是冪等的 —— 拉新版本後重跑即可,或隨時執行 `cc-loadout doctor` 來檢查 plugin scope 是否飄移。
 
 ### 預先建好的版本(等發佈了 release 之後)
 
@@ -88,7 +93,10 @@ cc-loadout 也以 Claude Code plugin 形式發佈,內附一個導引式的 profi
 /plugin install cc-loadout@cc-loadout
 ```
 
-然後執行 `/cc-loadout:init` —— 或直接叫 Claude「set up my cc-loadout profiles」。這個 skill 會驅動 `cc-loadout` CLI,所以也要把執行檔裝起來(見上)。互動式的 `cc-loadout profile init` TUI 是不靠 agent 的替代做法。
+然後執行 `/cc-loadout:init` —— 或直接叫 Claude「set up my cc-loadout profiles」。這個
+skill 會驅動 `cc-loadout` CLI,所以也要把執行檔裝起來(見上);如果找不到執行檔,
+plugin 的 SessionStart hook 會提醒你。互動式的 `cc-loadout profile init` TUI 是不靠
+agent 的替代做法。
 
 ## 用法(Usage)
 
