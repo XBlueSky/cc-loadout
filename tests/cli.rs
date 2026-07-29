@@ -22,10 +22,16 @@ fn write_login(home: &Path, email: &str) {
 /// developer's real ~/.claude config. It ALSO puts a file-backed fake `crontab`
 /// first on PATH, so no test can splice the developer's real user crontab — even one
 /// that forgets to patch PATH itself (the gap that once wiped a live prime schedule).
-/// Do NOT call `Command::cargo_bin("cc-loadout")` directly anywhere in this file —
-/// always go through `cmd()` and chain extra `.env(...)` / `.current_dir(...)` as
-/// needed. A test that must inspect the table overrides PATH with its own
-/// `fake_crontab_path(dir)` and reads that dir's `tab`.
+/// It ALSO removes CC_LOADOUT_PROFILES (profiles_path() prefers it over $HOME, so a
+/// value leaking in from the ambient shell would redirect profiles.json reads/writes
+/// out of the sandbox) and CLAUDE_ENV_FILE (this branch newly taught `hook
+/// session-start` to open and append to it — an ambient value would make that write
+/// land outside the sandbox too). Do NOT call `Command::cargo_bin("cc-loadout")`
+/// directly anywhere in this file — always go through `cmd()` and chain extra
+/// `.env(...)` / `.current_dir(...)` as needed. A test that must inspect the table
+/// overrides PATH with its own `fake_crontab_path(dir)` and reads that dir's `tab`.
+/// A test that wants CC_LOADOUT_PROFILES or CLAUDE_ENV_FILE set does so explicitly
+/// after construction — `.env()` after `.env_remove()` still wins.
 fn cmd(home: &Path, data: &Path) -> Command {
     let mut c = Command::cargo_bin("cc-loadout").unwrap();
     // Default crontab isolation. The fake bin lives under the caller-owned `data`
@@ -37,7 +43,9 @@ fn cmd(home: &Path, data: &Path) -> Command {
     c.env("HOME", home)
         .env("XDG_DATA_HOME", data)
         .env("PATH", fake_path)
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CC_LOADOUT_PROFILES")
+        .env_remove("CLAUDE_ENV_FILE");
     c
 }
 
