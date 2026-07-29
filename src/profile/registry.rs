@@ -30,15 +30,6 @@ impl PromoteReport {
     }
 }
 
-/// The single fixed-name backup written before a mutating pass. Deliberately
-/// not timestamped: the old shell version's `.bak.$(date +%s)` accumulated 108
-/// files (1.7 MB) on one developer machine with no reclamation.
-fn backup_path(registry_path: &Path) -> PathBuf {
-    let mut name = registry_path.file_name().unwrap_or_default().to_os_string();
-    name.push(".cc-loadout.bak");
-    registry_path.with_file_name(name)
-}
-
 /// Every key cc-loadout manages: universal, on-demand, and all profile plugins.
 fn managed_keys(cfg: &Profiles) -> Vec<String> {
     let mut keys: Vec<String> = Vec::new();
@@ -111,7 +102,7 @@ pub fn promote_keys_to_user(registry_path: &Path, keys: &[String]) -> Result<Pro
 
     if report.changed() {
         // Backup is best-effort insurance; the write proceeds regardless if it fails.
-        let _ = std::fs::copy(registry_path, backup_path(registry_path));
+        let _ = std::fs::copy(registry_path, atomicfile::sidecar_backup(registry_path));
         let out = serde_json::to_vec_pretty(&root)?;
         atomicfile::write_atomic(registry_path, &out, 0o644)?;
     }

@@ -20,12 +20,19 @@ const EVENTS: [&str; 2] = ["SessionStart", "SessionEnd"];
 ///
 /// Two shapes exist in the wild: the `lib/session-{start,end}-hook.sh` wrapper,
 /// and the older inline one-liner that sourced `registry.sh` and called
-/// `promote_universal_to_user`. Matching `registry.sh` alone would be too broad
-/// — another plugin could legitimately ship a file by that name — so the inline
-/// form requires both markers.
+/// `promote_universal_to_user`. All three markers are anchored strictly to avoid
+/// false positives: the hook path deletion runs automatically on every session
+/// start once the plugin hook is wired up, and a mis-identified entry is
+/// silently deleted from `~/.claude/settings.json`, a file shared by all plugins.
+/// A false negative leaves one of our zombies behind; a false positive destroys
+/// someone else's hook and never surfaces a diagnostic. Asymmetric risk demands
+/// strict matching on all branches. The wrapper scripts anchor to `lib/` (always
+/// present in our installer paths, never in another plugin's legitimate use of
+/// those basenames). The inline form requires both `registry.sh` and
+/// `promote_universal_to_user` (a collision with both markers is implausible).
 pub fn is_legacy_command(command: &str) -> bool {
-    command.contains("session-start-hook.sh")
-        || command.contains("session-end-hook.sh")
+    command.contains("lib/session-start-hook.sh")
+        || command.contains("lib/session-end-hook.sh")
         || (command.contains("registry.sh") && command.contains("promote_universal_to_user"))
 }
 
@@ -98,6 +105,11 @@ pub fn remove_legacy_hooks(settings_path: &Path) -> Result<usize> {
     };
     let removed = strip(&mut root);
     if removed > 0 {
+        // Back up before the only write cc-loadout makes to a file it does not
+        // own. Best-effort insurance: the write proceeds even if the copy fails,
+        // but when it succeeds a mis-identified entry is recoverable instead of
+        // gone. Single fixed name, per the plan's backup policy.
+        let _ = std::fs::copy(settings_path, atomicfile::sidecar_backup(settings_path));
         let out = serde_json::to_vec_pretty(&root)?;
         atomicfile::write_atomic(settings_path, &out, 0o644)?;
     }
@@ -203,5 +215,52 @@ mod tests {
         let before = std::fs::read_to_string(&p).unwrap();
         assert_eq!(count_legacy_hooks(&p).unwrap(), 1);
         assert_eq!(std::fs::read_to_string(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn anchors_on_lib_to_reject_same_basename_different_path() {
+        // False positives would silently delete another plugin's hook.
+        // Our installer always wrote /path/lib/session-{start,end}-hook.sh.
+        // Another plugin writing /path/scripts/session-start-hook.sh must not match.
+        assert!(!is_legacy_command(
+            r#"bash "${CLAUDE_PLUGIN_ROOT}/scripts/session-start-hook.sh""#
+        ));
+        assert!(!is_legacy_command(
+            r#"bash "/opt/other-plugin/session-end-hook.sh""#
+        ));
+    }
+
+    #[test]
+    fn creates_exactly_one_fixed_name_backup_on_removal() {
+        let (_d, p) = settings_with(
+            r#"{"hooks":{"SessionStart":[
+                {"hooks":[{"type":"command","command":"bash \"/x/lib/session-start-hook.sh\""}]}
+            ]}}"#,
+        );
+        let dir = p.parent().unwrap();
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 1);
+
+        let baks: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+            .collect();
+        assert_eq!(baks.len(), 1, "exactly one fixed-name backup on removal");
+    }
+
+    #[test]
+    fn does_not_create_backup_on_clean_file() {
+        let (_d, p) = settings_with(&format!(
+            r#"{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"{OTHER_PLUGIN}"}}]}}]}}}}"#
+        ));
+        let dir = p.parent().unwrap();
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 0);
+
+        let baks: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".bak"))
+            .collect();
+        assert_eq!(baks.len(), 0, "no backup when file is not modified");
     }
 }
