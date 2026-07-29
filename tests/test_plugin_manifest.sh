@@ -105,3 +105,17 @@ else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a non-executable cc-loadout (exit=$hook_exit, out=$hook_out)"
 fi
 rm -rf "$hook_scratch"
+
+# Regression guard: `-x` alone returns true for a directory (the traversal
+# bit is set by default), so the ~/.local/bin fallback must also check `-f`
+# or a stray directory named cc-loadout is treated as usable.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/.local/bin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
+hook_exit=$?
+if [[ "$hook_out" == *"cc-loadout: CLI not installed"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh treats a directory at the fallback path as missing"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a directory at \$HOME/.local/bin/cc-loadout (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
