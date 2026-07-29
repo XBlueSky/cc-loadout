@@ -16,6 +16,16 @@ event="${1:-}"
 [ -n "$event" ] || exit 0
 
 bin="$(command -v cc-loadout 2>/dev/null || true)"
+# `command -v` reports a PATH match without checking that it is executable,
+# while the fallback below uses `-x`. Left inconsistent, a non-executable
+# cc-loadout on PATH (partial install, a copy that dropped the exec bit) is
+# treated as "found": the shim runs it, bash emits a raw "Permission denied",
+# and the install hint — the one message that exists to explain a broken
+# install — never prints, precisely when the install is broken. An unusable
+# binary must be indistinguishable from a missing one.
+if [ -n "$bin" ] && [ ! -x "$bin" ]; then
+  bin=""
+fi
 if [ -z "$bin" ] && [ -x "$HOME/.local/bin/cc-loadout" ]; then
   bin="$HOME/.local/bin/cc-loadout"
 fi

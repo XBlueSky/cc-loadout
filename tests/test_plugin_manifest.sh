@@ -86,3 +86,22 @@ if grep -rq "lib/session-.*-hook.sh" "$ROOT/hooks/" 2>/dev/null; then
 else
   TEST_PASS=$((TEST_PASS+1)); echo "  ok: no shim references the retired lib/ scripts"
 fi
+
+# Regression guard: this file also checks hook.sh *behaviour*, not just
+# manifest shape, because the binary-resolution lookup it validates has no
+# other test coverage. A non-executable cc-loadout on PATH must be treated
+# the same as no cc-loadout at all: `command -v` alone reports a match
+# without checking the executable bit, so a partial/broken install must not
+# silently swallow the one message that explains it.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/bin"
+printf '#!/bin/bash\necho ran\n' > "$hook_scratch/bin/cc-loadout"
+chmod 644 "$hook_scratch/bin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
+hook_exit=$?
+if [[ "$hook_out" == *"cc-loadout: CLI not installed"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh treats a non-executable cc-loadout on PATH as missing"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a non-executable cc-loadout (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
