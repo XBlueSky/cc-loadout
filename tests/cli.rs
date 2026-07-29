@@ -1202,6 +1202,13 @@ fn doctor_fix_reports_stale_backups_but_leaves_them_on_disk() {
     // The retired installer left timestamped backups beside BOTH files.
     let sbak = home.join(".claude").join("settings.json.bak.1700000001");
     std::fs::write(&sbak, "{}").unwrap();
+    // profiles.json accumulates the same way, via write_profiles on every
+    // board deploy / `profile init` — not from the retired installer, but
+    // reclaimed by the same sweep.
+    let profiles_dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let pbak = profiles_dir.join("profiles.json.bak.1700000002");
+    std::fs::write(&pbak, "{}").unwrap();
 
     cmd(home, ddir.path())
         .args(["doctor", "--fix"])
@@ -1211,6 +1218,7 @@ fn doctor_fix_reports_stale_backups_but_leaves_them_on_disk() {
 
     assert!(bak.exists(), "--fix must not delete backups");
     assert!(sbak.exists(), "--fix must not delete backups");
+    assert!(pbak.exists(), "--fix must not delete backups");
 }
 
 #[test]
@@ -1318,6 +1326,10 @@ fn doctor_prune_backups_removes_them() {
     std::fs::write(&bak, "{}").unwrap();
     let sbak = home.join(".claude").join("settings.json.bak.1700000001");
     std::fs::write(&sbak, "{}").unwrap();
+    let profiles_dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let pbak = profiles_dir.join("profiles.json.bak.1700000002");
+    std::fs::write(&pbak, "{}").unwrap();
 
     cmd(home, ddir.path())
         .args(["doctor", "--fix", "--prune-backups"])
@@ -1326,6 +1338,27 @@ fn doctor_prune_backups_removes_them() {
 
     assert!(!bak.exists(), "registry backups are reclaimed");
     assert!(!sbak.exists(), "settings backups are reclaimed too");
+    assert!(!pbak.exists(), "profiles.json backups are reclaimed too");
+}
+
+#[test]
+fn doctor_without_fix_says_theres_nothing_to_check_when_profiles_json_is_absent() {
+    // M4: with no profiles.json at all, doctor never loaded anything to check
+    // scope against. "plugin scope: already consistent" would be a diagnostic
+    // reporting health it never established — the same anti-pattern C1 exists
+    // to kill one level down.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no profiles.json — nothing to check",
+        ))
+        .stdout(predicate::str::contains("already consistent").not());
 }
 
 #[test]
