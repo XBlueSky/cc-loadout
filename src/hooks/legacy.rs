@@ -178,6 +178,36 @@ mod tests {
     }
 
     #[test]
+    fn preserves_an_entry_with_no_command_field_while_removing_a_legacy_one() {
+        // A hook entry need not have a `command` field at all (e.g. a
+        // `type: "prompt"` hook). `is_legacy_command("")` must be false, so
+        // `strip()` leaves such an entry alone instead of mistaking "absent"
+        // for "matches" and dropping someone else's configuration. Go through
+        // `remove_legacy_hooks` rather than `strip()` directly, so this proves
+        // the entry survives a real write, not just the in-memory filter.
+        const PROMPT_ONLY: &str = r#"{"type": "prompt", "prompt": "some prompt"}"#;
+        let (_d, p) = settings_with(&format!(
+            r#"{{"hooks":{{"SessionStart":[
+                {{"hooks":[
+                    {{"type":"command","command":"bash \"/x/lib/session-start-hook.sh\""}},
+                    {PROMPT_ONLY}
+                ]}}
+            ]}}}}"#
+        ));
+        assert_eq!(remove_legacy_hooks(&p).unwrap(), 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let hooks = v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap();
+        assert_eq!(
+            hooks.len(),
+            1,
+            "the legacy entry is removed, the command-less one stays"
+        );
+        assert_eq!(hooks[0]["type"], "prompt");
+        assert!(hooks[0].get("command").is_none());
+    }
+
+    #[test]
     fn drops_the_event_key_when_it_becomes_empty() {
         let (_d, p) = settings_with(
             r#"{"hooks":{"SessionEnd":[
