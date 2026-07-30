@@ -164,6 +164,13 @@ pub fn scan_repo_signals(
 }
 
 fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
+    // Canonicalize up front so RepoSignal.path agrees with detect_one's own
+    // canonicalize-before-match (detect.rs:27-28) — otherwise a repo reached
+    // through a symlinked scan root would fail path_prefix rules that disk
+    // detection resolves correctly. Same fallback semantics as detect.rs:26.
+    let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let repo = canonical.as_path();
+
     let marker_files = MARKER_FILES
         .iter()
         .filter(|m| repo.join(m).exists())
