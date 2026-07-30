@@ -16,6 +16,7 @@ pub mod plugins;
 pub mod registry;
 pub mod scan;
 pub mod scan_cache;
+pub mod signal_detect;
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
