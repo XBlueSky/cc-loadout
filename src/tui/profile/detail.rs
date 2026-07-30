@@ -451,15 +451,22 @@ mod tests {
     }
 
     #[test]
-    fn detail_done_after_rule_edit_emits_background_recompute() {
-        // Editing detection rules DOES change uncovered, so done emits a
-        // background RecomputeUncovered (spinner) rather than freezing.
-        let inv = inv_with_cargo_repo("/tmp/none");
+    fn detail_done_after_rule_edit_recomputes_uncovered_synchronously() {
+        // Editing detection rules DOES change uncovered, but the recompute now
+        // runs inline over the indexed signal (zero I/O) instead of dispatching
+        // a background job: `done` emits no Action, and `uncovered` already
+        // reflects the new rule by the time `on_key` returns.
+        let inv = inv_with_cargo_repo("/workspace/svc");
         let working = working_rust_profile(vec![]);
         let mut view = open_detail_on_rust(inv, working);
         let (_h, _d, ctx) = test_support::ctx();
         let snap = test_support::snap();
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // open Detail(rust)
+        assert_eq!(
+            view.uncovered_for_test(),
+            &["/workspace/svc".to_string()],
+            "empty detect rules match nothing yet"
+        );
         view.on_key(k(KeyCode::Tab), &ctx, &snap); // focus -> Rules
         view.on_key(k(KeyCode::Char('a')), &ctx, &snap); // open builder (kind pick)
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // choose "path under"
@@ -469,11 +476,12 @@ mod tests {
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // commit rule
         let action = view.on_key(k(KeyCode::Enter), &ctx, &snap); // done
         assert!(
-            matches!(
-                action,
-                Some(crate::tui::view::Action::RecomputeUncovered { .. })
-            ),
-            "a rule change must recompute uncovered on the job thread, got {action:?}"
+            action.is_none(),
+            "the recompute is inline now — no background Action, got {action:?}"
+        );
+        assert!(
+            view.uncovered_for_test().is_empty(),
+            "the new path_prefix rule now matches the repo, coverage updated synchronously"
         );
     }
 

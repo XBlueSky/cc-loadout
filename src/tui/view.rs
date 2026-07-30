@@ -43,13 +43,6 @@ pub enum Action {
         roots: Vec<String>,
         working: crate::profile::config::Profiles,
     },
-    /// Recompute the uncovered-repos drift on the job thread (detection over every
-    /// repo touches the filesystem and must not freeze the UI). Emitted after an
-    /// edit that changed detection; the result is handed back via `accept_uncovered`.
-    RecomputeUncovered {
-        repos: Vec<crate::profile::discover::RepoSignal>,
-        working: crate::profile::config::Profiles,
-    },
 }
 
 /// One tab. Renders the body area; emits `Action`s rather than touching disk.
@@ -83,7 +76,7 @@ pub trait View {
     /// Receive a completed background repo scan (from `Action::Rescan`).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_scan(&mut self, _outcome: crate::tui::job::ScanOutcome) {}
-    /// Receive a recomputed uncovered-repos set (from `Action::RecomputeUncovered`).
+    /// Receive a recomputed uncovered-repos set (from a completed `Rescan` job).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_uncovered(&mut self, _uncovered: Vec<String>) {}
     /// Return the working config to persist when it has unsaved edits, marking it
@@ -99,19 +92,6 @@ pub trait View {
     /// authoritative uncovered source across sessions, regardless of which code
     /// path recomputed the set. Default: `None` (only the Profile view holds it).
     fn dirty_uncovered(&mut self) -> Option<Vec<String>> {
-        None
-    }
-    /// Return `(repos, working)` for a pending off-thread uncovered recompute,
-    /// clearing the request. `App` polls this after every key and job result and
-    /// dispatches an `Action::RecomputeUncovered`-equivalent background job. Used
-    /// by view paths that change detection but cannot return an `Action`
-    /// themselves (e.g. `accept_draft`). Default: `None`.
-    fn take_recompute_request(
-        &mut self,
-    ) -> Option<(
-        Vec<crate::profile::discover::RepoSignal>,
-        crate::profile::config::Profiles,
-    )> {
         None
     }
 }

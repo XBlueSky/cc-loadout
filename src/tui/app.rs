@@ -73,23 +73,23 @@ impl App {
         let mut scanned_at = None;
         let mut cached_repos = Vec::new();
         let mut cached_uncovered = Vec::new();
-        // A cached `uncovered: None` means the cache predates uncovered tracking
-        // (or was never computed) — seed empty now and schedule a one-time
-        // background backfill so the drift badge fills in without a manual `s`.
-        let mut needs_backfill = false;
+        // A cached `uncovered: None` means the cache predates the atom index (a
+        // v1 cache has no `rule_hits`, so a signal-based recompute over it would
+        // land every repo Unknown) — seed uncovered empty and mark it pending
+        // rather than guessing. Task 10 replaces this with a banner + explicit
+        // rebuild; this task only stops the old (deleted) background-walk
+        // backfill from having a caller.
+        let mut uncovered_pending = false;
         if let Some(cache) = crate::profile::scan_cache::load(&ctx.data_root) {
             if cache.roots == scan_roots {
                 cached_repos = cache.repos;
                 match cache.uncovered {
                     Some(u) => cached_uncovered = u,
-                    None => needs_backfill = !cached_repos.is_empty(),
+                    None => uncovered_pending = !cached_repos.is_empty(),
                 }
                 scanned_at = Some(cache.scanned_at);
             }
         }
-        // Capture backfill inputs before repos/working move into the view.
-        let backfill = needs_backfill.then(|| (cached_repos.clone(), working.clone()));
-        let data_root = ctx.data_root.clone();
         let tabs: Vec<Box<dyn View>> = vec![
             Box::new(Overview::new()),
             Box::new(AccountsView::new()),
@@ -102,12 +102,13 @@ impl App {
                     .with_scan_roots(scan_roots)
                     .with_scanned_at(scanned_at)
                     .with_scan_repos(cached_repos)
-                    .with_uncovered(cached_uncovered),
+                    .with_uncovered(cached_uncovered)
+                    .with_uncovered_pending(uncovered_pending),
             ),
             Box::new(crate::tui::tasks::TasksView::new()),
         ];
         let active = initial_tab.min(tabs.len().saturating_sub(1));
-        let mut app = App {
+        let app = App {
             tabs,
             active,
             should_quit: false,
@@ -120,13 +121,6 @@ impl App {
             ctx,
             snap,
         };
-        // One-time legacy backfill: detached (never blocks input), persists the
-        // computed set to the cache so the walk happens at most once, and its
-        // result reaches the Profile view when it lands.
-        if let Some((repos, working)) = backfill {
-            let job = Self::recompute_uncovered_job(repos, working, Some(data_root));
-            app.detached.push(job.rx);
-        }
         Ok(app)
     }
 
@@ -200,53 +194,6 @@ impl App {
                 cache.uncovered = Some(uncovered);
                 let _ = crate::profile::scan_cache::save(&self.ctx.data_root, &cache);
             }
-        }
-    }
-
-    /// Build the background job that recomputes the uncovered-repos drift for
-    /// `repos` + `working`. When `persist_to` is `Some(data_root)`, the job also
-    /// writes the result into that scan cache's `uncovered` field — used by the
-    /// one-time legacy backfill so the cache is repaired even when the in-session
-    /// result routes past a non-Profile active tab.
-    fn recompute_uncovered_job(
-        repos: Vec<crate::profile::discover::RepoSignal>,
-        working: crate::profile::config::Profiles,
-        persist_to: Option<std::path::PathBuf>,
-    ) -> crate::tui::job::Job {
-        crate::tui::job::spawn("updating\u{2026}", crate::now_epoch() * 1000, move || {
-            let inv = crate::profile::discover::Inventory {
-                plugins: Vec::new(),
-                repos,
-                suggested_profiles: Vec::new(),
-            };
-            let uncovered = crate::profile::drift::uncovered_repos(&inv, &working);
-            if let Some(dr) = persist_to {
-                if let Some(mut cache) = crate::profile::scan_cache::load(&dr) {
-                    cache.uncovered = Some(uncovered.clone());
-                    let _ = crate::profile::scan_cache::save(&dr, &cache);
-                }
-            }
-            crate::tui::job::JobResult {
-                toast: String::new(),
-                needs_refresh: false,
-                draft: None,
-                scan: None,
-                uncovered: Some(uncovered),
-            }
-        })
-    }
-
-    /// Dispatch a pending off-thread uncovered recompute requested by the active
-    /// view (e.g. after `accept_draft`). No-op when a job is already running — the
-    /// request flag persists and is retried on the next drain. Mirrors how the
-    /// Detail-edit path returns `Action::RecomputeUncovered`, but serves paths
-    /// that cannot return an `Action`.
-    fn dispatch_pending_recompute(&mut self) {
-        if self.job.is_some() {
-            return;
-        }
-        if let Some((repos, working)) = self.tabs[self.active].take_recompute_request() {
-            self.job = Some(Self::recompute_uncovered_job(repos, working, None));
         }
     }
 
@@ -380,7 +327,6 @@ impl App {
             self.refresh()?;
         }
         self.persist_active_config();
-        self.dispatch_pending_recompute();
         Ok(())
     }
 
@@ -610,9 +556,6 @@ impl App {
                     },
                 ));
             }
-            Action::RecomputeUncovered { repos, working } => {
-                self.job = Some(Self::recompute_uncovered_job(repos, working, None));
-            }
             Action::RunTask(id) => {
                 let store = self.ctx.store.clone();
                 let data_root = self.ctx.data_root.clone();
@@ -802,7 +745,6 @@ impl App {
             self.apply_action(action)?;
         }
         self.persist_active_config();
-        self.dispatch_pending_recompute();
         Ok(())
     }
 
@@ -1347,22 +1289,29 @@ mod tests {
     }
 
     #[test]
-    fn new_backfills_legacy_cache_uncovered_in_background() {
-        // A legacy cache (uncovered: None) with repos must not block startup, but
-        // must schedule a one-time background backfill that computes uncovered and
-        // repairs the cache — so the drift badge fills in without a manual `s`.
+    fn new_does_not_spawn_a_backfill_job_for_a_legacy_cache() {
+        // A legacy cache (uncovered: None, predating the atom index) must not
+        // block startup — and, since the background-walk backfill job was
+        // deleted (Task 6: drift is now computed from the signal index, not a
+        // filesystem walk), startup must not schedule ANY job for it either.
+        // The cache is left untouched; Task 10 replaces this seed with an
+        // explicit rebuild + banner.
         let hdir = tempfile::tempdir().unwrap();
         let ddir = tempfile::tempdir().unwrap();
         // None uncovered + one repo (/workspace/a, nonexistent) under empty profiles.
         let ctx = ctx_with_cache_uncovered(hdir.path(), ddir.path(), "/workspace", None);
-        // Startup returns immediately (backfill is detached, not blocking).
         let mut app = App::new(ctx, 1).unwrap(); // active = Accounts, NOT Profile
+        assert!(
+            app.detached.is_empty(),
+            "no backfill job is scheduled for a legacy cache anymore"
+        );
         drain_until_settled(&mut app);
-        let cache = crate::profile::scan_cache::load(ddir.path()).unwrap();
         assert_eq!(
-            cache.uncovered,
-            Some(vec!["/workspace/a".to_string()]),
-            "backfill must compute uncovered and repair the cache (repo matches no profile)"
+            crate::profile::scan_cache::load(ddir.path())
+                .unwrap()
+                .uncovered,
+            None,
+            "the cache is left untouched until Task 10's explicit rebuild"
         );
     }
 
@@ -1903,8 +1852,8 @@ mod tests {
         panic!("background job did not finish in time");
     }
 
-    /// Like `drain_until_idle` but also waits for detached jobs (e.g. the startup
-    /// legacy-uncovered backfill) to land.
+    /// Like `drain_until_idle` but also waits for detached jobs (e.g. one moved
+    /// there via Esc) to land.
     fn drain_until_settled(app: &mut App) {
         for _ in 0..400 {
             app.drain_jobs(i64::MAX / 2).unwrap();
@@ -1956,7 +1905,7 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Enter)).unwrap(); // commit rule
         app.handle_key(key(KeyCode::Enter)).unwrap(); // done → write back to working
-        drain_until_idle(&mut app); // rule change recompute runs on the job thread
+        drain_until_idle(&mut app); // no-op now: the recompute is inline, not a job
 
         // Commit to disk via Apply, then read the profile back.
         app.handle_key(key(KeyCode::Char('w'))).unwrap(); // open Apply
@@ -2038,7 +1987,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('f'))).unwrap(); // open repo picker
         app.handle_key(key(KeyCode::Enter)).unwrap(); // prefill from first repo
         app.handle_key(key(KeyCode::Enter)).unwrap(); // done -> write back
-        drain_until_idle(&mut app); // rule change recompute runs on the job thread
+        drain_until_idle(&mut app); // no-op now: the recompute is inline, not a job
 
         app.handle_key(key(KeyCode::Char('w'))).unwrap(); // open Apply
         app.handle_key(key(KeyCode::Enter)).unwrap(); // commit
@@ -2077,7 +2026,7 @@ mod tests {
         );
         // Done → write back, then commit to disk and read profile back.
         app.handle_key(key(KeyCode::Enter)).unwrap(); // done from Rules → write back
-        drain_until_idle(&mut app); // rule change recompute runs on the job thread
+        drain_until_idle(&mut app); // no-op now: the recompute is inline, not a job
         app.handle_key(key(KeyCode::Char('w'))).unwrap(); // open Apply
         app.handle_key(key(KeyCode::Enter)).unwrap(); // commit
         drain_commit(&app);
@@ -2155,7 +2104,7 @@ mod tests {
         // If the picker still owns focus, Enter prefills from the repo.
         app.handle_key(key(KeyCode::Enter)).unwrap(); // prefill from first repo
         app.handle_key(key(KeyCode::Enter)).unwrap(); // done -> write back
-        drain_until_idle(&mut app); // rule change recompute runs on the job thread
+        drain_until_idle(&mut app); // no-op now: the recompute is inline, not a job
 
         app.handle_key(key(KeyCode::Char('w'))).unwrap(); // open Apply
         app.handle_key(key(KeyCode::Enter)).unwrap(); // commit

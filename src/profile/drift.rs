@@ -65,6 +65,29 @@ pub fn uncovered_repos(inv: &Inventory, working: &Profiles) -> Vec<String> {
     out
 }
 
+/// Uncovered repos computed purely from indexed signals — zero filesystem I/O,
+/// via `signal_detect::detect_from_signal`. A repo whose evaluation could not
+/// be decided for every profile (some rule needed an atom the index never
+/// recorded) is left out of the list rather than guessed at; the second
+/// return value is `true` when any repo is still undecided, telling the
+/// caller the result is provisional until a full atom index lands.
+pub fn uncovered_from_signals(repos: &[RepoSignal], cfg: &Profiles) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut any_pending = false;
+    for r in repos {
+        let (matched, pending) = crate::profile::signal_detect::detect_from_signal(r, cfg);
+        if pending {
+            any_pending = true;
+            continue;
+        }
+        if matched.is_empty() {
+            out.push(r.path.clone());
+        }
+    }
+    out.sort();
+    (out, any_pending)
+}
+
 /// The five re-edit drift signals.
 pub struct Drift {
     pub new_unassigned: Vec<String>,
@@ -253,5 +276,35 @@ mod tests {
         };
         assert_eq!(d.review_count(), 1);
         assert!(!d.is_clean());
+    }
+
+    fn sig(path: &str, hits: &[(&str, bool)]) -> RepoSignal {
+        RepoSignal {
+            path: path.to_string(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: hits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            override_names: None,
+        }
+    }
+
+    fn sig_no_hits(path: &str) -> RepoSignal {
+        sig(path, &[])
+    }
+
+    #[test]
+    fn uncovered_from_signals_excludes_pending_repos() {
+        let cfg: Profiles = serde_json::from_str(
+            r#"{"universal": [], "profiles": {
+        "rust": {"plugins": [], "detect": {"marker_files": ["Cargo.toml"]}}}}"#,
+        )
+        .unwrap();
+        let hit = |b| sig("/a", &[("file:Cargo.toml", b)]);
+        let unknown = sig_no_hits("/b"); // empty rule_hits → Unknown
+        let (unc, pending) = uncovered_from_signals(&[hit(false), unknown], &cfg);
+        assert_eq!(unc, vec!["/a".to_string()]); // definite no-match
+        assert!(pending); // /b is undecided, not "uncovered"
     }
 }
