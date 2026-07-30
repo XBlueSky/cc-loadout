@@ -59,7 +59,6 @@ pub fn vocabulary(cfg: &Profiles) -> BTreeSet<String> {
 /// means some atom the rules need was never indexed (the caller should treat
 /// this as "ask the disk"), `NoMatch` is a definite miss.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // consumed from Task 6
 pub enum ProfileAnswer {
     Match(MatchReason),
     NoMatch,
@@ -81,7 +80,6 @@ pub enum ProfileAnswer {
 /// skipped over, exactly like disk detection would if the caller re-asked
 /// with the missing atom resolved. Only when no rule ever matches AND at
 /// least one atom was missing do we report `Unknown` instead of `NoMatch`.
-#[allow(dead_code)] // consumed from Task 6
 pub fn profile_answer(sig: &RepoSignal, profile: &Profile) -> ProfileAnswer {
     let d = &profile.detect;
     let mut saw_unknown = false;
@@ -201,7 +199,6 @@ pub fn profile_answer(sig: &RepoSignal, profile: &Profile) -> ProfileAnswer {
 /// `detect_profiles_explained`'s explicit sort at detect.rs:60) is evaluated;
 /// `.1` is `true` if *any* profile answered `Unknown`, telling the caller this
 /// repo's rendering is provisional pending a full atom index.
-#[allow(dead_code)] // consumed from Task 6
 pub fn detect_from_signal_explained(
     sig: &RepoSignal,
     cfg: &Profiles,
@@ -238,7 +235,6 @@ pub fn detect_from_signal_explained(
 
 /// Thin name-only view over `detect_from_signal_explained`, mirroring
 /// `detect::detect_profiles` over `detect_profiles_explained`.
-#[allow(dead_code)] // consumed from Task 6
 pub fn detect_from_signal(sig: &RepoSignal, cfg: &Profiles) -> (Vec<String>, bool) {
     let (explained, pending) = detect_from_signal_explained(sig, cfg);
     (

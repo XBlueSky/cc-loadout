@@ -60,11 +60,12 @@ pub struct ProfileView {
     /// Snapshot of `uncovered` as last persisted to the scan cache; `dirty_uncovered`
     /// compares against it so a cache write fires exactly when the set changed.
     saved_uncovered: Vec<String>,
-    /// Set when an edit changed detection but the (filesystem-walking) uncovered
-    /// recompute must run off the UI thread. `App` drains it via
-    /// `take_recompute_request` and dispatches the background job. Used by paths
-    /// that cannot themselves return an `Action` (e.g. `accept_draft`).
-    needs_recompute: bool,
+    /// Set when the last signal-based recompute (`uncovered_from_signals`) could
+    /// not decide every repo — some profile's rule needed an atom the index
+    /// never recorded. While true, `self.uncovered` keeps its last value and the
+    /// board renders a trailing `…` cue (Task 7) rather than claiming a stale
+    /// answer is final.
+    pub(super) uncovered_pending: bool,
     /// Epoch seconds of the scan whose repos are loaded (from cache or a live
     /// scan); `None` until anything is scanned. Drives the scan bar's age/stale.
     pub(super) scanned_at: Option<i64>,
@@ -95,7 +96,7 @@ impl ProfileView {
             on_demand_help: false,
             saved,
             saved_uncovered: Vec::new(),
-            needs_recompute: false,
+            uncovered_pending: false,
             scanned_at: None,
         };
         v.recompute_uncovered();
@@ -140,6 +141,15 @@ impl ProfileView {
     pub(crate) fn with_uncovered(mut self, uncovered: Vec<String>) -> Self {
         self.saved_uncovered = uncovered.clone();
         self.uncovered = uncovered;
+        self
+    }
+
+    /// Mark the seeded `uncovered` set as provisional (a v1 scan cache predates
+    /// the atom index, so nothing can be decided from it yet). Task 10 replaces
+    /// this seed with an explicit rebuild + banner; until then the board just
+    /// renders the pending cue over the empty seeded set.
+    pub(crate) fn with_uncovered_pending(mut self, pending: bool) -> Self {
+        self.uncovered_pending = pending;
         self
     }
 
@@ -263,6 +273,13 @@ impl ProfileView {
     #[cfg(test)]
     pub fn uncovered_for_test(&self) -> &[String] {
         &self.uncovered
+    }
+
+    /// Test-visible accessor for whether the last signal-based recompute was
+    /// undecided for some repo (see `uncovered_pending`).
+    #[cfg(test)]
+    pub fn uncovered_pending_for_test(&self) -> bool {
+        self.uncovered_pending
     }
 
     /// Test-visible accessor for Apply state (returns None if not in Apply).
@@ -894,16 +911,17 @@ impl View for ProfileView {
         if detail_done {
             self.sub = Sub::Board;
         }
-        // When detection changed, the uncovered set must be recomputed — but that
-        // walks every scanned repo (filesystem I/O), so run it on the job thread
-        // behind a spinner instead of freezing the event loop. The board shows the
-        // spinner and its drift updates via `accept_uncovered` when it lands.
+        // When detection changed, the uncovered set is recomputed in place from
+        // the indexed signal (signal_detect over self.inv.repos) — zero
+        // filesystem I/O, so this runs synchronously, no job/spinner needed.
         if recompute {
             self.sub = Sub::Board;
-            action_out = Some(Action::RecomputeUncovered {
-                repos: self.inv.repos.clone(),
-                working: self.working.clone(),
-            });
+            let (unc, pending) =
+                crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
+            if !pending {
+                self.uncovered = unc;
+            }
+            self.uncovered_pending = pending;
         }
 
         action_out
@@ -946,20 +964,13 @@ impl View for ProfileView {
         self.working = draft;
         self.ai_offer = false;
         // The draft replaces every profile's detect rules, so coverage changes —
-        // but recomputing walks every repo. Flag it for `App` to run off the UI
-        // thread (accept_draft cannot itself return an `Action`).
-        self.needs_recompute = true;
-    }
-
-    fn take_recompute_request(
-        &mut self,
-    ) -> Option<(Vec<crate::profile::discover::RepoSignal>, Profiles)> {
-        if self.needs_recompute {
-            self.needs_recompute = false;
-            Some((self.inv.repos.clone(), self.working.clone()))
-        } else {
-            None
+        // recompute it in place from the indexed signal (zero filesystem I/O).
+        let (unc, pending) =
+            crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
+        if !pending {
+            self.uncovered = unc;
         }
+        self.uncovered_pending = pending;
     }
 
     fn accept_scan(&mut self, outcome: crate::tui::job::ScanOutcome) {
@@ -1113,26 +1124,50 @@ mod tests {
     }
 
     #[test]
-    fn accept_draft_requests_recompute_off_thread() {
-        use crate::tui::view::View;
-        // accept_draft changes every detect rule, so coverage must be recomputed
-        // — but off the UI thread. It must NOT walk synchronously; instead it
-        // flags a request App drains via take_recompute_request.
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        let mut v = ProfileView::new(inv, working, false, false);
-        assert!(
-            v.take_recompute_request().is_none(),
-            "no pending recompute before a draft"
+    fn accept_draft_recomputes_uncovered_from_the_index_not_the_disk() {
+        // accept_draft changes every detect rule, so coverage must be
+        // recomputed — but there is no filesystem walk to wait on: the repo's
+        // directory below does not exist on disk, only its indexed signal says
+        // Cargo.toml is present. A stale disk-walking recompute would find
+        // nothing and leave the repo uncovered; the signal-based recompute
+        // must pick it up synchronously, no job required.
+        use crate::profile::discover::RepoSignal;
+        let repo = RepoSignal {
+            path: "/does/not/exist/a".into(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: [("file:Cargo.toml".to_string(), true)]
+                .into_iter()
+                .collect(),
+            override_names: None,
+        };
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![repo],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false);
+        assert_eq!(
+            v.uncovered_for_test(),
+            &["/does/not/exist/a".to_string()],
+            "no profiles yet: the repo is uncovered"
         );
-        v.accept_draft(crate::profile::config::Profiles::default());
+
+        let draft: Profiles = serde_json::from_str(
+            r#"{"universal": [], "profiles": {
+                "rust": {"plugins": [], "detect": {"marker_files": ["Cargo.toml"]}}}}"#,
+        )
+        .unwrap();
+        v.accept_draft(draft);
         assert!(
-            v.take_recompute_request().is_some(),
-            "accept_draft must request an off-thread recompute"
+            v.uncovered_for_test().is_empty(),
+            "the indexed marker_file hit must cover the repo synchronously"
         );
         assert!(
-            v.take_recompute_request().is_none(),
-            "the request must be one-shot (drained)"
+            !v.uncovered_pending_for_test(),
+            "a fully indexed repo must not be pending"
         );
     }
 
