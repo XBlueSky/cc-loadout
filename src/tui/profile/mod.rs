@@ -168,7 +168,8 @@ impl ProfileView {
         let Some(roots) = self.nonempty_scan_roots() else {
             return;
         };
-        let repos = crate::profile::discover::scan_repo_signals(&roots, 6);
+        let vocab = crate::profile::signal_detect::vocabulary(&self.working);
+        let repos = crate::profile::discover::scan_repo_signals(&roots, 6, &vocab);
         let suggested = crate::profile::discover::suggest_profiles(&repos);
         let uncovered =
             crate::profile::drift::uncovered_post_merge(&self.working, &suggested, &repos);

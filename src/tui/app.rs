@@ -573,7 +573,8 @@ impl App {
                     label,
                     crate::now_epoch() * 1000,
                     move || {
-                        let repos = crate::profile::discover::scan_repo_signals(&roots, 6);
+                        let vocab = crate::profile::signal_detect::vocabulary(&working);
+                        let repos = crate::profile::discover::scan_repo_signals(&roots, 6, &vocab);
                         let suggested = crate::profile::discover::suggest_profiles(&repos);
                         // Compute the uncovered drift here (post-merge) so the UI
                         // thread never re-walks every repo when folding the result.
@@ -715,7 +716,13 @@ impl App {
             move || {
                 let mut inv = inv;
                 if inv.repos.is_empty() && !scan_roots.is_empty() {
-                    inv.repos = crate::profile::discover::scan_repo_signals(&scan_roots, 6);
+                    // No loaded profiles config is available on this path (the
+                    // draft flow runs before any profile assignment exists), so
+                    // index against the marker/glob defaults only.
+                    let vocab = crate::profile::signal_detect::vocabulary(
+                        &crate::profile::config::Profiles::default(),
+                    );
+                    inv.repos = crate::profile::discover::scan_repo_signals(&scan_roots, 6, &vocab);
                     inv.suggested_profiles = crate::profile::discover::suggest_profiles(&inv.repos);
                 }
                 match crate::profile::ai::draft_with_claude(
