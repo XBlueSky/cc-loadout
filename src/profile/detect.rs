@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::profile::config::{Profile, Profiles};
@@ -178,14 +179,41 @@ pub(crate) fn contains_word(haystack: &str, word: &str) -> bool {
     false
 }
 
-pub(crate) fn glob_exists(root: &Path, pattern: &str) -> bool {
+/// Dirent budget for a single `globs_exist` walk: caps worst-case cost on huge
+/// repos (the profile-view perf hot path) instead of walking unbounded.
+pub(crate) const GLOB_WALK_BUDGET: usize = 200_000;
+
+/// Answer whether each of `patterns` matches some file name in a single walk
+/// of `root`, spending at most `budget` dirents. Returns the per-pattern hits
+/// plus whether the budget ran out before every pattern was resolved —
+/// patterns not yet matched at that point report `false`.
+pub(crate) fn globs_exist(
+    root: &Path,
+    patterns: &[String],
+    budget: usize,
+) -> (BTreeMap<String, bool>, bool) {
+    let mut hits: BTreeMap<String, bool> = patterns.iter().map(|p| (p.clone(), false)).collect();
+    let mut remaining: std::collections::BTreeSet<&str> =
+        patterns.iter().map(|p| p.as_str()).collect();
+    if remaining.is_empty() {
+        return (hits, false);
+    }
+
+    let mut budget_left = budget;
+    let mut exhausted = false;
     let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    'walk: while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            if budget_left == 0 {
+                exhausted = true;
+                break 'walk;
+            }
+            budget_left -= 1;
+
             let ft = match entry.file_type() {
                 Ok(t) => t,
                 Err(_) => continue,
@@ -218,12 +246,27 @@ pub(crate) fn glob_exists(root: &Path, pattern: &str) -> bool {
                     continue;
                 }
                 stack.push(entry.path());
-            } else if ft.is_file() && name_matches_glob(&name, pattern) {
-                return true;
+            } else if ft.is_file() {
+                let matched: Vec<&str> = remaining
+                    .iter()
+                    .filter(|p| name_matches_glob(&name, p))
+                    .copied()
+                    .collect();
+                for p in matched {
+                    remaining.remove(p);
+                    hits.insert(p.to_string(), true);
+                }
+                if remaining.is_empty() {
+                    break 'walk;
+                }
             }
         }
     }
-    false
+    (hits, exhausted)
+}
+
+pub(crate) fn glob_exists(root: &Path, pattern: &str) -> bool {
+    globs_exist(root, &[pattern.to_string()], GLOB_WALK_BUDGET).0[pattern]
 }
 
 fn package_json_dep_hit(root: &Path, deps: &[String]) -> Option<String> {
@@ -272,6 +315,36 @@ mod tests {
         assert!(name_matches_glob("a.vue", "*.vue"));
         assert!(!name_matches_glob("vue", "*.vue"));
         assert!(name_matches_glob("x", "?"));
+    }
+
+    #[test]
+    fn globs_exist_answers_all_patterns_in_one_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("App.vue"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "x").unwrap();
+        let pats = vec![
+            "*.vue".to_string(),
+            "*.svelte".to_string(),
+            "*.rs".to_string(),
+        ];
+        let (hits, exhausted) = globs_exist(dir.path(), &pats, GLOB_WALK_BUDGET);
+        assert!(!exhausted);
+        assert!(hits["*.vue"]);
+        assert!(!hits["*.svelte"]);
+        assert!(hits["*.rs"]);
+    }
+
+    #[test]
+    fn globs_exist_stops_at_budget_and_reports_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        // Budget smaller than the entry count: unmatched patterns report false + exhausted.
+        let (hits, exhausted) = globs_exist(dir.path(), &["*.vue".to_string()], 5);
+        assert!(exhausted);
+        assert!(!hits["*.vue"]);
     }
 
     #[test]
