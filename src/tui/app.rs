@@ -1267,6 +1267,123 @@ mod tests {
         );
     }
 
+    /// Task 7: a profile rule whose atom was never indexed (absent from every
+    /// scanned repo's `rule_hits`) must not block opening Detail — the count
+    /// line reads "matches … of {total}" and prompts "press s to index"
+    /// instead of guessing a number. Opening Detail must not spawn a
+    /// background job either: the whole evaluation is signal-only.
+    #[test]
+    fn detail_rules_count_line_prompts_to_index_an_unindexed_atom() {
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            hdir.path().join("profiles.json"),
+            r#"{"scan_roots":["/workspace"],"universal":[],"profiles":{"rust":{"plugins":[],"detect":{"marker_globs":["*.tsx"]}}}}"#,
+        )
+        .unwrap();
+        crate::profile::scan_cache::save(
+            ddir.path(),
+            &crate::profile::scan_cache::ScanCache {
+                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
+                roots: vec!["/workspace".to_string()],
+                repos: vec![crate::profile::discover::RepoSignal {
+                    path: "/workspace/does-not-exist-a".into(),
+                    marker_files: vec![],
+                    marker_globs: vec![],
+                    package_json_deps: vec![],
+                    languages: vec![],
+                    rule_hits: Default::default(), // "glob:*.tsx" never indexed
+                    override_names: None,
+                }],
+                uncovered: Some(vec![]),
+                scanned_at: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        let mut app = App::new(ctx, 3).unwrap();
+
+        open_rust_detail_rules(&mut app);
+        assert!(
+            app.job.is_none(),
+            "opening Detail on an unindexed rule must not spawn a background \
+             job — the whole evaluation is instant, zero-I/O"
+        );
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("matches \u{2026} of"),
+            "an unindexed atom renders the pending ellipsis count: {text}"
+        );
+        assert!(
+            text.contains("press s to index"),
+            "an unindexed atom with no index job running prompts to index: {text}"
+        );
+    }
+
+    /// Task 7: once every atom a profile's rules reference is present in the
+    /// index, the count line reports a definite number tagged with the scan's
+    /// age — no more "…", no more prompt.
+    #[test]
+    fn detail_rules_count_line_shows_a_definite_number_when_fully_indexed() {
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            hdir.path().join("profiles.json"),
+            r#"{"scan_roots":["/workspace"],"universal":[],"profiles":{"rust":{"plugins":[],"detect":{"marker_files":["Cargo.toml"]}}}}"#,
+        )
+        .unwrap();
+        crate::profile::scan_cache::save(
+            ddir.path(),
+            &crate::profile::scan_cache::ScanCache {
+                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
+                roots: vec!["/workspace".to_string()],
+                repos: vec![crate::profile::discover::RepoSignal {
+                    path: "/workspace/does-not-exist-a".into(),
+                    marker_files: vec![],
+                    marker_globs: vec![],
+                    package_json_deps: vec![],
+                    languages: vec![],
+                    rule_hits: [("file:Cargo.toml".to_string(), true)]
+                        .into_iter()
+                        .collect(),
+                    override_names: None,
+                }],
+                uncovered: Some(vec![]),
+                scanned_at: 1_700_000_000,
+            },
+        )
+        .unwrap();
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        let mut app = App::new(ctx, 3).unwrap();
+
+        open_rust_detail_rules(&mut app);
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("matches 1 of 1"),
+            "a fully-indexed rule shows a definite count: {text}"
+        );
+        assert!(
+            text.contains("as of"),
+            "a fully-indexed count is tagged with the scan age: {text}"
+        );
+    }
+
     #[test]
     fn recompute_persists_uncovered_into_scan_cache() {
         // When the uncovered set changes in-session (here simulated via a

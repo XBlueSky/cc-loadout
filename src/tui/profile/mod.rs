@@ -20,6 +20,22 @@ pub(crate) mod rules;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Compact "3d ago" / "2h ago" / "5m ago" / "just now" for a past epoch-seconds
+/// value relative to `now_secs`. Shared by the by-plugin scan bar and the
+/// Rules tab's index-age tag.
+fn fmt_age(then: i64, now_secs: i64) -> String {
+    let d = (now_secs - then).max(0);
+    if d < 60 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
+
 /// Which sub-view is active.
 enum Sub {
     Board,
@@ -958,7 +974,9 @@ impl View for ProfileView {
                 }
             },
             Sub::Assign(state) => assign::render(state, &self.working, f, area),
-            Sub::Detail(state) => detail::render(state, &self.inv, f, area),
+            Sub::Detail(state) => {
+                detail::render(state, &self.inv, f, area, now_ms, self.scanned_at)
+            }
             Sub::Apply(state) => apply::render(state, &self.working, f, area),
         }
     }

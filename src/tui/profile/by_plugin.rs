@@ -20,20 +20,6 @@ pub(super) const NEW_PROFILE: &str = "+ New profile\u{2026}";
 /// A scan older than this reads as possibly stale — the bar warns and suggests s.
 const SCAN_STALE_SECS: i64 = 7 * 24 * 60 * 60;
 
-/// Compact "3d ago" / "2h ago" / "5m ago" / "just now" for a past epoch-seconds.
-fn relative_since(then: i64, now_secs: i64) -> String {
-    let d = (now_secs - then).max(0);
-    if d < 60 {
-        "just now".to_string()
-    } else if d < 3600 {
-        format!("{}m ago", d / 60)
-    } else if d < 86_400 {
-        format!("{}h ago", d / 3600)
-    } else {
-        format!("{}d ago", d / 86_400)
-    }
-}
-
 // ── MembershipPick ────────────────────────────────────────────────────────────
 
 /// Transient state for the multi-profile membership picker.
@@ -171,7 +157,7 @@ pub fn render(view: &ProfileView, f: &mut Frame, area: Rect, now_ms: i64) {
         ));
         bar.push(Span::styled(format!("{scanned} repos"), count_style));
         if let Some(t) = view.scanned_at {
-            let rel = relative_since(t, now_secs);
+            let rel = super::fmt_age(t, now_secs);
             let tail = if stale {
                 format!("  \u{b7}  {rel} \u{b7} may be stale")
             } else {
