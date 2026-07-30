@@ -265,8 +265,17 @@ impl DetailState {
 ///   header_lines tall — profile name + tab bar (3 rows)
 ///   body           — the focused tab content
 ///
-/// When renaming, the rename prompt occupies the header area.
-pub fn render(state: &DetailState, _inv: &Inventory, f: &mut Frame, area: Rect) {
+/// When renaming, the rename prompt occupies the header area. `now_ms` /
+/// `scanned_at` are threaded through to the Rules tab's count line, which
+/// tags a fully-answerable count with the scan's age.
+pub fn render(
+    state: &DetailState,
+    _inv: &Inventory,
+    f: &mut Frame,
+    area: Rect,
+    now_ms: i64,
+    scanned_at: Option<i64>,
+) {
     if let Some(ti) = &state.renaming {
         // Rename mode: just the prompt, no tab content.
         let lines: Vec<Line<'static>> = vec![
@@ -311,7 +320,7 @@ pub fn render(state: &DetailState, _inv: &Inventory, f: &mut Frame, area: Rect) 
                 if let Some(ex) = &state.explain {
                     crate::tui::profile::explain::render(ex, f, chunks[1]);
                 } else {
-                    state.rules.render(f, chunks[1]);
+                    state.rules.render(f, chunks[1], scanned_at, now_ms);
                 }
             }
         }
