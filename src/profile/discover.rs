@@ -123,7 +123,7 @@ pub fn list_plugins(registry_path: &Path) -> Vec<PluginInfo> {
     out
 }
 
-const MARKER_FILES: &[&str] = &[
+pub const MARKER_FILES: &[&str] = &[
     "package.json",
     "Cargo.toml",
     "pyproject.toml",
@@ -134,7 +134,7 @@ const MARKER_FILES: &[&str] = &[
     "composer.json",
     "build.gradle",
 ];
-const KNOWN_GLOBS: &[&str] = &["*.vue"];
+pub const KNOWN_GLOBS: &[&str] = &["*.vue"];
 
 /// Scan every git repo under `roots` and extract raw, detect-schema-aligned signals.
 pub fn scan_repo_signals(roots: &[String], max_depth: usize) -> Vec<RepoSignal> {
