@@ -22,10 +22,16 @@ fn write_login(home: &Path, email: &str) {
 /// developer's real ~/.claude config. It ALSO puts a file-backed fake `crontab`
 /// first on PATH, so no test can splice the developer's real user crontab — even one
 /// that forgets to patch PATH itself (the gap that once wiped a live prime schedule).
-/// Do NOT call `Command::cargo_bin("cc-loadout")` directly anywhere in this file —
-/// always go through `cmd()` and chain extra `.env(...)` / `.current_dir(...)` as
-/// needed. A test that must inspect the table overrides PATH with its own
-/// `fake_crontab_path(dir)` and reads that dir's `tab`.
+/// It ALSO removes CC_LOADOUT_PROFILES (profiles_path() prefers it over $HOME, so a
+/// value leaking in from the ambient shell would redirect profiles.json reads/writes
+/// out of the sandbox) and CLAUDE_ENV_FILE (this branch newly taught `hook
+/// session-start` to open and append to it — an ambient value would make that write
+/// land outside the sandbox too). Do NOT call `Command::cargo_bin("cc-loadout")`
+/// directly anywhere in this file — always go through `cmd()` and chain extra
+/// `.env(...)` / `.current_dir(...)` as needed. A test that must inspect the table
+/// overrides PATH with its own `fake_crontab_path(dir)` and reads that dir's `tab`.
+/// A test that wants CC_LOADOUT_PROFILES or CLAUDE_ENV_FILE set does so explicitly
+/// after construction — `.env()` after `.env_remove()` still wins.
 fn cmd(home: &Path, data: &Path) -> Command {
     let mut c = Command::cargo_bin("cc-loadout").unwrap();
     // Default crontab isolation. The fake bin lives under the caller-owned `data`
@@ -37,7 +43,9 @@ fn cmd(home: &Path, data: &Path) -> Command {
     c.env("HOME", home)
         .env("XDG_DATA_HOME", data)
         .env("PATH", fake_path)
-        .env_remove("CLAUDE_CONFIG_DIR");
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CC_LOADOUT_PROFILES")
+        .env_remove("CLAUDE_ENV_FILE");
     c
 }
 
@@ -930,4 +938,481 @@ fn task_add_and_list() {
         .assert()
         .success()
         .stdout(predicate::str::contains("weekly").and(predicate::str::contains("/cortex:weekly")));
+}
+
+#[test]
+fn hook_session_start_exports_the_session_id() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let env_file = ddir.path().join("env");
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .write_stdin(r#"{"session_id":"sess-abc"}"#)
+        .assert()
+        .success();
+
+    let body = std::fs::read_to_string(&env_file).unwrap();
+    assert!(
+        body.contains("export CC_LOADOUT_SESSION_ID=sess-abc"),
+        "env file was: {body}"
+    );
+}
+
+#[test]
+fn hook_session_start_promotes_managed_plugins_to_user_scope() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    std::fs::create_dir_all(home.join(".claude").join("profiles")).unwrap();
+    std::fs::write(
+        home.join(".claude").join("profiles").join("profiles.json"),
+        r#"{"scan_roots":[],"universal":["u@m"],"profiles":{},"on_demand":[]}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".claude").join("plugins")).unwrap();
+    let reg = home
+        .join(".claude")
+        .join("plugins")
+        .join("installed_plugins.json");
+    std::fs::write(
+        &reg,
+        r#"{"version":2,"plugins":{"u@m":[{"scope":"local","projectPath":"/p","lastUpdated":"1"}]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .write_stdin(r#"{"session_id":"s"}"#)
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&reg).unwrap()).unwrap();
+    assert_eq!(v["plugins"]["u@m"][0]["scope"], "user");
+}
+
+#[test]
+fn hook_session_start_migrates_legacy_settings_hooks() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    let settings = home.join(".claude").join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"hooks":{"SessionStart":[
+            {"hooks":[{"type":"command","command":"bash \"/old/lib/session-start-hook.sh\""}]}
+        ]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .write_stdin(r#"{"session_id":"s"}"#)
+        .assert()
+        .success();
+
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert!(
+        v["hooks"].get("SessionStart").is_none(),
+        "the retired entry should be gone: {v}"
+    );
+}
+
+#[test]
+fn hook_session_start_survives_garbage_stdin() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    cmd(hdir.path(), ddir.path())
+        .args(["hook", "session-start"])
+        .write_stdin("not json at all")
+        .assert()
+        .success();
+}
+
+#[test]
+fn hook_session_end_is_a_noop_without_a_session_id() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    cmd(hdir.path(), ddir.path())
+        .args(["hook", "session-end"])
+        .write_stdin(r#"{"cwd":"/tmp"}"#)
+        .assert()
+        .success();
+}
+
+#[test]
+fn hook_session_start_rejects_a_hostile_session_id_in_the_env_file() {
+    // `$CLAUDE_ENV_FILE` is sourced by a shell later in the session. A session
+    // id is JSON-string input from Claude Code, which can legally contain a
+    // newline (splits into a second command line) or `$(...)`/backticks
+    // (command substitution). Regression test for the fix: the hook must
+    // never write such a value into the file, even though it must still
+    // exit successfully (a hook must never block a session).
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let env_file = ddir.path().join("env");
+
+    let hostile = "abc\n$(touch /tmp/pwned)";
+    let stdin = serde_json::json!({ "session_id": hostile }).to_string();
+
+    cmd(home, ddir.path())
+        .args(["hook", "session-start"])
+        .env("CLAUDE_ENV_FILE", &env_file)
+        .write_stdin(stdin)
+        .assert()
+        .success();
+
+    if env_file.exists() {
+        let body = std::fs::read_to_string(&env_file).unwrap();
+        assert!(
+            !body
+                .lines()
+                .any(|l| l.starts_with("export CC_LOADOUT_SESSION_ID=abc")),
+            "a hostile session id must never be written into the sourced env file: {body}"
+        );
+    }
+}
+
+#[test]
+fn hook_session_end_releases_the_sessions_on_demand_holds() {
+    // Positive-path coverage for session_end's actual wiring to
+    // `profile::on_demand::release_all` — the earlier noop test only covers
+    // the early-return guard. Drives `acquire` through the real CLI (not
+    // hand-written state) so the round trip through `hook session-end`
+    // exercises the same on-demand state and settings.local.json the CLI
+    // itself would produce.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+
+    let profiles = hdir.path().join("profiles.json");
+    std::fs::write(
+        &profiles,
+        r#"{"scan_roots":[],"universal":[],"profiles":{},"on_demand":["pixijs@x"]}"#,
+    )
+    .unwrap();
+
+    // A prior value the release must restore.
+    let settings = repo.path().join(".claude").join("settings.local.json");
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, r#"{"enabledPlugins":{"pixijs@x":false}}"#).unwrap();
+
+    cmd(hdir.path(), ddir.path())
+        .env("CC_LOADOUT_PROFILES", &profiles)
+        .env("CC_LOADOUT_SESSION_ID", "sess-hookend-1")
+        .current_dir(repo.path())
+        .args(["profile", "on-demand", "acquire", "pixijs@x"])
+        .assert()
+        .success();
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(after["enabledPlugins"]["pixijs@x"], serde_json::json!(true));
+
+    let stdin = format!(
+        r#"{{"session_id":"sess-hookend-1","cwd":"{}"}}"#,
+        repo.path().display()
+    );
+    cmd(hdir.path(), ddir.path())
+        .args(["hook", "session-end"])
+        .write_stdin(stdin)
+        .assert()
+        .success();
+
+    let state_path = repo
+        .path()
+        .join(".claude")
+        .join(".cc-loadout")
+        .join("on-demand.json");
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    assert!(
+        state.get("pixijs@x").is_none(),
+        "the released key must be dropped from on-demand state: {state}"
+    );
+
+    let restored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(
+        restored["enabledPlugins"]["pixijs@x"],
+        serde_json::json!(false),
+        "settings.local.json must be restored to its pre-acquire value"
+    );
+}
+
+#[test]
+fn doctor_without_fix_reports_but_writes_nothing() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let profiles = home.join(".claude").join("profiles").join("profiles.json");
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("profiles.json"));
+
+    assert!(!profiles.exists(), "doctor without --fix must not seed");
+}
+
+#[test]
+fn doctor_fix_seeds_profiles_from_the_embedded_template() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    let profiles = home.join(".claude").join("profiles").join("profiles.json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&profiles).unwrap()).unwrap();
+    assert!(v.get("universal").is_some(), "seeded file: {v}");
+}
+
+#[test]
+fn doctor_fix_never_overwrites_an_existing_profiles_json() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    let profiles = dir.join("profiles.json");
+    std::fs::write(&profiles, r#"{"sentinel":"mine","profiles":{}}"#).unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    assert!(std::fs::read_to_string(&profiles)
+        .unwrap()
+        .contains("sentinel"));
+}
+
+#[test]
+fn doctor_fix_reports_stale_backups_but_leaves_them_on_disk() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let bak = plugins.join("installed_plugins.json.bak.1700000000");
+    std::fs::write(&bak, "{}").unwrap();
+    // The retired installer left timestamped backups beside BOTH files.
+    let sbak = home.join(".claude").join("settings.json.bak.1700000001");
+    std::fs::write(&sbak, "{}").unwrap();
+    // profiles.json accumulates the same way, via write_profiles on every
+    // board deploy / `profile init` — not from the retired installer, but
+    // reclaimed by the same sweep.
+    let profiles_dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let pbak = profiles_dir.join("profiles.json.bak.1700000002");
+    std::fs::write(&pbak, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--prune-backups"));
+
+    assert!(bak.exists(), "--fix must not delete backups");
+    assert!(sbak.exists(), "--fix must not delete backups");
+    assert!(pbak.exists(), "--fix must not delete backups");
+}
+
+#[test]
+fn doctor_errors_on_corrupt_profiles_json_with_and_without_fix() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("profiles.json"), "{not valid json").unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("profiles.json"));
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("profiles.json"));
+}
+
+#[test]
+fn doctor_errors_on_corrupt_registry_the_same_way_with_and_without_fix() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("installed_plugins.json"), "{not valid json").unwrap();
+
+    // Same diagnosis whether or not --fix is passed: one tool must not give two
+    // different verdicts about the same corrupt file.
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("installed_plugins.json"));
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("installed_plugins.json"));
+}
+
+#[test]
+fn doctor_prune_backups_ignores_a_sidecar_with_a_non_numeric_suffix() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    // A user's own sidecar, not one the retired installer wrote.
+    let user_sidecar = home
+        .join(".claude")
+        .join("settings.json.bak.before-migration");
+    std::fs::write(&user_sidecar, "{}").unwrap();
+    let stale = home.join(".claude").join("settings.json.bak.1700000001");
+    std::fs::write(&stale, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix", "--prune-backups"])
+        .assert()
+        .success();
+
+    assert!(
+        user_sidecar.exists(),
+        "a non-epoch suffix must never be treated as one of ours"
+    );
+    assert!(
+        !stale.exists(),
+        "the epoch-suffixed sidecar is still reclaimed"
+    );
+}
+
+#[test]
+fn doctor_prints_stale_backup_paths_not_just_a_count() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let bak = plugins.join("installed_plugins.json.bak.1700000000");
+    std::fs::write(&bak, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "installed_plugins.json.bak.1700000000",
+        ));
+}
+
+#[test]
+fn doctor_prune_backups_removes_them() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let plugins = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let bak = plugins.join("installed_plugins.json.bak.1700000000");
+    std::fs::write(&bak, "{}").unwrap();
+    let sbak = home.join(".claude").join("settings.json.bak.1700000001");
+    std::fs::write(&sbak, "{}").unwrap();
+    let profiles_dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    let pbak = profiles_dir.join("profiles.json.bak.1700000002");
+    std::fs::write(&pbak, "{}").unwrap();
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix", "--prune-backups"])
+        .assert()
+        .success();
+
+    assert!(!bak.exists(), "registry backups are reclaimed");
+    assert!(!sbak.exists(), "settings backups are reclaimed too");
+    assert!(!pbak.exists(), "profiles.json backups are reclaimed too");
+}
+
+#[test]
+fn doctor_without_fix_says_theres_nothing_to_check_when_profiles_json_is_absent() {
+    // M4: with no profiles.json at all, doctor never loaded anything to check
+    // scope against. "plugin scope: already consistent" would be a diagnostic
+    // reporting health it never established — the same anti-pattern C1 exists
+    // to kill one level down.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "no profiles.json — nothing to check",
+        ))
+        .stdout(predicate::str::contains("already consistent").not());
+}
+
+#[test]
+fn doctor_promotes_cc_loadouts_own_registry_key_even_though_no_profiles_json_names_it() {
+    // This is the mitigation for the branch's one accepted residual risk: if
+    // cc-loadout@cc-loadout itself drifts to scope: local, the plugin stops
+    // resolving outside the repo it is bound to, and its own SessionStart hook
+    // never runs there to repair it. `doctor`/`doctor --fix` are the only
+    // recovery, so the self key must be treated as managed even though no
+    // profiles.json — not even the seeded template — ever lists it.
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+
+    let profiles_dir = home.join(".claude").join("profiles");
+    std::fs::create_dir_all(&profiles_dir).unwrap();
+    std::fs::write(
+        profiles_dir.join("profiles.json"),
+        r#"{"scan_roots":[],"universal":["other@x"],"profiles":{}}"#,
+    )
+    .unwrap();
+
+    let plugins_dir = home.join(".claude").join("plugins");
+    std::fs::create_dir_all(&plugins_dir).unwrap();
+    let registry_path = plugins_dir.join("installed_plugins.json");
+    std::fs::write(
+        &registry_path,
+        r#"{"version":2,"plugins":{"cc-loadout@cc-loadout":[{"scope":"local","lastUpdated":"1"}]}}"#,
+    )
+    .unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cc-loadout@cc-loadout"));
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success();
+
+    let v: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry_path).unwrap()).unwrap();
+    assert_eq!(
+        v["plugins"]["cc-loadout@cc-loadout"][0]["scope"], "user",
+        "the self key must be promoted even though profiles.json never names it"
+    );
 }

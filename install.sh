@@ -1,11 +1,12 @@
 #!/bin/bash
 # Installer for cc-loadout (Rust). Two modes:
-#   1. In-repo: builds with cargo and installs the binary.
-#   2. curl | bash: downloads a pre-built binary from GitHub Releases.
-# After installing the binary it runs the cc-loadout bootstrap:
-#   - seed ~/.claude/profiles/profiles.json from profiles.example.json (if absent)
-#   - promote universal / on-demand / profile plugins to scope: user
-#   - install the SessionStart hook (re-enforces on every session)
+#   1. In-repo (a clone with .git): builds with cargo, falling back to the
+#      published binary if no toolchain is present.
+#   2. Otherwise: downloads a pre-built binary from GitHub Releases.
+# Either way it then runs `cc-loadout doctor --fix`, which seeds
+# ~/.claude/profiles/profiles.json, promotes managed plugins to scope: user, and
+# clears any hook entries older versions wrote into ~/.claude/settings.json.
+# The SessionStart/SessionEnd hooks themselves now ship with the plugin.
 set -e
 
 GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
@@ -21,20 +22,40 @@ err()  { echo -e "${RED}[x]${NC} $1" >&2; exit 1; }
 
 REPO_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
+# Source mode means "a real developer clone". Cargo.toml alone is not enough:
+# marketplace.json declares `"source": "./"`, so the ENTIRE repo — Cargo.toml,
+# src/, install.sh — is copied into the plugin cache, which has no .git. Testing
+# for Cargo.toml alone made `bash ${CLAUDE_PLUGIN_ROOT}/install.sh` demand a Rust
+# toolchain on the path that is now the front door.
 detect_mode() {
-  if [ -f "${REPO_ROOT}/Cargo.toml" ] && grep -q 'name = "cc-loadout"' "${REPO_ROOT}/Cargo.toml" 2>/dev/null; then
+  # `-e` not `-d`: in a git worktree `.git` is a regular file holding a
+  # `gitdir:` pointer, and a worktree is still a developer clone.
+  if [ -f "${REPO_ROOT}/Cargo.toml" ] \
+     && [ -e "${REPO_ROOT}/.git" ] \
+     && grep -q 'name = "cc-loadout"' "${REPO_ROOT}/Cargo.toml" 2>/dev/null; then
     echo source
   else
     echo binary
   fi
 }
 
+# Returns non-zero when it could not produce a binary, so main() can fall back to
+# the published release rather than dead-ending someone without a toolchain.
 build_from_source() {
+  if ! command -v cargo >/dev/null 2>&1; then
+    warn "cargo (Rust toolchain) not found — falling back to the published binary"
+    return 1
+  fi
   step "Building cc-loadout from source..."
-  command -v cargo >/dev/null 2>&1 || err "cargo (Rust toolchain) not found"
-  ( cd "$REPO_ROOT" && cargo build --release ) || err "cargo build failed"
+  if ! ( cd "$REPO_ROOT" && cargo build --release ); then
+    warn "cargo build failed — falling back to the published binary"
+    return 1
+  fi
   local bin="${REPO_ROOT}/target/release/${BINARY_NAME}"
-  [ -f "$bin" ] || err "build succeeded but binary missing: $bin"
+  if [ ! -f "$bin" ]; then
+    warn "build reported success but produced no binary — falling back to the published binary"
+    return 1
+  fi
   mkdir -p "$INSTALL_DIR"
   cp "$bin" "${INSTALL_DIR}/${BINARY_NAME}"
   chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
@@ -108,36 +129,36 @@ install_from_release() {
   info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
 }
 
+# Bootstrap now runs in BOTH modes, because the binary owns it: seeding
+# profiles.json, promoting plugin scope, and clearing the retired settings.json
+# hooks are all `cc-loadout doctor --fix`. Hooks themselves are no longer
+# installed here at all — the bundled plugin ships them.
 bootstrap() {
-  # Only runs in-repo (needs profiles.example.json + lib/registry.sh).
-  local mode="$1"
-  [ "$mode" = "source" ] || { info "binary mode: skipping repo bootstrap"; return 0; }
-
   step "Running cc-loadout bootstrap..."
-  local profiles="${HOME}/.claude/profiles/profiles.json"
-  if [ ! -f "$profiles" ]; then
-    mkdir -p "$(dirname "$profiles")"
-    cp "${REPO_ROOT}/profiles.example.json" "$profiles"
-    info "seeded $profiles from template"
-  else
-    info "profiles.json exists — left untouched"
-  fi
-
-  # shellcheck source=lib/registry.sh
-  source "${REPO_ROOT}/lib/registry.sh"
-  promote_universal_to_user || warn "promote_universal_to_user reported an issue"
-  promote_on_demand_to_user || warn "promote_on_demand_to_user reported an issue"
-  promote_profiles_to_user || warn "promote_profiles_to_user reported an issue"
-  install_session_hook || warn "install_session_hook reported an issue"
-  install_session_end_hook || warn "install_session_end_hook reported an issue"
+  "${INSTALL_DIR}/${BINARY_NAME}" doctor --fix || warn "doctor reported an issue"
 }
 
 main() {
+  # An unknown option must be a hard error, not a fall-through to a real
+  # install: that fall-through is exactly what happened once during this
+  # project's own development, running a full install against a developer's
+  # real environment (see tests/test_install.sh's isolation comment above
+  # print_mode()). An explicit case makes "only $1 is ever consulted" a
+  # stated contract too, not an accident of a single `if`.
+  case "${1:-}" in
+    --print-mode) detect_mode; exit 0 ;;
+    "") ;;
+    *) err "unknown option: $1 (supported: --print-mode)" ;;
+  esac
   echo -e "${BLUE}cc-loadout installer${NC}"
   local mode; mode="$(detect_mode)"
   info "Mode: $mode"
-  if [ "$mode" = source ]; then build_from_source; else install_from_release; fi
-  bootstrap "$mode"
+  if [ "$mode" = source ]; then
+    build_from_source || install_from_release
+  else
+    install_from_release
+  fi
+  bootstrap
   echo ""
   step "Done. Try: ${BINARY_NAME} --help"
   echo "$PATH" | grep -q "$INSTALL_DIR" || warn "add $INSTALL_DIR to PATH: export PATH=\"${INSTALL_DIR}:\${PATH}\""

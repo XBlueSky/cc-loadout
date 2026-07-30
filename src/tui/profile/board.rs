@@ -17,6 +17,7 @@ use super::ProfileView;
 ///   ● {n} to review                    ← accent header
 ///   ⚠ {k} repos match nothing          ← only when uncovered non-empty
 ///   ⚠ global out of sync ({n})         ← only when global non-empty
+///   ⚠ {n} plugins lost user scope …     ← only when scope non-empty
 ///                                       ← blank separator
 ///   <rows…>
 ///
@@ -28,6 +29,7 @@ pub fn render(view: &ProfileView, snap: &Snapshot, f: &mut Frame, area: Rect) {
         stale: crate::profile::drift::stale_refs(&view.inv, &view.working),
         uncovered: view.uncovered.clone(),
         global: crate::profile::drift::global_drift(&view.working, &snap.global_enabled),
+        scope: snap.scope_drift.clone(),
     };
     let stale: BTreeSet<&str> = d.stale.iter().map(String::as_str).collect();
 
@@ -63,6 +65,13 @@ pub fn render(view: &ProfileView, snap: &Snapshot, f: &mut Frame, area: Rect) {
             let g = d.global.len();
             lines.push(Line::from(Span::styled(
                 format!("⚠ global out of sync ({g})"),
+                theme::alert(),
+            )));
+        }
+        if !d.scope.is_empty() {
+            let s = d.scope.len();
+            lines.push(Line::from(Span::styled(
+                format!("⚠ {s} plugins lost user scope — run: cc-loadout doctor --fix"),
                 theme::alert(),
             )));
         }

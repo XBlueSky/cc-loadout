@@ -376,6 +376,7 @@ mod tests {
             global_enabled: Vec::new(),
             tasks: Vec::new(),
             schedule_drift: false,
+            scope_drift: Vec::new(),
         }
     }
 
