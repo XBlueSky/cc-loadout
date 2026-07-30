@@ -135,6 +135,8 @@ mod tests {
             marker_globs: vec![],
             package_json_deps: vec![],
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
         };
         let b = RepoSignal {
             path: "/b".into(),
@@ -142,6 +144,8 @@ mod tests {
             marker_globs: vec!["*.rs".into()],
             package_json_deps: vec![],
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
         };
         let s = signals_from_repos(&[&a, &b]);
         assert_eq!(

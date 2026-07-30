@@ -114,6 +114,8 @@ mod tests {
             marker_globs: vec![],
             package_json_deps: vec![],
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
         };
         // Empty working, but a suggested profile keyed on Cargo.toml.
         let suggested = vec![SuggestedProfile {
@@ -196,6 +198,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             },
             RepoSignal {
                 path: plain.display().to_string(),
@@ -203,6 +207,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             },
         ];
         let working: Profiles = serde_json::from_str(

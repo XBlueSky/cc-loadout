@@ -18,6 +18,12 @@ pub struct RepoSignal {
     pub marker_globs: Vec<String>,
     pub package_json_deps: Vec<String>,
     pub languages: Vec<String>,
+    /// atom key (signal_detect::atom_*) → did this repo satisfy it at scan time.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub rule_hits: std::collections::BTreeMap<String, bool>,
+    /// Parsed `.claude/profile` override names; None = no override file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -174,6 +180,8 @@ fn signals_for_repo(repo: &Path) -> RepoSignal {
         marker_globs,
         package_json_deps,
         languages: root_extensions(repo),
+        rule_hits: Default::default(),
+        override_names: None,
     }
 }
 
@@ -360,6 +368,8 @@ mod tests {
             marker_globs: globs.iter().map(|s| s.to_string()).collect(),
             package_json_deps: deps.iter().map(|s| s.to_string()).collect(),
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
         }
     }
 

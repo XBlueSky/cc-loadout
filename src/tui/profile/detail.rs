@@ -343,6 +343,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec!["rs".into()],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested_profiles: vec![SuggestedProfile {
                 name: "rust".into(),
