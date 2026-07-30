@@ -142,8 +142,13 @@ pub const MARKER_FILES: &[&str] = &[
 ];
 pub const KNOWN_GLOBS: &[&str] = &["*.vue"];
 
-/// Scan every git repo under `roots` and extract raw, detect-schema-aligned signals.
-pub fn scan_repo_signals(roots: &[String], max_depth: usize) -> Vec<RepoSignal> {
+/// Scan every git repo under `roots` and extract raw, detect-schema-aligned
+/// signals, plus every atom in `vocab` answered against that repo.
+pub fn scan_repo_signals(
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+) -> Vec<RepoSignal> {
     let mut out = Vec::new();
     for root in roots {
         let root = Path::new(root);
@@ -151,14 +156,14 @@ pub fn scan_repo_signals(roots: &[String], max_depth: usize) -> Vec<RepoSignal> 
             continue;
         }
         for repo in scan::find_git_repos(root, max_depth) {
-            out.push(signals_for_repo(&repo));
+            out.push(signals_for_repo(&repo, vocab));
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
 }
 
-fn signals_for_repo(repo: &Path) -> RepoSignal {
+fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
     let marker_files = MARKER_FILES
         .iter()
         .filter(|m| repo.join(m).exists())
@@ -174,14 +179,57 @@ fn signals_for_repo(repo: &Path) -> RepoSignal {
     } else {
         Vec::new()
     };
+
+    // Answer every atom in the vocabulary. Glob atoms share ONE walk.
+    let mut rule_hits = BTreeMap::new();
+    let mut glob_pats: Vec<String> = Vec::new();
+    for atom in vocab {
+        if let Some(g) = atom.strip_prefix("glob:") {
+            glob_pats.push(g.to_string());
+        } else if let Some(f) = atom.strip_prefix("file:") {
+            rule_hits.insert(atom.clone(), repo.join(f).exists());
+        } else if let Some(rest) = atom.strip_prefix("content:") {
+            if let Some((f, w)) = rest.split_once('\u{2192}') {
+                let hit = std::fs::read_to_string(repo.join(f))
+                    .map(|t| detect::contains_word(&t, w))
+                    .unwrap_or(false);
+                rule_hits.insert(atom.clone(), hit);
+            }
+        } else if let Some(rest) = atom.strip_prefix("kw:") {
+            if let Some((f, k)) = rest.split_once('\u{2192}') {
+                let hit = std::fs::read_to_string(repo.join(f))
+                    .map(|t| detect::contains_word(&t, k))
+                    .unwrap_or(false);
+                rule_hits.insert(atom.clone(), hit);
+            }
+        }
+    }
+    let (glob_hits, _exhausted) = detect::globs_exist(repo, &glob_pats, detect::GLOB_WALK_BUDGET);
+    for (g, hit) in glob_hits {
+        rule_hits.insert(crate::profile::signal_detect::atom_glob(&g), hit);
+    }
+    let override_names = std::fs::read_to_string(repo.join(".claude").join("profile"))
+        .ok()
+        .map(|text| {
+            let mut names: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        });
+
     RepoSignal {
         path: repo.display().to_string(),
         marker_files,
         marker_globs,
         package_json_deps,
         languages: root_extensions(repo),
-        rule_hits: Default::default(),
-        override_names: None,
+        rule_hits,
+        override_names,
     }
 }
 
@@ -300,9 +348,14 @@ pub fn resolve_registry_path(home: &Path, config_override: Option<&Path>) -> Pat
 }
 
 /// Assemble the full inventory: plugins ∪ repo signals ∪ suggested profiles.
-pub fn build_inventory(registry_path: &Path, roots: &[String], max_depth: usize) -> Inventory {
+pub fn build_inventory(
+    registry_path: &Path,
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+) -> Inventory {
     let plugins = list_plugins(registry_path);
-    let repos = scan_repo_signals(roots, max_depth);
+    let repos = scan_repo_signals(roots, max_depth, vocab);
     let suggested_profiles = suggest_profiles(&repos);
     Inventory {
         plugins,
@@ -354,7 +407,14 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
 
-        let inv = build_inventory(&reg, &[roots.path().display().to_string()], 6);
+        let default_vocab =
+            crate::profile::signal_detect::vocabulary(&crate::profile::config::Profiles::default());
+        let inv = build_inventory(
+            &reg,
+            &[roots.path().display().to_string()],
+            6,
+            &default_vocab,
+        );
         assert_eq!(inv.plugins.len(), 1);
         assert_eq!(inv.repos.len(), 1);
         assert_eq!(inv.suggested_profiles.len(), 1);
@@ -414,7 +474,9 @@ mod tests {
         .unwrap();
         std::fs::write(repo.join("src.vue"), "x").unwrap();
 
-        let got = scan_repo_signals(&[root.path().display().to_string()], 6);
+        let default_vocab =
+            crate::profile::signal_detect::vocabulary(&crate::profile::config::Profiles::default());
+        let got = scan_repo_signals(&[root.path().display().to_string()], 6, &default_vocab);
         assert_eq!(got.len(), 1);
         let s = &got[0];
         assert!(s.path.ends_with("app"));
@@ -523,5 +585,35 @@ mod tests {
             inv.suggested_profiles.is_empty(),
             "no-scan inventory must not suggest profiles"
         );
+    }
+
+    #[test]
+    fn signals_include_rule_hits_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude/profile"), "frontend\n# comment\n").unwrap();
+        std::fs::write(repo.join("a.svelte"), "x").unwrap();
+        std::fs::write(repo.join("Notes.md"), "syno kw here").unwrap();
+
+        let mut vocab = std::collections::BTreeSet::new();
+        vocab.insert(crate::profile::signal_detect::atom_glob("*.svelte"));
+        vocab.insert(crate::profile::signal_detect::atom_file("Notes.md"));
+        vocab.insert(crate::profile::signal_detect::atom_content(
+            "Notes.md", "syno",
+        ));
+        vocab.insert(crate::profile::signal_detect::atom_kw("Notes.md", "kw"));
+        vocab.insert(crate::profile::signal_detect::atom_glob("*.vue"));
+
+        let sigs = scan_repo_signals(&[dir.path().display().to_string()], 6, &vocab);
+        assert_eq!(sigs.len(), 1);
+        let s = &sigs[0];
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_glob("*.svelte")]);
+        assert!(!s.rule_hits[&crate::profile::signal_detect::atom_glob("*.vue")]);
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_file("Notes.md")]);
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_content("Notes.md", "syno")]);
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_kw("Notes.md", "kw")]);
+        assert_eq!(s.override_names, Some(vec!["frontend".to_string()]));
     }
 }
