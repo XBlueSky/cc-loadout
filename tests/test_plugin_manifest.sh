@@ -53,3 +53,95 @@ if [[ -n "$cargo_ver" && "$cargo_ver" == "$plugin_ver" ]]; then
 else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: plugin.json version ($plugin_ver) != Cargo.toml ($cargo_ver)"
 fi
+
+# The plugin now owns its hooks; the manifest and the shim must exist.
+hkp="$ROOT/hooks/hooks.json"
+if jq -e . "$hkp" >/dev/null 2>&1; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hooks/hooks.json is valid JSON"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hooks/hooks.json invalid or missing"
+fi
+
+# Each event must point at the shared shim, plugin-root relative, and pass its
+# own event name through as the argument the binary expects.
+for ev in SessionStart:session-start SessionEnd:session-end; do
+  key="${ev%%:*}"; arg="${ev##*:}"
+  c="$(jq -r --arg e "$key" '.hooks[$e][0].hooks[0].command // ""' "$hkp" 2>/dev/null)"
+  if [[ "$c" == *'${CLAUDE_PLUGIN_ROOT}/hooks/hook.sh '* && "$c" == *" $arg" ]]; then
+    TEST_PASS=$((TEST_PASS+1)); echo "  ok: $key invokes hook.sh with '$arg'"
+  else
+    TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: $key command wrong: $c"
+  fi
+done
+
+if [[ -f "$ROOT/hooks/hook.sh" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hooks/hook.sh present"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hooks/hook.sh missing (hooks.json would point at nothing)"
+fi
+
+# Regression guard: no shim may reference the deleted lib/ scripts.
+if grep -rq "lib/session-.*-hook.sh" "$ROOT/hooks/" 2>/dev/null; then
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: a shim still references the retired lib/ hook scripts"
+else
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: no shim references the retired lib/ scripts"
+fi
+
+# Regression guard: this file also checks hook.sh *behaviour*, not just
+# manifest shape, because the binary-resolution lookup it validates has no
+# other test coverage. A non-executable cc-loadout on PATH must be treated
+# the same as no cc-loadout at all: `command -v` alone reports a match
+# without checking the executable bit, so a partial/broken install must not
+# silently swallow the one message that explains it.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/bin"
+printf '#!/bin/bash\necho ran\n' > "$hook_scratch/bin/cc-loadout"
+chmod 644 "$hook_scratch/bin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
+hook_exit=$?
+if [[ "$hook_out" == *"cc-loadout: CLI not installed"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh treats a non-executable cc-loadout on PATH as missing"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a non-executable cc-loadout (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
+
+# Regression guard: `-x` alone returns true for a directory (the traversal
+# bit is set by default), so the ~/.local/bin fallback must also check `-f`
+# or a stray directory named cc-loadout is treated as usable.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/.local/bin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
+hook_exit=$?
+if [[ "$hook_out" == *"cc-loadout: CLI not installed"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh treats a directory at the fallback path as missing"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a directory at \$HOME/.local/bin/cc-loadout (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
+
+# Regression guard: an installed binary too old to understand `hook` must not
+# fail silently. clap exits non-zero on an unrecognised subcommand; the old
+# `"$bin" hook "$event" || true` swallowed that unconditionally, so a plugin
+# update against a stale binary produced no signal at all (no session id, no
+# scope promotion, no legacy migration) with nothing to explain why. A stub
+# binary that exits 2 stands in for that stale binary here.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/bin"
+printf '#!/bin/bash\nexit 2\n' > "$hook_scratch/bin/cc-loadout"
+chmod +x "$hook_scratch/bin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
+hook_exit=$?
+if [[ "$hook_out" == *"cc-loadout: the installed CLI is too old"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh prints an upgrade hint at session-start when the binary rejects the hook subcommand"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the upgrade hint for a binary exiting 2 on session-start (exit=$hook_exit, out=$hook_out)"
+fi
+hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-end 2>&1)"
+hook_exit=$?
+if [[ -z "$hook_out" && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh stays silent at session-end for the same old binary"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh was not silent at session-end for a binary exiting 2 (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"

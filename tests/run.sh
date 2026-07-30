@@ -6,8 +6,9 @@ cd "$ROOT"
 
 total_pass=0
 total_fail=0
-# Only test_install.sh remains after the Rust refactor removed the bash profile tests.
-for f in tests/test_install.sh tests/test_plugin_manifest.sh tests/test_registry.sh tests/test_hooks.sh; do
+# The bash suite now covers only the installer and the plugin manifest; hook and
+# registry behaviour moved into `cargo test` when lib/ was retired.
+for f in tests/test_install.sh tests/test_plugin_manifest.sh; do
   [[ -f "$f" ]] || continue
   echo "=== $f ==="
   TEST_PASS=0; TEST_FAIL=0

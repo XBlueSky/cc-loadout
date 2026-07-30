@@ -65,17 +65,25 @@ pub fn uncovered_repos(inv: &Inventory, working: &Profiles) -> Vec<String> {
     out
 }
 
-/// The four re-edit drift signals.
+/// The five re-edit drift signals.
 pub struct Drift {
     pub new_unassigned: Vec<String>,
     pub stale: Vec<String>,
     pub uncovered: Vec<String>,
     pub global: Vec<String>,
+    /// Managed plugins that are installed but lack a `scope: user` entry. This
+    /// is the only visible symptom of the failure mode plugin-owned hooks
+    /// cannot repair themselves — see `src/doctor.rs`.
+    pub scope: Vec<String>,
 }
 
 impl Drift {
     pub fn review_count(&self) -> usize {
-        self.new_unassigned.len() + self.stale.len() + self.uncovered.len() + self.global.len()
+        self.new_unassigned.len()
+            + self.stale.len()
+            + self.uncovered.len()
+            + self.global.len()
+            + self.scope.len()
     }
 
     // Only called from tests; the binary render path uses review_count() directly.
@@ -214,6 +222,7 @@ mod tests {
             stale: vec!["b".into(), "c".into()],
             uncovered: vec![],
             global: vec!["d".into()],
+            scope: vec![],
         };
         assert_eq!(d.review_count(), 4);
         assert!(!d.is_clean());
@@ -221,8 +230,22 @@ mod tests {
             new_unassigned: vec![],
             stale: vec![],
             uncovered: vec![],
-            global: vec![]
+            global: vec![],
+            scope: vec![],
         }
         .is_clean());
+    }
+
+    #[test]
+    fn review_count_includes_scope_drift() {
+        let d = Drift {
+            new_unassigned: vec![],
+            stale: vec![],
+            uncovered: vec![],
+            global: vec![],
+            scope: vec!["cc-loadout@cc-loadout".to_string()],
+        };
+        assert_eq!(d.review_count(), 1);
+        assert!(!d.is_clean());
     }
 }

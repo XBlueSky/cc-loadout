@@ -2,7 +2,17 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// The single fixed-name backup sidecar for `path` (`<name>.cc-loadout.bak`).
+/// Deliberately not timestamped: the retired shell installer's
+/// `.bak.$(date +%s)` scheme accumulated 108 files / 1.7 MB on one
+/// machine with no reclamation.
+pub fn sidecar_backup(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".cc-loadout.bak");
+    path.with_file_name(name)
+}
 
 /// Write `bytes` to `path` atomically: write to a temp file in the same
 /// directory, fsync, chmod, then rename over the target. Creates parent dirs.

@@ -68,6 +68,10 @@ pub struct Snapshot {
     /// (a write that never landed, or a crontab wiped externally). Computed once
     /// per load (best-effort; any crontab-read error is treated as no drift).
     pub schedule_drift: bool,
+    /// Managed plugin keys whose registry scope drifted off `user`. Best-effort:
+    /// a malformed profiles.json or missing registry yields an empty vec so the
+    /// hub still opens, matching how `schedule_drift` degrades.
+    pub scope_drift: Vec<String>,
 }
 
 impl Snapshot {
@@ -151,6 +155,10 @@ impl Snapshot {
             .and_then(|bin| crate::task::ops::schedule_drift(&bin, &ctx.data_root, &ctx.home))
             .unwrap_or(false);
 
+        let scope_drift = config::load(&ctx.cfg_path)
+            .map(|cfg| crate::profile::registry::keys_needing_promotion(&cfg, &ctx.registry_path))
+            .unwrap_or_default();
+
         Ok(Snapshot {
             accounts,
             cwd: ctx.cwd.clone(),
@@ -162,6 +170,7 @@ impl Snapshot {
             global_enabled,
             tasks,
             schedule_drift,
+            scope_drift,
         })
     }
 }

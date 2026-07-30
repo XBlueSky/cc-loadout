@@ -231,6 +231,7 @@ impl ProfileView {
             stale: crate::profile::drift::stale_refs(&self.inv, &self.working),
             uncovered: self.uncovered.clone(),
             global: crate::profile::drift::global_drift(&self.working, &snap.global_enabled),
+            scope: snap.scope_drift.clone(),
         }
     }
 
@@ -1224,7 +1225,7 @@ mod tests {
     // ── Pre-existing tests (updated call sites to 4-arg new) ─────────────────
 
     #[test]
-    fn drift_surfaces_new_unassigned_stale_and_global() {
+    fn drift_surfaces_new_unassigned_stale_global_and_scope() {
         // installed: serena (universal), eslint (unassigned). config references gone@x (stale).
         let inv = Inventory {
             plugins: vec![
@@ -1250,11 +1251,15 @@ mod tests {
         // global has the profile plugin "gone@x" enabled (drift) — provide via a snapshot.
         let mut s = test_support::snap();
         s.global_enabled = vec!["gone@x".to_string()];
+        // scope drift is computed off-band from registry.rs; a snapshot just carries
+        // the result through, so a fixed key is enough to prove the wiring.
+        s.scope_drift = vec!["cc-loadout@cc-loadout".to_string()];
         let d = v.drift_for_test(&s);
         assert_eq!(d.new_unassigned, vec!["eslint@x".to_string()]);
         assert_eq!(d.stale, vec!["gone@x".to_string()]);
         assert_eq!(d.global, vec!["gone@x".to_string()]);
-        assert_eq!(d.review_count(), 3);
+        assert_eq!(d.scope, vec!["cc-loadout@cc-loadout".to_string()]);
+        assert_eq!(d.review_count(), 4);
     }
 
     fn view() -> ProfileView {
