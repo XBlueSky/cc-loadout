@@ -315,6 +315,55 @@ mod tests {
         assert_eq!(names, disk);
     }
 
+    #[test]
+    fn parity_with_disk_detect_through_symlinked_scan_root() {
+        // scan_repo_signals must canonicalize repo paths at scan time
+        // (mirroring detect_profiles_explained's canonicalize-before-match,
+        // detect.rs:27-28), so path_prefix rules still agree with disk
+        // detection when the scan root is reached via a symlink.
+        // RepoSignal.path must NOT retain symlink components — see
+        // detect.rs's own `path_prefix_match` test (detect.rs:436-449) for
+        // the same trap on the disk side.
+        let real = tempfile::tempdir().unwrap();
+        let repo = real.path().join("r");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let link_dir = tempfile::tempdir().unwrap();
+        let link_root = link_dir.path().join("via_link");
+        std::os::unix::fs::symlink(real.path(), &link_root).unwrap();
+
+        // The configured prefix is naturally canonical (as real
+        // path_prefixes are in practice), built from the real (non-symlink)
+        // repo path — NOT from the symlinked root we're about to scan.
+        let canon_repo = std::fs::canonicalize(&repo).unwrap();
+        let prefix = format!("{}/", canon_repo.display());
+        let mut cfg = Profiles::default();
+        cfg.profiles.insert(
+            "backend".into(),
+            serde_json::from_value(serde_json::json!({
+                "plugins": [], "detect": {"path_prefixes": [prefix]}
+            }))
+            .unwrap(),
+        );
+
+        let vocab = vocabulary(&cfg);
+        let sigs = crate::profile::discover::scan_repo_signals(
+            &[link_root.display().to_string()],
+            6,
+            &vocab,
+        );
+        assert_eq!(sigs.len(), 1);
+        let (names, pending) = detect_from_signal(&sigs[0], &cfg);
+        assert!(!pending);
+
+        // Disk detection on the SAME symlinked path must agree — both sides
+        // resolve to the canonical form before matching path_prefixes.
+        let via_link_repo = link_root.join("r");
+        let disk: Vec<String> = crate::profile::detect::detect_profiles(&via_link_repo, &cfg);
+        assert_eq!(names, disk);
+        assert_eq!(names, vec!["backend".to_string()]);
+    }
+
     fn cfg() -> Profiles {
         serde_json::from_str(
             r#"{
