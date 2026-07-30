@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-07-30
+
+### Bug Fixes
+
+- keep a hooks-less group instead of dropping it as empty
+- reclaim profiles.json backups, stop claiming health it never checked
+- error on an unknown flag instead of falling through to a real install
+- stop swallowing a too-old binary's non-zero exit in hook.sh
+- make cc-loadout's own key unconditionally managed
+- require -f alongside -x when resolving cc-loadout
+- treat a non-executable cc-loadout on PATH as missing
+- stop swallowing corrupt profiles.json/registry, fix stale-backup matching
+- sanitize session_id in env-file write, add session_end coverage
+- tighten anchor to close residual collision risks
+- remove unused PathBuf import
+- anchor legacy command matching and add settings.json backup
+- error handling in registry promotion and performance tweaks
+
+### Documentation
+
+- add doctor to the README feature lists
+
+### Features
+
+- surface plugin scope drift on the profile board
+- ship SessionStart/SessionEnd hooks with the plugin
+- add cc-loadout doctor for install inspection and repair
+- add cc-loadout hook session-start/session-end
+- remove retired settings.json hook entries
+- port registry scope promotion to Rust
+
+### Refactoring
+
+- retire lib/ shell hooks in favour of plugin-owned hooks
+- bootstrap via the binary, stop installing hooks
+
+### Testing
+
+- neutralise CC_LOADOUT_PROFILES and CLAUDE_ENV_FILE in cmd()
+- prove scope drift survives the Snapshot->Drift assembly wiring
+- cover a command-less entry surviving legacy-hook removal
+- isolate the --help/--version probe too
+- isolate --print-mode assertions unconditionally
+
 ## [0.1.18] - 2026-07-28
 
 ### CI/CD
