@@ -9,11 +9,16 @@ use std::path::{Path, PathBuf};
 use crate::profile::discover::RepoSignal;
 use crate::util::atomicfile;
 
+/// Cache format version; incremented when schema changes (fields added/removed).
+pub const SCAN_CACHE_VERSION: u32 = 2;
+
 /// The cached result of one `s`/Rescan: which roots were walked, what repos were
 /// found, and when (epoch seconds). Keyed on `roots` — a cache whose roots no
 /// longer match the current scan roots is ignored on load.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanCache {
+    #[serde(default)]
+    pub version: u32,
     pub roots: Vec<String>,
     pub repos: Vec<RepoSignal>,
     /// Repo paths that matched no profile as of this scan — the Profile board's
@@ -61,6 +66,8 @@ mod tests {
             marker_globs: vec![],
             package_json_deps: vec![],
             languages: vec!["rs".into()],
+            rule_hits: Default::default(),
+            override_names: None,
         }
     }
 
@@ -68,6 +75,7 @@ mod tests {
     fn save_then_load_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ScanCache {
+            version: SCAN_CACHE_VERSION,
             roots: vec!["/workspace".into()],
             repos: vec![repo("/workspace/a"), repo("/workspace/b")],
             uncovered: Some(vec!["/workspace/b".into()]),
@@ -104,5 +112,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(cache_path(dir.path()), b"{ not json").unwrap();
         assert!(load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn v1_cache_loads_with_version_zero_and_empty_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cache_path(dir.path()),
+            r#"{"roots":["/w"],"repos":[{"path":"/w/a","marker_files":[],"marker_globs":[],
+                "package_json_deps":[],"languages":[]}],"uncovered":[],"scanned_at":1}"#,
+        )
+        .unwrap();
+        let c = load(dir.path()).expect("v1 cache must load");
+        assert_eq!(c.version, 0);
+        assert!(c.repos[0].rule_hits.is_empty());
+        assert!(c.repos[0].override_names.is_none());
+    }
+
+    #[test]
+    fn v2_round_trips_rule_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = repo("/w/a");
+        r.rule_hits.insert("glob:*.vue".into(), true);
+        r.override_names = Some(vec!["frontend".into()]);
+        let cache = ScanCache {
+            version: SCAN_CACHE_VERSION,
+            roots: vec!["/w".into()],
+            repos: vec![r],
+            uncovered: Some(vec![]),
+            scanned_at: 1,
+        };
+        save(dir.path(), &cache).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), cache);
     }
 }

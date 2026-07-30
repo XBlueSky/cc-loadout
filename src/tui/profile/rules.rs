@@ -880,6 +880,8 @@ mod tests {
             marker_globs: globs.iter().map(|s| s.to_string()).collect(),
             package_json_deps: deps.iter().map(|s| s.to_string()).collect(),
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
         }
     }
 

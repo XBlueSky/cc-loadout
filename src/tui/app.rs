@@ -586,6 +586,7 @@ impl App {
                         let _ = crate::profile::scan_cache::save(
                             &data_root,
                             &crate::profile::scan_cache::ScanCache {
+                                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
                                 roots: roots.clone(),
                                 repos: repos.clone(),
                                 uncovered: Some(uncovered.clone()),
@@ -1277,6 +1278,7 @@ mod tests {
         crate::profile::scan_cache::save(
             ddir,
             &crate::profile::scan_cache::ScanCache {
+                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
                 roots: vec![cache_roots.to_string()],
                 repos: vec![crate::profile::discover::RepoSignal {
                     path: "/workspace/a".into(),
@@ -1284,6 +1286,8 @@ mod tests {
                     marker_globs: vec![],
                     package_json_deps: vec![],
                     languages: vec![],
+                    rule_hits: Default::default(),
+                    override_names: None,
                 }],
                 uncovered,
                 scanned_at: 1_700_000_000,

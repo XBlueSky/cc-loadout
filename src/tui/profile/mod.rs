@@ -1162,6 +1162,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested_profiles: vec![],
         };
@@ -2236,6 +2238,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested: vec![SuggestedProfile {
                 name: "rust".into(),
@@ -2278,6 +2282,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested: vec![],
             uncovered: vec!["SENTINEL-not-from-disk".into()],
@@ -2311,6 +2317,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }])
             .with_uncovered(vec![]);
         assert_eq!(
