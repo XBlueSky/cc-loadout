@@ -211,8 +211,11 @@ impl ProfileView {
         self.working.scan_roots = outcome.roots;
         // The uncovered drift was computed on the job thread (post-merge) and
         // handed back in the outcome — assign it directly rather than re-walking
-        // every repo on the UI thread.
+        // every repo on the UI thread. A full rescan is always decisive (it
+        // walked every repo live), so it also resolves any pending state left
+        // over from a seeded-but-undecided legacy cache.
         self.uncovered = outcome.uncovered;
+        self.uncovered_pending = false;
     }
 
     /// Build the AI-draft action, scanning first when no repos have been
@@ -2330,6 +2333,52 @@ mod tests {
             v.uncovered_for_test(),
             &["SENTINEL-not-from-disk".to_string()],
             "apply_scan must use the outcome's uncovered set, not walk the FS"
+        );
+    }
+
+    #[test]
+    fn apply_scan_clears_uncovered_pending_after_a_full_rescan() {
+        // A legacy v1-cache seeds uncovered_pending = true at startup (App::new).
+        // A Rescan's outcome is fully decisive (computed from a live walk, no
+        // "pending" concept) — apply_scan must clear the flag along with
+        // replacing `uncovered`, or Task 7's "…" cue would stay stuck on
+        // forever even after a successful rescan resolves it.
+        use crate::profile::discover::RepoSignal;
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v =
+            ProfileView::new(inv, Profiles::default(), false, false).with_uncovered_pending(true);
+        assert!(
+            v.uncovered_pending_for_test(),
+            "seeded pending from a legacy cache"
+        );
+        let outcome = crate::tui::job::ScanOutcome {
+            roots: vec!["/x".into()],
+            repos: vec![RepoSignal {
+                path: "/x/a".into(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
+            }],
+            suggested: vec![],
+            uncovered: vec!["/x/a".into()],
+            scanned_at: 0,
+        };
+        v.accept_scan(outcome);
+        assert_eq!(
+            v.uncovered_for_test(),
+            &["/x/a".to_string()],
+            "uncovered must be replaced by the rescan outcome"
+        );
+        assert!(
+            !v.uncovered_pending_for_test(),
+            "a full rescan is decisive — the pending flag must clear"
         );
     }
 

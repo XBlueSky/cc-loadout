@@ -22,8 +22,9 @@ pub struct JobResult {
     pub draft: Option<crate::profile::config::Profiles>,
     /// Set by a background repo scan; delivered to the active view's `accept_scan`.
     pub scan: Option<ScanOutcome>,
-    /// Set by a background drift recompute (the uncovered-repos set); delivered
-    /// to the active view's `accept_uncovered`.
+    /// Forward scaffolding: no current job sets this (a `Rescan`'s uncovered
+    /// set flows through `ScanOutcome.uncovered` → `accept_scan` instead).
+    /// Reserved for a future off-thread producer that isn't a full rescan.
     pub uncovered: Option<Vec<String>>,
 }
 

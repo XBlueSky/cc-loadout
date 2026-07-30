@@ -76,7 +76,11 @@ pub trait View {
     /// Receive a completed background repo scan (from `Action::Rescan`).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_scan(&mut self, _outcome: crate::tui::job::ScanOutcome) {}
-    /// Receive a recomputed uncovered-repos set (from a completed `Rescan` job).
+    /// Receive a recomputed uncovered-repos set delivered via the shared
+    /// `JobResult.uncovered` slot. Currently unused forward scaffolding: no
+    /// producer sets that field today — `Rescan`'s uncovered set flows through
+    /// `ScanOutcome.uncovered` → `accept_scan` instead. Kept for a future
+    /// off-thread producer (e.g. Task 10's v1-cache migration rebuild).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_uncovered(&mut self, _uncovered: Vec<String>) {}
     /// Return the working config to persist when it has unsaved edits, marking it
