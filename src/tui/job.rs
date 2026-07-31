@@ -49,6 +49,31 @@ pub struct Job {
     pub rx: Receiver<JobResult>,
 }
 
+/// Which kind of job a receiver moved into `App::detached` backs. A bare
+/// `Receiver<JobResult>` can't tell `drain_jobs` what to recover if the
+/// worker dies (e.g. panics) before sending a result — the channel just
+/// disconnects with no `JobResult` at all. Most detached jobs (anything the
+/// user Esc'd away from the modal slot) have no per-job view state riding on
+/// them, so a dead worker is silently dropped, same as before. An
+/// `Action::IndexAtoms` job is the one exception: `ProfileView.indexing`
+/// (and the open Detail's `rules.indexing`) must be cleared even if the
+/// worker never reports back, or every future `IndexAtoms` dispatch wedges
+/// forever behind the `!self.indexing` guard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DetachedKind {
+    /// An Esc-detached job of any `Action` — nothing to recover on death.
+    Generic,
+    /// An `Action::IndexAtoms` job — `accept_index_failed` must run on death.
+    IndexAtoms,
+}
+
+/// A receiver held in `App::detached`, tagged with `kind` so `drain_jobs`
+/// knows whether a disconnect (worker died without sending) needs recovery.
+pub struct Detached {
+    pub kind: DetachedKind,
+    pub rx: Receiver<JobResult>,
+}
+
 /// Spawn `f` on a background thread; the UI keeps animating until it completes.
 pub fn spawn<F>(label: impl Into<String>, started_ms: i64, f: F) -> Job
 where

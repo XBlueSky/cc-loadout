@@ -93,9 +93,11 @@ pub struct ProfileView {
     /// where duplicates are caught.
     pub(super) index_queue: Vec<String>,
     /// Whether a background `Action::IndexAtoms` job is currently in flight.
-    /// While true, a non-empty `index_queue` waits for the NEXT `on_key` call
-    /// after `accept_index` clears this flag before dispatching the follow-up
-    /// batch (sequential batches, never two jobs racing each other).
+    /// While true, a non-empty `index_queue` waits: once this flag clears
+    /// (`accept_index` on success, `accept_index_failed` if the worker dies
+    /// without a result) the next `on_key` call sees `!indexing` and
+    /// dispatches the follow-up batch — so batches are always sequential,
+    /// never two jobs racing each other, and never permanently wedged.
     pub(super) indexing: bool,
     /// The atom batch of the currently in-flight `Action::IndexAtoms` job (or
     /// about to be dispatched), for the scan bar / count-line "indexing …" text.
@@ -979,9 +981,11 @@ impl View for ProfileView {
                 }
             }
         }
-        // A batch already queued while a job was in flight waits here — the
-        // next `on_key` call after `accept_index` clears `indexing` dispatches
-        // it, so batches are always sequential, never racing each other.
+        // A batch already queued while a job was in flight waits here: once
+        // `indexing` clears (`accept_index` on success, `accept_index_failed`
+        // if the worker died first) the first `on_key` call afterward sees
+        // `!indexing` and dispatches it, so batches are always sequential,
+        // never racing each other, and a dead worker never wedges the queue.
         // `action_out.is_none()` lets an Apply commit (the only other action
         // this function can emit) win if both happen to land on the same key.
         if action_out.is_none() && !self.index_queue.is_empty() && !self.indexing {
@@ -1086,6 +1090,29 @@ impl View for ProfileView {
             self.uncovered = unc;
         }
         self.uncovered_pending = pending;
+    }
+
+    fn accept_index_failed(&mut self) {
+        // The worker died before producing an `IndexOutcome` (e.g. it
+        // panicked) — the atoms it was about to answer are still genuinely
+        // unindexed, so requeue them (deduped, same rule as any other queue
+        // push) rather than dropping them: the very next `on_key` retries
+        // them as a fresh batch instead of leaving the rule permanently
+        // stuck on "press s to index". Clear both `indexing` flags
+        // unconditionally so dispatch (and the scan-bar/count-line
+        // "indexing …" text) can never wedge behind a worker that will
+        // never report back.
+        let mut seen: std::collections::BTreeSet<String> =
+            self.index_queue.iter().cloned().collect();
+        for atom in std::mem::take(&mut self.indexing_atoms) {
+            if seen.insert(atom.clone()) {
+                self.index_queue.push(atom);
+            }
+        }
+        self.indexing = false;
+        if let Sub::Detail(state) = &mut self.sub {
+            state.rules.indexing = false;
+        }
     }
 
     fn dirty_config(&mut self) -> Option<Profiles> {
@@ -2881,6 +2908,59 @@ mod tests {
             Sub::Detail(state) => assert!(
                 !state.rules.indexing,
                 "the open Detail's RulesState.indexing must clear too — it must never wedge"
+            ),
+            _ => panic!("expected Sub::Detail"),
+        }
+    }
+
+    /// The IndexAtoms worker died (e.g. panicked) before producing an
+    /// `IndexOutcome` — `accept_index_failed` is the recovery path
+    /// `App::drain_jobs` calls on a disconnected receiver. The dead batch's
+    /// atoms must be requeued (not dropped) for an automatic retry, deduped
+    /// against whatever else queued while the dead batch was still in
+    /// flight, and both indexing flags must clear.
+    #[test]
+    fn accept_index_failed_requeues_the_dead_batch_deduped_and_clears_flags() {
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string(), "file:go.mod".to_string()];
+        // A different atom was queued (e.g. from a second rule commit) while
+        // this batch was still in flight — one atom overlaps the dead batch.
+        v.index_queue = vec![
+            "file:go.mod".to_string(),
+            "kw:Cargo.toml\u{2192}tokio".to_string(),
+        ];
+        if let Sub::Detail(state) = &mut v.sub {
+            state.rules.indexing = true;
+        }
+
+        v.accept_index_failed();
+
+        assert!(!v.indexing, "indexing must clear on worker death");
+        assert!(v.indexing_atoms.is_empty());
+        let mut got = v.index_queue.clone();
+        got.sort();
+        let mut want = vec![
+            "file:go.mod".to_string(),
+            "glob:*.tsx".to_string(),
+            "kw:Cargo.toml\u{2192}tokio".to_string(),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the dead batch is requeued for retry, deduped against what's already queued"
+        );
+        match &v.sub {
+            Sub::Detail(state) => assert!(
+                !state.rules.indexing,
+                "the open Detail's RulesState.indexing must clear too"
             ),
             _ => panic!("expected Sub::Detail"),
         }
