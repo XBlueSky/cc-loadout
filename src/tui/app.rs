@@ -31,6 +31,78 @@ fn rescan_toast(repo_count: usize, budget_hits: usize) -> String {
     }
 }
 
+/// Build the background job for a full repo scan: walk `roots`, compute
+/// rule_hits/uncovered from the freshly-indexed signals, and best-effort
+/// persist the result into the scan cache. Shared by `Action::Rescan` (the
+/// `s` key) and `App::new`'s startup rebuild of a stale-version scan cache
+/// (Task 10) — both need the identical computation, so there is exactly one
+/// place that knows how a scan turns into a `ScanOutcome` + cache write.
+fn rescan_job(
+    roots: Vec<String>,
+    working: crate::profile::config::Profiles,
+    data_root: std::path::PathBuf,
+    now_ms: i64,
+) -> crate::tui::job::Job {
+    let label = if roots.len() == 1 {
+        format!("scanning {}", roots[0])
+    } else {
+        format!("scanning {} roots", roots.len())
+    };
+    crate::tui::job::spawn(label, now_ms, move || {
+        let vocab = crate::profile::signal_detect::vocabulary(&working);
+        let (repos, budget_hits) =
+            crate::profile::discover::scan_repo_signals_with_budget_hits(&roots, 6, &vocab);
+        let suggested = crate::profile::discover::suggest_profiles(&repos);
+        // Compute the uncovered drift here (post-merge, from the freshly-indexed
+        // signals) so the UI thread never re-walks every repo when folding the
+        // result. A fresh scan indexes the full current-rule vocabulary, so
+        // every rule is index-answerable by construction — `pending` must be
+        // false (debug-asserted below; if it somehow isn't, the signal
+        // evaluator still degrades gracefully by leaving undecided repos out
+        // of `uncovered` rather than guessing).
+        let mut merged = working.clone();
+        for sp in &suggested {
+            merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
+                crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
+            });
+        }
+        let (uncovered, pending) = crate::profile::drift::uncovered_from_signals(&repos, &merged);
+        debug_assert!(
+            !pending,
+            "a fresh scan indexes the full current-rule vocabulary; \
+             uncovered_from_signals must be decisive right after Rescan"
+        );
+        let scanned_at = crate::now_epoch();
+        // Best-effort: persist so a reopen shows counts + drift without a
+        // re-walk. A failed cache write must not fail the scan.
+        let _ = crate::profile::scan_cache::save(
+            &data_root,
+            &crate::profile::scan_cache::ScanCache {
+                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
+                roots: roots.clone(),
+                repos: repos.clone(),
+                uncovered: Some(uncovered.clone()),
+                scanned_at,
+            },
+        );
+        crate::tui::job::JobResult {
+            toast: rescan_toast(repos.len(), budget_hits),
+            needs_refresh: false,
+            draft: None,
+            scan: Some(crate::tui::job::ScanOutcome {
+                roots,
+                repos,
+                suggested,
+                uncovered,
+                scanned_at,
+                budget_hits,
+            }),
+            uncovered: None,
+            index: None,
+        }
+    })
+}
+
 pub struct App {
     tabs: Vec<Box<dyn View>>,
     active: usize,
@@ -88,13 +160,18 @@ impl App {
         let mut scanned_at = None;
         let mut cached_repos = Vec::new();
         let mut cached_uncovered = Vec::new();
-        // A cached `uncovered: None` means the cache predates the atom index (a
-        // v1 cache has no `rule_hits`, so a signal-based recompute over it would
-        // land every repo Unknown) — seed uncovered empty and mark it pending
-        // rather than guessing. Task 10 replaces this with a banner + explicit
-        // rebuild; this task only stops the old (deleted) background-walk
-        // backfill from having a caller.
+        // A cached `uncovered: None` means the field was never computed (e.g. a
+        // stale-version cache predates the atom index, so a signal-based
+        // recompute over it would land every repo Unknown) — seed uncovered
+        // empty and mark it pending rather than guessing.
         let mut uncovered_pending = false;
+        // Task 10: a cache stamped with an older schema version needs its
+        // rule_hits rebuilt from scratch (a v1 cache has none at all) before
+        // any signal-based recompute can trust it. Purely version-driven —
+        // independent of whether `uncovered` above happened to be `Some` or
+        // `None` — so the two seeds can each be true or false on their own
+        // without ever causing a second spawn.
+        let mut needs_rebuild = false;
         if let Some(cache) = crate::profile::scan_cache::load(&ctx.data_root) {
             if cache.roots == scan_roots {
                 cached_repos = cache.repos;
@@ -103,7 +180,28 @@ impl App {
                     None => uncovered_pending = !cached_repos.is_empty(),
                 }
                 scanned_at = Some(cache.scanned_at);
+                needs_rebuild = cache.version < crate::profile::scan_cache::SCAN_CACHE_VERSION
+                    && !cached_repos.is_empty();
             }
+        }
+        // A stale-version cache walks itself back onto the current schema on a
+        // detached background thread — startup itself never blocks on it
+        // (Stage B stays walk-free): `App::new` only ever reads the cache
+        // file above. `rescan_job` is the SAME implementation the `s` key
+        // dispatches, so the rebuilt cache is exactly what an explicit
+        // rescan would have produced.
+        let mut detached: Vec<crate::tui::job::Detached> = Vec::new();
+        if needs_rebuild {
+            let job = rescan_job(
+                scan_roots.clone(),
+                working.clone(),
+                ctx.data_root.clone(),
+                crate::now_epoch() * 1000,
+            );
+            detached.push(crate::tui::job::Detached {
+                kind: crate::tui::job::DetachedKind::Rebuild,
+                rx: job.rx,
+            });
         }
         let tabs: Vec<Box<dyn View>> = vec![
             Box::new(Overview::new()),
@@ -118,7 +216,8 @@ impl App {
                     .with_scanned_at(scanned_at)
                     .with_scan_repos(cached_repos)
                     .with_uncovered(cached_uncovered)
-                    .with_uncovered_pending(uncovered_pending),
+                    .with_uncovered_pending(uncovered_pending)
+                    .with_index_rebuilding(needs_rebuild),
             ),
             Box::new(crate::tui::tasks::TasksView::new()),
         ];
@@ -132,7 +231,7 @@ impl App {
             toast_at_ms: None,
             frame: 0,
             job: None,
-            detached: Vec::new(),
+            detached,
             ctx,
             snap,
         };
@@ -303,12 +402,13 @@ impl App {
         let mut completed_scans: Vec<crate::tui::job::ScanOutcome> = Vec::new();
         let mut completed_uncovered: Vec<Vec<String>> = Vec::new();
         let mut completed_index: Vec<crate::tui::job::IndexOutcome> = Vec::new();
-        // An IndexAtoms worker that disconnected without sending a result
-        // (e.g. it panicked) — recovery is routed after the loop, once the
-        // borrow on self.detached is released. Most detached jobs (Generic)
-        // have no per-job view state to recover, so a disconnect there is
-        // still silently dropped, same as before this fix.
+        // An IndexAtoms/Rebuild worker that disconnected without sending a
+        // result (e.g. it panicked) — recovery is routed after the loop,
+        // once the borrow on self.detached is released. Most detached jobs
+        // (Generic) have no per-job view state to recover, so a disconnect
+        // there is still silently dropped, same as before this fix.
         let mut index_job_died = false;
+        let mut rebuild_job_died = false;
         let mut refresh_needed = false;
         for job in self.detached.drain(..) {
             match job.rx.try_recv() {
@@ -330,12 +430,13 @@ impl App {
                     }
                     completed_toasts.push(result.toast);
                 }
-                Err(TryRecvError::Disconnected) => {
-                    if job.kind == crate::tui::job::DetachedKind::IndexAtoms {
-                        index_job_died = true;
+                Err(TryRecvError::Disconnected) => match job.kind {
+                    crate::tui::job::DetachedKind::IndexAtoms => index_job_died = true,
+                    crate::tui::job::DetachedKind::Rebuild => rebuild_job_died = true,
+                    crate::tui::job::DetachedKind::Generic => {
+                        // Generic: worker gone, nothing to show (unchanged).
                     }
-                    // Generic: worker gone, nothing to show (unchanged).
-                }
+                },
                 Err(TryRecvError::Empty) => still_pending.push(job), // keep polling
             }
         }
@@ -362,6 +463,14 @@ impl App {
             // itself clears without the user having to do anything.
             self.tabs[crate::tui::TAB_PROFILE].accept_index_failed();
             completed_toasts.push("indexing aborted".to_string());
+        }
+        if rebuild_job_died {
+            // Same shape as the IndexAtoms recovery above: clear the
+            // "index outdated — rebuilding…" banner (it would otherwise
+            // never clear) and surface a user-visible toast — the cache
+            // stays stale until the user rescans explicitly.
+            self.tabs[crate::tui::TAB_PROFILE].accept_rebuild_failed();
+            completed_toasts.push("index rebuild aborted \u{b7} press s to rescan".to_string());
         }
         // Apply the last toast (if multiple completed, only the last is shown).
         for toast in completed_toasts {
@@ -564,72 +673,12 @@ impl App {
                 self.spawn_draft_job(inv, scan_roots, crate::util::which("claude"));
             }
             Action::Rescan { roots, working } => {
-                let label = if roots.len() == 1 {
-                    format!("scanning {}", roots[0])
-                } else {
-                    format!("scanning {} roots", roots.len())
-                };
                 let data_root = self.ctx.data_root.clone();
-                self.job = Some(crate::tui::job::spawn(
-                    label,
+                self.job = Some(rescan_job(
+                    roots,
+                    working,
+                    data_root,
                     crate::now_epoch() * 1000,
-                    move || {
-                        let vocab = crate::profile::signal_detect::vocabulary(&working);
-                        let (repos, budget_hits) =
-                            crate::profile::discover::scan_repo_signals_with_budget_hits(
-                                &roots, 6, &vocab,
-                            );
-                        let suggested = crate::profile::discover::suggest_profiles(&repos);
-                        // Compute the uncovered drift here (post-merge, from the
-                        // freshly-indexed signals) so the UI thread never re-walks
-                        // every repo when folding the result. A fresh scan indexes
-                        // the full current-rule vocabulary, so every rule is
-                        // index-answerable by construction — `pending` must be
-                        // false (debug-asserted below; if it somehow isn't, the
-                        // signal evaluator still degrades gracefully by leaving
-                        // undecided repos out of `uncovered` rather than guessing).
-                        let mut merged = working.clone();
-                        for sp in &suggested {
-                            merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
-                                crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
-                            });
-                        }
-                        let (uncovered, pending) =
-                            crate::profile::drift::uncovered_from_signals(&repos, &merged);
-                        debug_assert!(
-                            !pending,
-                            "a fresh scan indexes the full current-rule vocabulary; \
-                             uncovered_from_signals must be decisive right after Rescan"
-                        );
-                        let scanned_at = crate::now_epoch();
-                        // Best-effort: persist so a reopen shows counts + drift
-                        // without a re-walk. A failed cache write must not fail the scan.
-                        let _ = crate::profile::scan_cache::save(
-                            &data_root,
-                            &crate::profile::scan_cache::ScanCache {
-                                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
-                                roots: roots.clone(),
-                                repos: repos.clone(),
-                                uncovered: Some(uncovered.clone()),
-                                scanned_at,
-                            },
-                        );
-                        crate::tui::job::JobResult {
-                            toast: rescan_toast(repos.len(), budget_hits),
-                            needs_refresh: false,
-                            draft: None,
-                            scan: Some(crate::tui::job::ScanOutcome {
-                                roots,
-                                repos,
-                                suggested,
-                                uncovered,
-                                scanned_at,
-                                budget_hits,
-                            }),
-                            uncovered: None,
-                            index: None,
-                        }
-                    },
                 ));
             }
             Action::IndexAtoms { atoms, repos } => {
@@ -1920,13 +1969,18 @@ mod tests {
     }
 
     #[test]
-    fn new_does_not_spawn_a_backfill_job_for_a_legacy_cache() {
-        // A legacy cache (uncovered: None, predating the atom index) must not
-        // block startup — and, since the background-walk backfill job was
-        // deleted (Task 6: drift is now computed from the signal index, not a
-        // filesystem walk), startup must not schedule ANY job for it either.
-        // The cache is left untouched; Task 10 replaces this seed with an
-        // explicit rebuild + banner.
+    fn new_does_not_spawn_a_rebuild_for_a_current_version_cache_with_uncovered_none() {
+        // Renamed from `new_does_not_spawn_a_backfill_job_for_a_legacy_cache`
+        // (Task 9 era): `ctx_with_cache_uncovered` always stamps the cache
+        // with `SCAN_CACHE_VERSION` (the helper has no `version` parameter),
+        // so despite the old name this was never actually a v1/stale-version
+        // cache — it is a CURRENT-version cache whose `uncovered` just
+        // happens to be `None`. Task 10's rebuild is purely version-driven
+        // (`cache.version < SCAN_CACHE_VERSION`), so this same-version cache
+        // must still spawn NO job — only the Task 6 pending-seed applies.
+        // The true v1-migration scenario (version < SCAN_CACHE_VERSION) is
+        // covered by `v1_cache_with_uncovered_none_also_spawns_exactly_one_rebuild_job`
+        // below, which uses an explicit `version: 0` cache.
         let hdir = tempfile::tempdir().unwrap();
         let ddir = tempfile::tempdir().unwrap();
         // None uncovered + one repo (/workspace/a, nonexistent) under empty profiles.
@@ -1934,7 +1988,7 @@ mod tests {
         let mut app = App::new(ctx, 1).unwrap(); // active = Accounts, NOT Profile
         assert!(
             app.detached.is_empty(),
-            "no backfill job is scheduled for a legacy cache anymore"
+            "no rebuild job is scheduled for a same-version cache"
         );
         drain_until_settled(&mut app);
         assert_eq!(
@@ -1942,7 +1996,7 @@ mod tests {
                 .unwrap()
                 .uncovered,
             None,
-            "the cache is left untouched until Task 10's explicit rebuild"
+            "the cache is left untouched — nothing rebuilds a same-version cache"
         );
     }
 
@@ -1966,6 +2020,187 @@ mod tests {
                 .uncovered,
             Some(vec![]),
             "a computed-empty cache must stay empty (no re-walk on startup)"
+        );
+    }
+
+    // ── Task 10: v1 scan-cache migration (banner + detached rebuild) ────────
+
+    /// Build a context with a genuinely stale-version (`version: 0`) scan
+    /// cache whose one repo (`{root}/svc`, a real `.git` directory with an
+    /// `App.svelte` file) sits under `root` — so a real background rebuild
+    /// walk has something concrete to find and index.
+    fn ctx_with_v1_cache(
+        version: u32,
+        uncovered: Option<Vec<String>>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, AppCtx, String) {
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        let work = hdir.path().join("work");
+        let repo = work.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("App.svelte"), "").unwrap();
+        let root = work.display().to_string();
+
+        let cfg_json = r#"{"scan_roots":["__ROOT__"],"universal":[],"profiles":{"frontend":{"plugins":[],"detect":{"marker_globs":["*.svelte"]}}}}"#
+            .replace("__ROOT__", &root);
+        std::fs::write(hdir.path().join("profiles.json"), cfg_json).unwrap();
+
+        crate::profile::scan_cache::save(
+            ddir.path(),
+            &crate::profile::scan_cache::ScanCache {
+                version,
+                roots: vec![root.clone()],
+                repos: vec![crate::profile::discover::RepoSignal {
+                    path: repo.display().to_string(),
+                    marker_files: vec![],
+                    marker_globs: vec![],
+                    package_json_deps: vec![],
+                    languages: vec![],
+                    rule_hits: Default::default(), // v1: nothing indexed yet
+                    override_names: None,
+                }],
+                uncovered,
+                scanned_at: 1_700_000_000,
+            },
+        )
+        .unwrap();
+
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        (hdir, ddir, ctx, root)
+    }
+
+    #[test]
+    fn v1_cache_with_uncovered_some_spawns_a_detached_rebuild_and_the_banner_clears_once_it_lands()
+    {
+        // The typical July-era shape: version < SCAN_CACHE_VERSION, but
+        // `uncovered` was already computed by the old (pre-index) code path.
+        let (_hdir, ddir, ctx, _root) = ctx_with_v1_cache(0, Some(vec![]));
+        let mut app = App::new(ctx, 3).unwrap(); // Profile tab
+
+        assert_eq!(
+            app.detached.len(),
+            1,
+            "a stale-version cache with repos must spawn exactly one detached rebuild"
+        );
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("rebuilding in background"),
+            "the banner must render while the rebuild is in flight: {text}"
+        );
+
+        drain_until_settled(&mut app);
+
+        let text = render_profile(&mut app);
+        assert!(
+            !text.contains("rebuilding in background"),
+            "the banner must clear once the rebuild lands: {text}"
+        );
+
+        let cache =
+            crate::profile::scan_cache::load(ddir.path()).expect("rebuild must persist a cache");
+        assert_eq!(
+            cache.version,
+            crate::profile::scan_cache::SCAN_CACHE_VERSION,
+            "the rebuilt cache must be stamped with the current version"
+        );
+        let repo_cache = cache
+            .repos
+            .iter()
+            .find(|r| r.path.ends_with("/svc"))
+            .expect("svc repo must be reindexed by the rebuild");
+        assert_eq!(
+            repo_cache.rule_hits.get("glob:*.svelte"),
+            Some(&true),
+            "the rebuild must index rule_hits, not just bump the version: {:?}",
+            repo_cache.rule_hits
+        );
+    }
+
+    #[test]
+    fn v1_cache_with_uncovered_none_also_spawns_exactly_one_rebuild_job() {
+        // A v1 cache whose `uncovered` is None seeds Task 6's pending flag AND
+        // needs Task 10's rebuild — both are true here, but there must be
+        // exactly ONE detached job (no double-spawn between the two seeds).
+        let (_hdir, ddir, ctx, _root) = ctx_with_v1_cache(0, None);
+        let mut app = App::new(ctx, 3).unwrap();
+
+        assert_eq!(
+            app.detached.len(),
+            1,
+            "uncovered:None must not cause a second spawn alongside the rebuild"
+        );
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("rebuilding in background"),
+            "the banner must render for this case too: {text}"
+        );
+
+        drain_until_settled(&mut app);
+
+        let text = render_profile(&mut app);
+        assert!(
+            !text.contains("rebuilding in background"),
+            "the banner must clear once the rebuild lands: {text}"
+        );
+        let cache =
+            crate::profile::scan_cache::load(ddir.path()).expect("rebuild must persist a cache");
+        assert_eq!(
+            cache.version,
+            crate::profile::scan_cache::SCAN_CACHE_VERSION,
+            "the rebuilt cache must be stamped with the current version"
+        );
+    }
+
+    #[test]
+    fn rebuild_worker_death_clears_the_banner_and_leaves_no_wedged_detached_entry() {
+        // Mirrors `index_atoms_worker_death_clears_indexing_and_retries_the_batch`:
+        // a rebuild worker that dies before sending a ScanOutcome must not
+        // leave the banner up forever, and drain_jobs must not keep the dead
+        // receiver around.
+        let (_hdir, _ddir, ctx, _root) = ctx_with_v1_cache(0, Some(vec![]));
+        let mut app = App::new(ctx, 3).unwrap();
+        assert_eq!(
+            app.detached.len(),
+            1,
+            "the real rebuild job must be detached"
+        );
+
+        // Simulate the worker dying before it could send a result: swap the
+        // real job's receiver for one backed by a deliberately panicking
+        // closure, tagged the same Rebuild kind a real dispatch would use.
+        app.detached[0] = crate::tui::job::Detached {
+            kind: crate::tui::job::DetachedKind::Rebuild,
+            rx: crate::tui::job::spawn("simulated crash", 0, || panic!("simulated worker crash"))
+                .rx,
+        };
+
+        drain_until_settled(&mut app);
+        assert!(
+            app.detached.is_empty(),
+            "a disconnected rebuild receiver must not be kept forever"
+        );
+
+        let text = render_profile(&mut app);
+        assert!(
+            !text.contains("rebuilding in background"),
+            "a dead rebuild worker must clear the banner: {text}"
+        );
+        assert!(
+            app.toast
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("rebuild"),
+            "a user-visible signal must appear when the rebuild worker dies, got {:?}",
+            app.toast
         );
     }
 
