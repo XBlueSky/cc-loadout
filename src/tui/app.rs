@@ -208,9 +208,10 @@ impl App {
             Box::new(AccountsView::new()),
             Box::new(crate::tui::schedule::ScheduleView::new()),
             Box::new(
-                // Construct with a walk-free (empty-repo) inventory so the
-                // constructor's recompute is trivial, then seed the cached repos
-                // and uncovered drift via builders that do NO filesystem I/O.
+                // Construct with a walk-free (empty-repo) inventory — the
+                // constructor itself never touches disk — then seed the cached
+                // repos and uncovered drift via builders that do NO filesystem
+                // I/O either.
                 crate::tui::profile::ProfileView::new(inv, working, claude_available, !cfg_existed)
                     .with_scan_roots(scan_roots)
                     .with_scanned_at(scanned_at)
@@ -3208,6 +3209,118 @@ mod tests {
             app.active_index(),
             3,
             "still on the Profile tab after closing explain"
+        );
+    }
+
+    // ── Task 13: zero-I/O regression net ────────────────────────────────────
+
+    /// End-to-end proof that once a repo's signals are indexed, every
+    /// interactive path touching counts/drift/Apply reads the index — never
+    /// the filesystem. The repo directory is deleted entirely right after the
+    /// real scan that seeds the cache; a regression back to a disk walk on
+    /// any of these paths would either see "not found" (flipping a definite
+    /// match to a definite non-match, changing the rendered counts) or
+    /// hang/slow-walk a nonexistent tree — the 1s bound below catches the
+    /// latter even on the rare path where the former doesn't trip.
+    #[test]
+    fn zero_walk_after_repo_deletion_keeps_detail_edit_and_apply_definite() {
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        let work = hdir.path().join("work");
+        let repo = work.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("App.vue"), "").unwrap();
+        let root = work.display().to_string();
+
+        let cfg_json = r#"{"scan_roots":["__ROOT__"],"universal":[],"profiles":{"frontend":{"plugins":[],"detect":{"marker_globs":["*.vue"]}}}}"#
+            .replace("__ROOT__", &root);
+        std::fs::write(hdir.path().join("profiles.json"), cfg_json).unwrap();
+
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        let mut app = App::new(ctx, 3).unwrap(); // Profile tab
+
+        // Real scan while the repo still exists — the ONLY filesystem walk
+        // in this whole test.
+        app.handle_key(key(KeyCode::Char('s'))).unwrap();
+        drain_until_idle(&mut app);
+
+        // Delete the repo entirely. Everything from here on must answer from
+        // the already-indexed signal, not the (now-absent) directory.
+        std::fs::remove_dir_all(&repo).unwrap();
+        assert!(!repo.exists());
+
+        // ── Interaction 1: open Detail on the glob-rule profile ────────────
+        let t0 = std::time::Instant::now();
+        app.handle_key(key(KeyCode::Char('v'))).unwrap(); // by-profile board
+        app.handle_key(key(KeyCode::Down)).unwrap(); // Universal -> "frontend"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // open Detail
+        app.handle_key(key(KeyCode::Tab)).unwrap(); // focus -> Rules
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(1),
+            "opening Detail must not block on a disk walk"
+        );
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("matches 1 of 1"),
+            "count must stay definite even though the repo directory is gone: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "an already-indexed atom must never fall back to the pending ellipsis: {text}"
+        );
+
+        // ── Interaction 2: edit a rule — add a "has file" rule for
+        // Cargo.toml. That atom is already in every repo's rule_hits (Task 9:
+        // MARKER_FILES is indexed unconditionally at scan time, regardless of
+        // which rules were live then), so this must resolve — and drift must
+        // recompute — without dispatching a background IndexAtoms job. ───────
+        let t1 = std::time::Instant::now();
+        app.handle_key(key(KeyCode::Char('a'))).unwrap(); // open builder (kind pick)
+        app.handle_key(key(KeyCode::Down)).unwrap(); // move to "has file"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // choose "has file"
+        for c in "Cargo.toml".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // commit rule -> autosave
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // done -> close Detail, drift recomputes
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(1),
+            "editing a rule must not block on a disk walk"
+        );
+        assert!(
+            app.job.is_none() && app.detached.is_empty(),
+            "the new atom was already indexed at scan time — editing must not \
+             dispatch a background IndexAtoms job"
+        );
+
+        // ── Interaction 3: open Apply — rows built entirely from the index ─
+        let t2 = std::time::Instant::now();
+        app.handle_key(key(KeyCode::Char('w'))).unwrap(); // open Apply
+        assert!(
+            t2.elapsed() < std::time::Duration::from_secs(1),
+            "opening Apply must not block on a disk walk"
+        );
+        let text = render_profile(&mut app);
+        assert!(text.contains("APPLY"), "Apply must render: {text}");
+        assert!(
+            text.contains("frontend"),
+            "the row's matched profile must still be definite: {text}"
+        );
+        assert!(
+            !text.contains("pending index"),
+            "a fully indexed row must never render as pending: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "Apply must never show the pending ellipsis for an indexed repo: {text}"
         );
     }
 }
