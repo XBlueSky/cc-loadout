@@ -133,10 +133,18 @@ fn row_matches_reason(row: &RuleRow, reason: &MatchReason) -> bool {
 }
 
 /// Open explain overlay: a repo list + the report for the selected repo.
+///
+/// `repos` is a frozen snapshot taken when the overlay opened — a detached
+/// rescan can replace `inv.repos` wholesale while the overlay stays open
+/// (Task 9's `s` → Esc detach → the scan lands later), so a path in `repos`
+/// is not guaranteed to still have a signal in `inv.repos` by the time the
+/// user navigates to it. `report` is `None` in exactly that case: the caller
+/// couldn't find a signal for the selected path, and `render` must say so
+/// honestly rather than require a report to exist.
 pub struct ExplainState {
     pub repos: Vec<String>,
     pub cursor: usize,
-    pub report: ExplainReport,
+    pub report: Option<ExplainReport>,
 }
 
 /// Render the explain overlay (borderless).
@@ -165,60 +173,77 @@ pub fn render(ex: &ExplainState, f: &mut Frame, area: Rect) {
 
     // ── Report lines (provenance + per-rule breakdown) ────────────────────
     let mut report: Vec<Line<'static>> = Vec::new();
-    if ex.report.matched_profiles.is_empty() {
-        // An empty list is only a decisive "no profile matches" when nothing
-        // in the config is still pending an index answer — otherwise a
-        // profile that would have matched may simply not be indexed yet, and
-        // saying "no profile" outright would be a fabricated no-match.
-        if ex.report.cross_pending {
+    match &ex.report {
+        None => {
+            // No signal for the selected path — e.g. a detached rescan
+            // replaced `inv.repos` while this overlay's `repos` snapshot
+            // still names it (the repo was deleted/renamed on disk in the
+            // meantime). Say so honestly; there is no reasoning to show,
+            // not a decisive no-match.
             report.push(Line::from(Span::styled(
-                "(pending — some rules not yet indexed)",
-                theme::faint(),
-            )));
-        } else {
-            report.push(Line::from(Span::styled(
-                "Matches no profile",
+                "repo no longer indexed — rescan may have removed it",
                 theme::faint(),
             )));
         }
-    } else {
-        report.push(Line::from(Span::styled("Currently matches", theme::dim())));
-        for (name, why) in &ex.report.matched_profiles {
-            report.push(Line::from(Span::styled(
-                format!("   {name}   {why}"),
-                theme::text(),
-            )));
-        }
-    }
-    report.push(Line::raw(""));
-    let head = if ex.report.overall {
-        "This profile's rules (matches)"
-    } else if ex.report.this_pending {
-        "This profile's rules (pending — some rules not yet indexed)"
-    } else {
-        "This profile's rules (no rule fires)"
-    };
-    report.push(Line::from(Span::styled(head.to_string(), theme::dim())));
-    if ex.report.this_pending {
-        // This profile's own answer is Unknown: the disk question behind at
-        // least one row was never indexed, so per-row fire/no-fire marks
-        // would be fabricated. Say so honestly instead of drawing dashes.
-        report.push(Line::from(vec![
-            Span::raw("   "),
-            Span::styled("… pending index", theme::faint()),
-        ]));
-    } else {
-        for (label, fires) in &ex.report.this_rules {
-            let mark = if *fires { "●" } else { "╴" };
-            let style = if *fires {
-                theme::accent()
+        Some(rep) => {
+            if rep.matched_profiles.is_empty() {
+                // An empty list is only a decisive "no profile matches" when
+                // nothing in the config is still pending an index answer —
+                // otherwise a profile that would have matched may simply not
+                // be indexed yet, and saying "no profile" outright would be a
+                // fabricated no-match.
+                if rep.cross_pending {
+                    report.push(Line::from(Span::styled(
+                        "(pending — some rules not yet indexed)",
+                        theme::faint(),
+                    )));
+                } else {
+                    report.push(Line::from(Span::styled(
+                        "Matches no profile",
+                        theme::faint(),
+                    )));
+                }
             } else {
-                theme::faint()
+                report.push(Line::from(Span::styled("Currently matches", theme::dim())));
+                for (name, why) in &rep.matched_profiles {
+                    report.push(Line::from(Span::styled(
+                        format!("   {name}   {why}"),
+                        theme::text(),
+                    )));
+                }
+            }
+            report.push(Line::raw(""));
+            let head = if rep.overall {
+                "This profile's rules (matches)"
+            } else if rep.this_pending {
+                "This profile's rules (pending — some rules not yet indexed)"
+            } else {
+                "This profile's rules (no rule fires)"
             };
-            report.push(Line::from(vec![
-                Span::styled(format!("   {mark} "), style),
-                Span::styled(label.clone(), theme::text()),
-            ]));
+            report.push(Line::from(Span::styled(head.to_string(), theme::dim())));
+            if rep.this_pending {
+                // This profile's own answer is Unknown: the disk question
+                // behind at least one row was never indexed, so per-row
+                // fire/no-fire marks would be fabricated. Say so honestly
+                // instead of drawing dashes.
+                report.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled("… pending index", theme::faint()),
+                ]));
+            } else {
+                for (label, fires) in &rep.this_rules {
+                    let mark = if *fires { "●" } else { "╴" };
+                    let style = if *fires {
+                        theme::accent()
+                    } else {
+                        theme::faint()
+                    };
+                    report.push(Line::from(vec![
+                        Span::styled(format!("   {mark} "), style),
+                        Span::styled(label.clone(), theme::text()),
+                    ]));
+                }
+            }
         }
     }
 
@@ -472,7 +497,7 @@ mod tests {
         let ex = ExplainState {
             repos: vec![sig.path.clone()],
             cursor: 0,
-            report,
+            report: Some(report),
         };
 
         let mut t = Terminal::new(TestBackend::new(90, 20)).unwrap();
@@ -496,6 +521,39 @@ mod tests {
         assert!(
             !text.contains("no rule fires"),
             "must not fabricate a decisive no-fire verdict: {text}"
+        );
+    }
+
+    /// Fix round 1 (Critical): a repo can vanish from `inv.repos` out from
+    /// under an open explain overlay (a detached rescan lands on a frozen
+    /// `ExplainState.repos` snapshot — see detail.rs's regression test for
+    /// the full traced sequence). `render` must accept a missing report and
+    /// say so honestly, by construction, rather than requiring the caller to
+    /// have a report at all.
+    #[test]
+    fn render_shows_honest_message_when_report_missing_zero_disk() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let ex = ExplainState {
+            repos: vec!["/does/not/exist/vanished".into()],
+            cursor: 0,
+            report: None,
+        };
+
+        let mut t = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        t.draw(|f| render(&ex, f, f.area())).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            text.contains("no longer indexed"),
+            "must render an honest message instead of requiring a report: {text}"
         );
     }
 }
