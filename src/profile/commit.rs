@@ -21,6 +21,13 @@ pub struct CommitReport {
     /// from the index and can go stale between scan and write; this is the
     /// after-the-fact honesty check on that gap.
     pub diverged: usize,
+    /// Each written repo's freshly re-detected `RepoSignal` (same values just
+    /// merged into the on-disk scan cache above). The caller (the TUI's
+    /// `Action::Commit` handler) folds these into the in-memory inventory too
+    /// — via `IndexOutcome`/`accept_index`, same as `IndexAtoms` — so
+    /// reopening Apply right after a commit reflects fresh truth without a
+    /// restart or an explicit rescan.
+    pub fresh_signals: Vec<discover::RepoSignal>,
 }
 
 /// Write profiles.json (+ backup), sync global settings.json (Model C), then
@@ -90,10 +97,10 @@ pub fn commit(
     // thing above, so a partial atom-merge would leave other fields stale.
     if !fresh_signals.is_empty() {
         if let Some(mut cache) = scan_cache::load(data_root) {
-            for fresh in fresh_signals {
+            for fresh in &fresh_signals {
                 match cache.repos.iter_mut().find(|r| r.path == fresh.path) {
-                    Some(slot) => *slot = fresh,
-                    None => cache.repos.push(fresh),
+                    Some(slot) => *slot = fresh.clone(),
+                    None => cache.repos.push(fresh.clone()),
                 }
             }
             let _ = scan_cache::save(data_root, &cache);
@@ -106,6 +113,7 @@ pub fn commit(
         global_kept: kept,
         repos_applied,
         diverged,
+        fresh_signals,
     })
 }
 
@@ -204,6 +212,42 @@ mod tests {
         .unwrap();
 
         assert_eq!(rep.diverged, 1);
+    }
+
+    #[test]
+    fn commit_report_carries_fresh_signals_for_written_repos_only() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg_path = home.path().join("profiles.json");
+        let settings = home.path().join("settings.json");
+        let data_root = home.path();
+        let repo = home.path().join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
+        let canon = std::fs::canonicalize(&repo).unwrap();
+
+        let rep = commit(
+            &cfg_path,
+            &settings,
+            data_root,
+            &working(),
+            std::slice::from_ref(&repo),
+            &[(repo.clone(), vec!["rust".to_string()])],
+            100,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rep.fresh_signals.len(),
+            1,
+            "one written repo => one fresh signal"
+        );
+        let sig = &rep.fresh_signals[0];
+        assert_eq!(sig.path, canon.display().to_string());
+        assert_eq!(
+            sig.rule_hits.get("file:Cargo.toml"),
+            Some(&true),
+            "fresh signal must carry the just-recomputed rule_hits: {sig:?}"
+        );
     }
 
     #[test]
