@@ -142,21 +142,21 @@ impl DetailState {
                             KeyCode::Esc => self.explain = None,
                             KeyCode::Down | KeyCode::Char('j') if n > 0 => {
                                 ex.cursor = (ex.cursor + 1) % n;
-                                let path = ex.repos[ex.cursor].clone();
-                                ex.report = crate::tui::profile::explain::explain_repo(
-                                    &path,
+                                ex.report = explain_report_for(
+                                    &ex.repos[ex.cursor],
                                     &self.name,
                                     &self.rules.detect,
+                                    inv,
                                     working,
                                 );
                             }
                             KeyCode::Up | KeyCode::Char('k') if n > 0 => {
                                 ex.cursor = (ex.cursor + n - 1) % n;
-                                let path = ex.repos[ex.cursor].clone();
-                                ex.report = crate::tui::profile::explain::explain_repo(
-                                    &path,
+                                ex.report = explain_report_for(
+                                    &ex.repos[ex.cursor],
                                     &self.name,
                                     &self.rules.detect,
+                                    inv,
                                     working,
                                 );
                             }
@@ -190,25 +190,22 @@ impl DetailState {
                                 // Exclude repos with a .claude/profile override — detect
                                 // rules do not classify them, so the per-rule breakdown
                                 // would be meaningless. Mirrors the filter in
-                                // RulesState::recompute.
+                                // RulesState::recompute / matching_repos: read straight
+                                // off the signal's `override_names`, zero disk I/O.
                                 let repos: Vec<String> = inv
                                     .repos
                                     .iter()
-                                    .filter(|r| {
-                                        !std::path::Path::new(&r.path)
-                                            .join(".claude")
-                                            .join("profile")
-                                            .is_file()
-                                    })
+                                    .filter(|r| r.override_names.is_none())
                                     .map(|r| r.path.clone())
                                     .collect();
                                 if repos.is_empty() {
                                     return false;
                                 }
-                                let report = crate::tui::profile::explain::explain_repo(
+                                let report = explain_report_for(
                                     &repos[0],
                                     &self.name,
                                     &self.rules.detect,
+                                    inv,
                                     working,
                                 );
                                 self.explain = Some(crate::tui::profile::explain::ExplainState {
@@ -257,6 +254,24 @@ impl DetailState {
             }
         }
     }
+}
+
+/// Build an explain report for the repo at `path`, looking its indexed
+/// signal up in `inv.repos` — the explain overlay's repo list is itself
+/// derived from `inv.repos`, so the signal is always present. Zero disk I/O.
+fn explain_report_for(
+    path: &str,
+    name: &str,
+    detect: &crate::profile::config::Detect,
+    inv: &Inventory,
+    working: &Profiles,
+) -> crate::tui::profile::explain::ExplainReport {
+    let sig = inv
+        .repos
+        .iter()
+        .find(|r| r.path == path)
+        .expect("explain repo list is built from inv.repos");
+    crate::tui::profile::explain::explain_repo(sig, name, detect, working)
 }
 
 /// Render the Detail sub-view.
