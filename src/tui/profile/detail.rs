@@ -486,7 +486,11 @@ mod tests {
         // reflects the new rule by the time `on_key` returns.
         let inv = inv_with_cargo_repo("/workspace/svc");
         let working = working_rust_profile(vec![]);
-        let mut view = open_detail_on_rust(inv, working);
+        // `ProfileView::new` no longer walks the disk to seed `uncovered` (that
+        // synchronous per-repo walk is gone) — seed the starting precondition
+        // the same way a real scan-cache reopen would, via `with_uncovered`.
+        let mut view =
+            open_detail_on_rust(inv, working).with_uncovered(vec!["/workspace/svc".to_string()]);
         let (_h, _d, ctx) = test_support::ctx();
         let snap = test_support::snap();
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // open Detail(rust)

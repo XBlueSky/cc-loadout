@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use crate::profile::config::Profiles;
-use crate::profile::detect;
 use crate::profile::discover::{Inventory, RepoSignal};
 use crate::profile::plugins::managed_keys;
 
@@ -25,18 +23,6 @@ pub fn global_drift(working: &Profiles, global_enabled: &[String]) -> Vec<String
     let mut out: Vec<String> = managed_keys(working)
         .into_iter()
         .filter(|k| !universal.contains(k.as_str()) && enabled.contains(k.as_str()))
-        .collect();
-    out.sort();
-    out
-}
-
-/// Scanned repos that match no profile in `working` (sorted by path).
-pub fn uncovered_repos(inv: &Inventory, working: &Profiles) -> Vec<String> {
-    let mut out: Vec<String> = inv
-        .repos
-        .iter()
-        .filter(|r| detect::detect_profiles(Path::new(&r.path), working).is_empty())
-        .map(|r| r.path.clone())
         .collect();
     out.sort();
     out
@@ -132,47 +118,6 @@ mod tests {
         // serena is universal (allowed); ra is profile-specific but globally enabled → drift.
         let got = global_drift(&cfg(), &["serena@x".to_string(), "ra@x".to_string()]);
         assert_eq!(got, vec!["ra@x".to_string()]);
-    }
-
-    #[test]
-    fn uncovered_repos_are_those_matching_no_profile() {
-        use crate::profile::discover::RepoSignal;
-        let tmp = tempfile::tempdir().unwrap();
-        let rust = tmp.path().join("rusty");
-        std::fs::create_dir_all(&rust).unwrap();
-        std::fs::write(rust.join("Cargo.toml"), "[package]").unwrap();
-        let plain = tmp.path().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-
-        let mut inv = inv(&[]);
-        inv.repos = vec![
-            RepoSignal {
-                path: rust.display().to_string(),
-                marker_files: vec!["Cargo.toml".into()],
-                marker_globs: vec![],
-                package_json_deps: vec![],
-                languages: vec![],
-                rule_hits: Default::default(),
-                override_names: None,
-            },
-            RepoSignal {
-                path: plain.display().to_string(),
-                marker_files: vec![],
-                marker_globs: vec![],
-                package_json_deps: vec![],
-                languages: vec![],
-                rule_hits: Default::default(),
-                override_names: None,
-            },
-        ];
-        let working: Profiles = serde_json::from_str(
-            r#"{"profiles":{"rust":{"plugins":[],"detect":{"marker_files":["Cargo.toml"]}}}}"#,
-        )
-        .unwrap();
-        let got = uncovered_repos(&inv, &working);
-        // the rust repo matches; the plain repo does not.
-        assert_eq!(got.len(), 1);
-        assert!(got[0].ends_with("plain"));
     }
 
     #[test]

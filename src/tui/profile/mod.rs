@@ -121,13 +121,17 @@ impl ProfileView {
     pub fn new(inv: Inventory, working: Profiles, claude_available: bool, offer: bool) -> Self {
         let ai_offer = claude_available && offer;
         let saved = working.clone();
-        let mut v = ProfileView {
+        ProfileView {
             inv,
             working,
             cursor: 0,
             plugin_cursor: 0,
             view: ViewMode::ByPlugin,
             sub: Sub::Board,
+            // Repos are seeded empty (or via `with_scan_repos`/`with_uncovered`
+            // right after construction) — the TUI never walks the filesystem
+            // synchronously, so `uncovered` simply starts empty and is filled
+            // in by a scan outcome or a seeded cache value.
             uncovered: Vec::new(),
             claude_available,
             ai_offer,
@@ -143,14 +147,7 @@ impl ProfileView {
             indexing: false,
             indexing_atoms: Vec::new(),
             index_rebuilding: false,
-        };
-        v.recompute_uncovered();
-        v.saved_uncovered = v.uncovered.clone();
-        v
-    }
-
-    fn recompute_uncovered(&mut self) {
-        self.uncovered = crate::profile::drift::uncovered_repos(&self.inv, &self.working);
+        }
     }
 
     /// Set the suggested/confirmed scan roots. Used by `App::new`; the header
@@ -182,7 +179,7 @@ impl ProfileView {
     /// Seed the uncovered-repos drift from the scan cache (the authoritative
     /// value computed at scan time), marking it clean so it is not re-persisted
     /// on the first key. No filesystem I/O — this is the startup fast path that
-    /// replaces the synchronous `recompute_uncovered()` walk over every repo.
+    /// fills in what used to require a synchronous disk walk over every repo.
     pub(crate) fn with_uncovered(mut self, uncovered: Vec<String>) -> Self {
         self.saved_uncovered = uncovered.clone();
         self.uncovered = uncovered;
@@ -1376,7 +1373,11 @@ mod tests {
             repos: vec![repo],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false);
+        // `ProfileView::new` no longer walks the disk to seed `uncovered` — seed
+        // the starting precondition ("no profiles yet, so this repo counts as
+        // uncovered") the same way a real scan-cache reopen would.
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_uncovered(vec!["/does/not/exist/a".to_string()]);
         assert_eq!(
             v.uncovered_for_test(),
             &["/does/not/exist/a".to_string()],
