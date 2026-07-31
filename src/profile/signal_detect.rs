@@ -22,9 +22,19 @@ pub fn atom_kw(file: &str, kw: &str) -> String {
 }
 
 pub fn vocabulary(cfg: &Profiles) -> BTreeSet<String> {
-    use crate::profile::discover::{KNOWN_GLOBS, MARKER_FILES};
+    use crate::profile::discover::{FRONTEND_DEPS, KNOWN_GLOBS, MARKER_FILES};
     let mut v: BTreeSet<String> = MARKER_FILES.iter().map(|m| atom_file(m)).collect();
     v.extend(KNOWN_GLOBS.iter().map(|g| atom_glob(g)));
+    // suggest_profiles's "frontend" cluster maps these deps into content
+    // rules (author::profile_from), not the package_json_deps field — index
+    // them unconditionally, same as the builtin marker files/globs above, so
+    // a scan that discovers AND merges a brand-new frontend cluster in the
+    // same pass still leaves every repo decisively answerable.
+    v.extend(
+        FRONTEND_DEPS
+            .iter()
+            .map(|d| atom_content("package.json", d)),
+    );
     for p in cfg.profiles.values() {
         let d = &p.detect;
         v.extend(
@@ -374,6 +384,25 @@ mod tests {
         }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn vocabulary_covers_frontend_dep_content_atoms_unconditionally() {
+        // suggest_profiles's "frontend" cluster maps FRONTEND_DEPS into
+        // content rules via author::profile_from (package.json -> word), NOT
+        // the Detect.package_json_deps field — so, mirroring why
+        // MARKER_FILES/KNOWN_GLOBS are indexed unconditionally, these atoms
+        // must be too. Otherwise a scan that discovers a brand-new frontend
+        // cluster and merges it in the SAME pass (Task 9's Rescan job) leaves
+        // some repos genuinely pending right after the scan that supposedly
+        // just indexed everything.
+        let v = vocabulary(&Profiles::default());
+        for dep in ["react", "vue", "svelte", "preact", "solid-js"] {
+            assert!(
+                v.contains(&atom_content("package.json", dep)),
+                "vocabulary must unconditionally index the frontend dep content atom for {dep}"
+            );
+        }
     }
 
     #[test]
