@@ -25,10 +25,14 @@ pub enum Action {
     /// Remove a task (id), on the job thread.
     RemoveTask(String),
     /// Write profiles.json + global settings + the selected repos' settings.local.json.
-    /// Emitted by the Apply sub-view.
+    /// Emitted by the Apply sub-view. `expected` carries each written repo's
+    /// preview matched-set (name-only) alongside it, so `commit()` can report
+    /// how many repos' FRESH write-time detect diverged from what the
+    /// (zero-I/O, index-driven) Apply preview showed.
     Commit {
         cfg: crate::profile::config::Profiles,
         repos: Vec<std::path::PathBuf>,
+        expected: Vec<(std::path::PathBuf, Vec<String>)>,
     },
     /// Ask Claude to draft the plugin→profile assignment for these scanned inputs.
     DraftWithClaude {

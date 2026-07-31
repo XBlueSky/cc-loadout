@@ -196,7 +196,14 @@ fn scan_repo_signals_inner(
 
 /// Returns the repo's signal plus whether the vocabulary's glob-atom walk
 /// (`answer_atoms`) exhausted `budget` before answering every `glob:` atom.
-fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>, budget: usize) -> (RepoSignal, bool) {
+/// `pub(crate)` so `commit::commit` can recompute a single known repo's
+/// signal fresh at write time (mirroring `answer_atoms`'s same treatment for
+/// the `IndexAtoms` job) without re-walking a whole scan root.
+pub(crate) fn signals_for_repo(
+    repo: &Path,
+    vocab: &BTreeSet<String>,
+    budget: usize,
+) -> (RepoSignal, bool) {
     // Canonicalize up front so RepoSignal.path agrees with detect_one's own
     // canonicalize-before-match (detect.rs:27-28) — otherwise a repo reached
     // through a symlinked scan root would fail path_prefix rules that disk
