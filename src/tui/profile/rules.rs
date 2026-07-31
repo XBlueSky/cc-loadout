@@ -228,18 +228,32 @@ pub fn matching_repos(detect: &Detect, repos: &[RepoSignal]) -> (Vec<Match>, Vec
     (matched, pending.into_iter().collect())
 }
 
+/// Outcome of evaluating the builder's in-progress rule (on top of the
+/// committed rules) against the index. Three states, not two — mirrors the
+/// top-level `RulesState` count line's own tri-state split, at the single
+/// in-progress-rule granularity.
+enum ScratchCount {
+    /// The in-progress value is empty (or, for `contains`, either half is) —
+    /// nothing to count yet. Renders nothing.
+    Incomplete,
+    /// The value is complete, but some rule in the scratch `Detect` (the
+    /// in-progress one or an already-committed one) references an atom the
+    /// index has never seen. An honest "unknown" — renders a dim `…` rather
+    /// than an undercount, and never fires a job on a keystroke.
+    Pending,
+    /// Every atom in the scratch `Detect` is answerable — a definite count.
+    Counted(usize),
+}
+
 /// Count repos the builder's in-progress rule (on top of the committed rules)
-/// would match. Returns None until the in-progress value is non-empty (and, for
-/// `contains`, until both file and word are non-empty), and also while any
-/// rule in the scratch `Detect` (the in-progress one or an already-committed
-/// one) references an atom the index has never seen — an honest "unknown"
-/// renders as `…` rather than an undercount, and never fires a job on a
-/// keystroke.
-fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> Option<usize> {
-    let kind = ed.kind?;
+/// would match. See `ScratchCount` for the three possible outcomes.
+fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> ScratchCount {
+    let Some(kind) = ed.kind else {
+        return ScratchCount::Incomplete;
+    };
     let file = ed.file.value().trim().to_string();
     if file.is_empty() {
-        return None;
+        return ScratchCount::Incomplete;
     }
     let row = match kind {
         EditorKind::PathUnder => RuleRow::PathUnder(file),
@@ -252,7 +266,7 @@ fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> Opti
                 .map(|w| w.value().trim().to_string())
                 .unwrap_or_default();
             if word.is_empty() {
-                return None;
+                return ScratchCount::Incomplete;
             }
             RuleRow::Contains { file, word }
         }
@@ -267,9 +281,9 @@ fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> Opti
     add_rule(&mut scratch, row);
     let (matched, pending) = matching_repos(&scratch, repos);
     if !pending.is_empty() {
-        return None;
+        return ScratchCount::Pending;
     }
-    Some(matched.len())
+    ScratchCount::Counted(matched.len())
 }
 
 /// For each scanned repo NOT in `matched`, suggest one rule (derived from the
@@ -330,8 +344,16 @@ pub struct RuleEditor {
     editing: Option<usize>,
     /// Live count of repos the in-progress rule (committed rules + this one)
     /// would match, recomputed on each value keystroke. `None` until a
-    /// non-empty value exists. Spec §4.5.
+    /// non-empty value exists, AND while `live_pending` is true (an unindexed
+    /// atom is never rendered as a number). Spec §4.5.
     live_count: Option<usize>,
+    /// True when the in-progress rule (committed rules + this one) is
+    /// complete but references an atom the index has never seen — the count
+    /// can't be answered yet, so the builder renders a dim `…` instead of a
+    /// number instead of guessing or firing a job on a keystroke. Always
+    /// false while `live_count` is empty for lack of input (the "incomplete"
+    /// case, which renders nothing).
+    live_pending: bool,
     /// Ghost path-completion suffix for a `path under` value (the same
     /// dim-suffix completion the Scan Roots editor offers). `Some` only while
     /// editing a `path under` rule and there is a directory to complete to;
@@ -349,6 +371,7 @@ impl Default for RuleEditor {
             focus_word: false,
             editing: None,
             live_count: None,
+            live_pending: false,
             suggestion: None,
         }
     }
@@ -609,7 +632,20 @@ impl RulesState {
                 // in-progress rule. Cheap COUNT only (no near-miss); reuses the
                 // cached override-free repo set. (Avoids re-running the full
                 // preview per keystroke — see Plan C c050de4.)
-                ed.live_count = scratch_count(&self.detect, ed, &self.live_owned);
+                match scratch_count(&self.detect, ed, &self.live_owned) {
+                    ScratchCount::Incomplete => {
+                        ed.live_count = None;
+                        ed.live_pending = false;
+                    }
+                    ScratchCount::Pending => {
+                        ed.live_count = None;
+                        ed.live_pending = true;
+                    }
+                    ScratchCount::Counted(n) => {
+                        ed.live_count = Some(n);
+                        ed.live_pending = false;
+                    }
+                }
                 // Refresh the ghost path-completion for a `path under` value.
                 ed.suggestion = if matches!(ed.kind, Some(EditorKind::PathUnder)) {
                     super::by_plugin::dir_suggestion(&ed.file.value())
@@ -891,6 +927,12 @@ fn render_editor(ed: &RuleEditor, f: &mut Frame, area: Rect) {
                     format!("● matches {n} repos"),
                     theme::accent(),
                 )));
+            } else if ed.live_pending {
+                // Complete value, but an atom the index has never seen — an
+                // honest "can't say yet", not a guessed number, and never a
+                // job fired on this keystroke.
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled("matches …", theme::dim())));
             }
         }
     }
@@ -1450,6 +1492,92 @@ mod tests {
             st.editor.as_ref().unwrap().live_count,
             Some(2),
             "live count reflects the in-progress path-under rule (2 of 3 repos)"
+        );
+    }
+
+    /// Final-review fix: the builder's live count must distinguish "no value
+    /// typed yet" (renders nothing) from "value complete, but its atom is
+    /// unindexed" (renders a dim `…`, never a guessed number, never a job)
+    /// from "value complete and fully indexed" (renders the definite
+    /// number) — three states, not two. Drives real keystrokes through
+    /// `handle_key` and asserts on the actual rendered text, not just field
+    /// state.
+    #[test]
+    fn builder_live_count_shows_pending_ellipsis_for_an_unindexed_atom() {
+        // The index has answered "file:Cargo.toml" but has never seen
+        // "file:new.lock" for any repo.
+        let inv = inv_with_repos(vec![signal(
+            "/nonexistent-a",
+            &[("file:Cargo.toml", true)],
+            None,
+        )]);
+        let mut st = RulesState::open(Detect::default(), &inv);
+        st.handle_key(KeyEvent::from(KeyCode::Char('a')), &inv); // open builder (kind pick)
+        st.handle_key(KeyEvent::from(KeyCode::Down), &inv); // has file
+        st.handle_key(KeyEvent::from(KeyCode::Enter), &inv); // choose "has file"
+
+        let render = |st: &RulesState| -> String {
+            let mut t = Terminal::new(TestBackend::new(70, 20)).unwrap();
+            t.draw(|f| st.render(f, f.area(), None, 0)).unwrap();
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        // Stage 1: incomplete input -> nothing rendered (pinned).
+        let text = render(&st);
+        assert!(
+            !text.contains("matches"),
+            "no count line before any value is typed: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "no pending ellipsis before any value is typed: {text}"
+        );
+
+        // Stage 2: complete value, atom never indexed -> pending ellipsis,
+        // never a guessed number, never a job.
+        for c in "new.lock".chars() {
+            st.handle_key(key(c), &inv);
+        }
+        assert!(
+            st.editor.as_ref().unwrap().live_count.is_none(),
+            "an unindexed atom must never render a guessed number"
+        );
+        assert!(
+            st.editor.as_ref().unwrap().live_pending,
+            "a complete value whose atom is unindexed must be pending"
+        );
+        let text = render(&st);
+        assert!(
+            text.contains('\u{2026}'),
+            "unindexed atom shows the pending ellipsis: {text}"
+        );
+
+        // Stage 3: switch to a fully-indexed value -> definite number
+        // (existing behavior, pinned end-to-end through render this time).
+        for _ in 0.."new.lock".chars().count() {
+            st.handle_key(KeyEvent::from(KeyCode::Backspace), &inv);
+        }
+        for c in "Cargo.toml".chars() {
+            st.handle_key(key(c), &inv);
+        }
+        assert!(
+            !st.editor.as_ref().unwrap().live_pending,
+            "a fully-indexed atom is not pending"
+        );
+        assert_eq!(st.editor.as_ref().unwrap().live_count, Some(1));
+        let text = render(&st);
+        assert!(
+            text.contains("matches 1 repos"),
+            "indexed value shows the live number: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "a definite count must not also show the pending ellipsis: {text}"
         );
     }
 
