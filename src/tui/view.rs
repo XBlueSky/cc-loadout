@@ -43,6 +43,15 @@ pub enum Action {
         roots: Vec<String>,
         working: crate::profile::config::Profiles,
     },
+    /// Answer a batch of newly-committed-but-unindexed atoms on the job
+    /// thread — real disk I/O (file/content/kw stats + one `globs_exist` walk
+    /// per repo) — so committing a rule that introduces a new atom never
+    /// blocks the UI. Always runs detached (never through the modal job
+    /// slot); the result is handed back via `accept_index`.
+    IndexAtoms {
+        atoms: Vec<String>,
+        repos: Vec<String>,
+    },
 }
 
 /// One tab. Renders the body area; emits `Action`s rather than touching disk.
@@ -83,6 +92,9 @@ pub trait View {
     /// off-thread producer (e.g. Task 10's v1-cache migration rebuild).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_uncovered(&mut self, _uncovered: Vec<String>) {}
+    /// Receive a completed background atom-index (from `Action::IndexAtoms`).
+    /// Default: ignore (only the Profile view consumes it).
+    fn accept_index(&mut self, _o: crate::tui::job::IndexOutcome) {}
     /// Return the working config to persist when it has unsaved edits, marking it
     /// clean. Default: `None` (only the Profile view holds a persistent config).
     /// `App` calls this after every key and job result; `Some(cfg)` triggers an

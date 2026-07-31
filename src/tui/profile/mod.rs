@@ -85,6 +85,21 @@ pub struct ProfileView {
     /// Epoch seconds of the scan whose repos are loaded (from cache or a live
     /// scan); `None` until anything is scanned. Drives the scan bar's age/stale.
     pub(super) scanned_at: Option<i64>,
+    /// Newly-pending atoms drained from an open Detail's `RulesState::wants_index`,
+    /// waiting to be dispatched as the next `Action::IndexAtoms` batch. Deduped
+    /// on every push (both against what's already queued and within the drained
+    /// batch itself) so a delete-then-recommit cycle can never queue the same
+    /// atom twice — `RulesState` has no memory of prior pushes, so this is
+    /// where duplicates are caught.
+    pub(super) index_queue: Vec<String>,
+    /// Whether a background `Action::IndexAtoms` job is currently in flight.
+    /// While true, a non-empty `index_queue` waits for the NEXT `on_key` call
+    /// after `accept_index` clears this flag before dispatching the follow-up
+    /// batch (sequential batches, never two jobs racing each other).
+    pub(super) indexing: bool,
+    /// The atom batch of the currently in-flight `Action::IndexAtoms` job (or
+    /// about to be dispatched), for the scan bar / count-line "indexing …" text.
+    pub(super) indexing_atoms: Vec<String>,
 }
 
 impl ProfileView {
@@ -114,6 +129,9 @@ impl ProfileView {
             saved_uncovered: Vec::new(),
             uncovered_pending: false,
             scanned_at: None,
+            index_queue: Vec::new(),
+            indexing: false,
+            indexing_atoms: Vec::new(),
         };
         v.recompute_uncovered();
         v.saved_uncovered = v.uncovered.clone();
@@ -943,6 +961,40 @@ impl View for ProfileView {
             self.uncovered_pending = pending;
         }
 
+        // Task 8: drain any newly-pending atoms an open Detail's Rules tab just
+        // queued (a builder commit or `f`-derive can introduce one whether or
+        // not `detection_changed()` fired this key) into the index queue, then
+        // dispatch a background `Action::IndexAtoms` batch once idle. Dedupe
+        // both the incoming batch and against what's already queued — `RulesState`
+        // has no memory of prior pushes, so a delete-then-recommit cycle would
+        // otherwise queue the same atom twice.
+        if let Sub::Detail(state) = &mut self.sub {
+            if !state.rules.wants_index.is_empty() {
+                let mut seen: std::collections::BTreeSet<String> =
+                    self.index_queue.iter().cloned().collect();
+                for atom in std::mem::take(&mut state.rules.wants_index) {
+                    if seen.insert(atom.clone()) {
+                        self.index_queue.push(atom);
+                    }
+                }
+            }
+        }
+        // A batch already queued while a job was in flight waits here — the
+        // next `on_key` call after `accept_index` clears `indexing` dispatches
+        // it, so batches are always sequential, never racing each other.
+        // `action_out.is_none()` lets an Apply commit (the only other action
+        // this function can emit) win if both happen to land on the same key.
+        if action_out.is_none() && !self.index_queue.is_empty() && !self.indexing {
+            let atoms = std::mem::take(&mut self.index_queue);
+            let repos: Vec<String> = self.inv.repos.iter().map(|r| r.path.clone()).collect();
+            self.indexing = true;
+            self.indexing_atoms = atoms.clone();
+            if let Sub::Detail(state) = &mut self.sub {
+                state.rules.indexing = true;
+            }
+            action_out = Some(Action::IndexAtoms { atoms, repos });
+        }
+
         action_out
     }
 
@@ -1001,6 +1053,39 @@ impl View for ProfileView {
 
     fn accept_uncovered(&mut self, uncovered: Vec<String>) {
         self.uncovered = uncovered;
+    }
+
+    fn accept_index(&mut self, o: crate::tui::job::IndexOutcome) {
+        for repo in &mut self.inv.repos {
+            if let Some(hits) = o.hits.get(&repo.path) {
+                for (atom, hit) in hits {
+                    repo.rule_hits.insert(atom.clone(), *hit);
+                }
+            }
+        }
+        // An atom re-queued while THIS batch was still in flight (the
+        // delete-then-recommit case) is now redundant — this delivery already
+        // answered it. Drop it so the next `on_key` doesn't dispatch a
+        // pointless follow-up for an atom that's already indexed.
+        self.index_queue.retain(|a| !o.atoms.contains(a));
+        self.indexing = false;
+        self.indexing_atoms.clear();
+        if let Sub::Detail(state) = &mut self.sub {
+            state.rules.indexing = false;
+            // Refresh the cached match/near-miss preview + pending-atom set
+            // against the now-merged index, so the count line reflects the
+            // just-answered atom immediately rather than on the next edit.
+            state.rules.recompute(&self.inv);
+        }
+        // Detection didn't change (no rule was added/removed), but the index
+        // backing it did — recompute uncovered the same zero-I/O way as any
+        // other signal update.
+        let (unc, pending) =
+            crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
+        if !pending {
+            self.uncovered = unc;
+        }
+        self.uncovered_pending = pending;
     }
 
     fn dirty_config(&mut self) -> Option<Profiles> {
@@ -2738,6 +2823,180 @@ mod tests {
         assert!(
             text.contains("/cc-loadout:acquire"),
             "overlay content must replace the board; got: {text}"
+        );
+    }
+
+    // ── Task 8: detached IndexAtoms job — ProfileView-level state ────────────
+
+    fn working_with_empty_web_profile() -> Profiles {
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "web".to_string(),
+            crate::profile::config::Profile {
+                plugins: vec![],
+                detect: crate::profile::config::Detect::default(),
+            },
+        );
+        Profiles {
+            profiles,
+            ..Default::default()
+        }
+    }
+
+    /// A batch that answered zero repos (e.g. the repo set was empty, or none
+    /// of them produced a hit) must still clear both `indexing` flags — the
+    /// flag must never wedge just because the answer happened to be empty.
+    #[test]
+    fn accept_index_clears_indexing_flags_even_with_no_hits() {
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string()];
+        v.index_queue = vec!["glob:*.tsx".to_string()];
+        if let Sub::Detail(state) = &mut v.sub {
+            state.rules.indexing = true;
+        }
+
+        v.accept_index(crate::tui::job::IndexOutcome {
+            atoms: vec!["glob:*.tsx".to_string()],
+            hits: std::collections::BTreeMap::new(), // no repo answered anything
+        });
+
+        assert!(
+            !v.indexing,
+            "ProfileView.indexing must clear even with empty hits"
+        );
+        assert!(v.indexing_atoms.is_empty());
+        assert!(
+            v.index_queue.is_empty(),
+            "the answered atom must be dropped from the queue even though no repo hit"
+        );
+        match &v.sub {
+            Sub::Detail(state) => assert!(
+                !state.rules.indexing,
+                "the open Detail's RulesState.indexing must clear too — it must never wedge"
+            ),
+            _ => panic!("expected Sub::Detail"),
+        }
+    }
+
+    /// A rule committed while its atom's index job is still in flight, then
+    /// deleted and recommitted before that job lands, must be queued only
+    /// ONCE and must NOT spawn a second job — `RulesState` has no memory of
+    /// prior pushes, so `ProfileView` (not `RulesState`) owns the dedupe.
+    #[test]
+    fn dedupe_delete_then_recommit_queues_single_atom_instance() {
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![crate::profile::discover::RepoSignal {
+                path: "/nonexistent-fake/a".into(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+                rule_hits: Default::default(), // atom never indexed
+                override_names: None,
+            }],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv, working, false, false);
+        v.switch_to_by_profile_for_test();
+        v.cursor = 1; // "web" (row 0 is Universal)
+
+        let (_h, _d, ctx) = test_support::ctx();
+        let snap = test_support::snap();
+
+        v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // open Detail
+        v.on_key(KeyEvent::from(KeyCode::Tab), &ctx, &snap); // focus -> Rules
+
+        // Commit "has any *.tsx".
+        v.on_key(KeyEvent::from(KeyCode::Char('a')), &ctx, &snap); // builder (kind-pick)
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap); // -> "has any"
+        v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // choose "has any"
+        for c in "*.tsx".chars() {
+            v.on_key(KeyEvent::from(KeyCode::Char(c)), &ctx, &snap);
+        }
+        let action1 = v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // commit
+        assert!(
+            matches!(&action1, Some(Action::IndexAtoms { atoms, .. })
+                if atoms == &vec!["glob:*.tsx".to_string()]),
+            "first commit must dispatch the atom, got {action1:?}"
+        );
+        assert!(v.indexing, "a job is now in flight");
+        assert!(v.index_queue.is_empty());
+
+        // Delete the rule (cursor followed the committed row).
+        v.on_key(KeyEvent::from(KeyCode::Char('d')), &ctx, &snap);
+
+        // Recommit the identical rule while the first job is still in flight.
+        v.on_key(KeyEvent::from(KeyCode::Char('a')), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap);
+        for c in "*.tsx".chars() {
+            v.on_key(KeyEvent::from(KeyCode::Char(c)), &ctx, &snap);
+        }
+        let action2 = v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // recommit
+
+        assert!(
+            action2.is_none(),
+            "must NOT dispatch a second job while the first is still in flight, got {action2:?}"
+        );
+        assert_eq!(
+            v.index_queue,
+            vec!["glob:*.tsx".to_string()],
+            "the requeued atom must appear exactly once, not duplicated"
+        );
+    }
+
+    /// The by-plugin scan bar's "indexing …" tail names the single atom, or
+    /// reports the pattern count for a batch — the same singular/plural split
+    /// as the job's toast.
+    #[test]
+    fn scan_bar_shows_indexing_tail_while_indexing() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_scan_roots(vec!["/workspace".into()]);
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
+        let render = |v: &ProfileView| -> String {
+            let mut t = Terminal::new(TestBackend::new(90, 12)).unwrap();
+            t.draw(|f| v.render(f, f.area(), &snap, 0, now)).unwrap();
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string()];
+        let text = render(&v);
+        assert!(
+            text.contains("indexing glob:*.tsx\u{2026}"),
+            "single-atom tail: {text}"
+        );
+
+        v.indexing_atoms = vec!["glob:*.tsx".into(), "file:go.mod".into()];
+        let text2 = render(&v);
+        assert!(
+            text2.contains("indexing 2 patterns\u{2026}"),
+            "batch tail: {text2}"
         );
     }
 }

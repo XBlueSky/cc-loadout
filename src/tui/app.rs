@@ -209,8 +209,9 @@ impl App {
                 toast: String,
                 refresh: bool,
                 draft: Option<Box<crate::profile::config::Profiles>>,
-                scan: Option<crate::tui::job::ScanOutcome>,
+                scan: Box<Option<crate::tui::job::ScanOutcome>>,
                 uncovered: Option<Vec<String>>,
+                index: Option<crate::tui::job::IndexOutcome>,
             },
             Aborted,
             Pending,
@@ -227,8 +228,9 @@ impl App {
                         toast: result.toast,
                         refresh: result.needs_refresh,
                         draft: result.draft.map(Box::new),
-                        scan: result.scan,
+                        scan: Box::new(result.scan),
                         uncovered: result.uncovered,
+                        index: result.index,
                     },
                     Err(TryRecvError::Disconnected) => ActivePoll::Aborted,
                     Err(TryRecvError::Empty) => ActivePoll::Pending,
@@ -244,6 +246,7 @@ impl App {
                 draft,
                 scan,
                 uncovered,
+                index,
             } => {
                 self.job = None;
                 // These callbacks are consumed only by the Profile view, so route
@@ -253,11 +256,14 @@ impl App {
                 if let Some(p) = draft {
                     self.tabs[crate::tui::TAB_PROFILE].accept_draft(*p);
                 }
-                if let Some(o) = scan {
+                if let Some(o) = *scan {
                     self.tabs[crate::tui::TAB_PROFILE].accept_scan(o);
                 }
                 if let Some(u) = uncovered {
                     self.tabs[crate::tui::TAB_PROFILE].accept_uncovered(u);
+                }
+                if let Some(o) = index {
+                    self.tabs[crate::tui::TAB_PROFILE].accept_index(o);
                 }
                 // An empty toast (e.g. a silent drift recompute) shows nothing.
                 if !toast.is_empty() {
@@ -282,6 +288,7 @@ impl App {
         let mut completed_drafts: Vec<crate::profile::config::Profiles> = Vec::new();
         let mut completed_scans: Vec<crate::tui::job::ScanOutcome> = Vec::new();
         let mut completed_uncovered: Vec<Vec<String>> = Vec::new();
+        let mut completed_index: Vec<crate::tui::job::IndexOutcome> = Vec::new();
         let mut refresh_needed = false;
         for rx in self.detached.drain(..) {
             match rx.try_recv() {
@@ -298,6 +305,9 @@ impl App {
                     if let Some(u) = result.uncovered {
                         completed_uncovered.push(u);
                     }
+                    if let Some(o) = result.index {
+                        completed_index.push(o);
+                    }
                     completed_toasts.push(result.toast);
                 }
                 Err(TryRecvError::Disconnected) => {} // worker gone, nothing to show
@@ -305,9 +315,9 @@ impl App {
             }
         }
         self.detached = still_pending;
-        // Route drafts/scans/uncovered from detached jobs to the Profile view
-        // (their only consumer), not the active tab — a detached job commonly
-        // completes while the user has tabbed away.
+        // Route drafts/scans/uncovered/index from detached jobs to the Profile
+        // view (their only consumer), not the active tab — a detached job
+        // commonly completes while the user has tabbed away.
         for p in completed_drafts {
             self.tabs[crate::tui::TAB_PROFILE].accept_draft(p);
         }
@@ -316,6 +326,9 @@ impl App {
         }
         for u in completed_uncovered {
             self.tabs[crate::tui::TAB_PROFILE].accept_uncovered(u);
+        }
+        for o in completed_index {
+            self.tabs[crate::tui::TAB_PROFILE].accept_index(o);
         }
         // Apply the last toast (if multiple completed, only the last is shown).
         for toast in completed_toasts {
@@ -357,6 +370,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("switch failed: {e}"),
@@ -364,6 +378,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                     },
                 ));
@@ -386,6 +401,7 @@ impl App {
                                 draft: None,
                                 scan: None,
                                 uncovered: None,
+                                index: None,
                             }
                         }
                         Ok(crate::account::prime::PrimeOutcome::SkippedActive) => {
@@ -395,6 +411,7 @@ impl App {
                                 draft: None,
                                 scan: None,
                                 uncovered: None,
+                                index: None,
                             }
                         }
                         Err(e) => crate::tui::job::JobResult {
@@ -403,6 +420,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                     },
                 ));
@@ -419,6 +437,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("remove failed: {e}"),
@@ -426,6 +445,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                     },
                 ));
@@ -457,6 +477,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("commit failed: {e}"),
@@ -464,6 +485,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                     },
                 ));
@@ -552,9 +574,69 @@ impl App {
                                 scanned_at,
                             }),
                             uncovered: None,
+                            index: None,
                         }
                     },
                 ));
+            }
+            Action::IndexAtoms { atoms, repos } => {
+                // Real disk I/O (file/content/kw stats + one `globs_exist`
+                // walk per repo) — MUST run detached, never through the modal
+                // `self.job` slot, or committing a new rule would freeze
+                // every other key until the walk finishes.
+                let label = if atoms.len() == 1 {
+                    format!("indexing {}", atoms[0])
+                } else {
+                    format!("indexing {} patterns", atoms.len())
+                };
+                let data_root = self.ctx.data_root.clone();
+                let job = crate::tui::job::spawn(label, crate::now_epoch() * 1000, move || {
+                    let atom_set: std::collections::BTreeSet<String> =
+                        atoms.iter().cloned().collect();
+                    let mut hits: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeMap<String, bool>,
+                    > = std::collections::BTreeMap::new();
+                    for repo_path in &repos {
+                        let repo_hits = crate::profile::discover::answer_atoms(
+                            std::path::Path::new(repo_path),
+                            &atom_set,
+                        );
+                        hits.insert(repo_path.clone(), repo_hits);
+                    }
+                    // Best-effort load-merge-save into the scan cache, mirroring
+                    // Rescan's cache write above: a killed TUI at worst loses
+                    // this in-flight batch, never corrupts the cache.
+                    if let Some(mut cache) = crate::profile::scan_cache::load(&data_root) {
+                        for repo in &mut cache.repos {
+                            if let Some(repo_hits) = hits.get(&repo.path) {
+                                for (atom, hit) in repo_hits {
+                                    repo.rule_hits.insert(atom.clone(), *hit);
+                                }
+                            }
+                        }
+                        let _ = crate::profile::scan_cache::save(&data_root, &cache);
+                    }
+                    let toast = if atoms.len() == 1 {
+                        let atom = &atoms[0];
+                        let n = hits
+                            .values()
+                            .filter(|h| h.get(atom).copied().unwrap_or(false))
+                            .count();
+                        format!("indexed {atom} \u{b7} {n} repos match")
+                    } else {
+                        format!("indexed {} patterns", atoms.len())
+                    };
+                    crate::tui::job::JobResult {
+                        toast,
+                        needs_refresh: false,
+                        index: Some(crate::tui::job::IndexOutcome { atoms, hits }),
+                        ..Default::default()
+                    }
+                });
+                // Detached, not modal: the whole point of this feature is that
+                // committing a new rule atom never swallows the keyboard.
+                self.detached.push(job.rx);
             }
             Action::RunTask(id) => {
                 let store = self.ctx.store.clone();
@@ -584,6 +666,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("task '{id}' failed: {e}"),
@@ -591,6 +674,7 @@ impl App {
                             draft: None,
                             scan: None,
                             uncovered: None,
+                            index: None,
                         },
                     },
                 ));
@@ -681,6 +765,7 @@ impl App {
                         draft: Some(cfg),
                         scan: None,
                         uncovered: None,
+                        index: None,
                     },
                     Err(e) => crate::tui::job::JobResult {
                         toast: format!("Claude draft failed: {e}"),
@@ -688,6 +773,7 @@ impl App {
                         draft: None,
                         scan: None,
                         uncovered: None,
+                        index: None,
                     },
                 }
             },
@@ -1194,6 +1280,183 @@ mod tests {
         assert!(cache.scanned_at > 0, "cache must record a scan time");
     }
 
+    // ── Task 8: detached IndexAtoms job ───────────────────────────────────────
+
+    #[test]
+    fn index_atoms_dispatches_detached_job_keys_keep_working_and_cache_updates() {
+        // Committing a rule whose atom the index has never seen must be
+        // answered on a background thread — never through the modal `self.job`
+        // slot, or the keyboard would freeze until the walk finishes.
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        let repo_dir = hdir.path().join("repo1");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("App.tsx"), "").unwrap(); // makes the new atom answer true
+        let repo_path = std::fs::canonicalize(&repo_dir)
+            .unwrap()
+            .display()
+            .to_string();
+        let root = hdir.path().display().to_string();
+
+        let cfg_json = r#"{"scan_roots":["__ROOT__"],"universal":[],"profiles":{"web":{"plugins":[],"detect":{}}}}"#
+            .replace("__ROOT__", &root);
+        std::fs::write(hdir.path().join("profiles.json"), cfg_json).unwrap();
+        crate::profile::scan_cache::save(
+            ddir.path(),
+            &crate::profile::scan_cache::ScanCache {
+                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
+                roots: vec![root.clone()],
+                repos: vec![crate::profile::discover::RepoSignal {
+                    path: repo_path.clone(),
+                    marker_files: vec![],
+                    marker_globs: vec![],
+                    package_json_deps: vec![],
+                    languages: vec![],
+                    rule_hits: Default::default(), // nothing indexed yet
+                    override_names: None,
+                }],
+                uncovered: Some(vec![repo_path.clone()]),
+                scanned_at: 1_700_000_000,
+            },
+        )
+        .unwrap();
+
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        let mut app = App::new(ctx, 3).unwrap(); // Profile tab; cache seeds inv.repos
+
+        app.handle_key(key(KeyCode::Char('v'))).unwrap(); // by-profile board
+        app.handle_key(key(KeyCode::Down)).unwrap(); // Universal -> "web"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // open Detail
+        app.handle_key(key(KeyCode::Tab)).unwrap(); // focus -> Rules
+        app.handle_key(key(KeyCode::Char('a'))).unwrap(); // builder (kind-pick)
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap(); // -> "has any"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // choose "has any"
+        for c in "*.tsx".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // commit -> dispatches Action::IndexAtoms
+
+        assert_eq!(
+            app.detached.len(),
+            1,
+            "the index job must be detached, not modal"
+        );
+        assert!(
+            app.job.is_none(),
+            "the index job must never occupy the modal job slot"
+        );
+
+        // Keys keep working while the job runs.
+        app.handle_key(key(KeyCode::Esc)).unwrap(); // leave Detail, keeping the rule
+        assert_eq!(
+            app.active_index(),
+            3,
+            "still on Profile after leaving Detail"
+        );
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.active_index(),
+            4,
+            "Tab must still cycle top-level tabs while the index job runs"
+        );
+        app.handle_key(key(KeyCode::BackTab)).unwrap(); // back to Profile
+        assert_eq!(app.active_index(), 3);
+
+        drain_until_settled(&mut app);
+        assert!(
+            app.detached.is_empty(),
+            "the job result must have been delivered"
+        );
+
+        let cache = crate::profile::scan_cache::load(ddir.path()).unwrap();
+        let repo_cache = cache
+            .repos
+            .iter()
+            .find(|r| r.path == repo_path)
+            .expect("the repo must still be in the cache");
+        assert_eq!(
+            repo_cache.rule_hits.get("glob:*.tsx"),
+            Some(&true),
+            "the newly-answered atom must be persisted into the scan cache: {:?}",
+            repo_cache.rule_hits
+        );
+
+        // Reopen Detail: the count line must now be definite (no pending cue).
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // reopen Detail on "web"
+        app.handle_key(key(KeyCode::Tab)).unwrap(); // focus -> Rules
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("matches 1 of 1"),
+            "count line must show a definite number once the atom is indexed: {text}"
+        );
+    }
+
+    #[test]
+    fn index_atoms_toast_names_atom_and_match_count_for_a_single_atom() {
+        let (hdir, _ddir, ctx) = empty_ctx();
+        let hit_repo = hdir.path().join("hit");
+        let miss_repo = hdir.path().join("miss");
+        std::fs::create_dir_all(&hit_repo).unwrap();
+        std::fs::create_dir_all(&miss_repo).unwrap();
+        std::fs::write(hit_repo.join("go.mod"), "").unwrap();
+
+        let mut app = App::new(ctx, 0).unwrap();
+        app.apply_action(Action::IndexAtoms {
+            atoms: vec!["file:go.mod".to_string()],
+            repos: vec![
+                hit_repo.display().to_string(),
+                miss_repo.display().to_string(),
+            ],
+        })
+        .unwrap();
+        assert_eq!(app.detached.len(), 1, "must dispatch detached, not modal");
+        assert!(app.job.is_none());
+
+        let result = app.detached[0].recv().unwrap();
+        assert_eq!(
+            result.toast, "indexed file:go.mod \u{b7} 1 repos match",
+            "singular toast names the atom and the exact match count"
+        );
+        let outcome = result.index.expect("IndexOutcome must be set");
+        assert_eq!(outcome.atoms, vec!["file:go.mod".to_string()]);
+        assert!(
+            outcome.hits[&hit_repo.display().to_string()]["file:go.mod"],
+            "the repo with go.mod must answer true"
+        );
+        assert!(
+            !outcome.hits[&miss_repo.display().to_string()]["file:go.mod"],
+            "the repo without go.mod must answer false"
+        );
+    }
+
+    #[test]
+    fn index_atoms_toast_reports_pattern_count_for_a_batch() {
+        let (hdir, _ddir, ctx) = empty_ctx();
+        let repo = hdir.path().join("r");
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let mut app = App::new(ctx, 0).unwrap();
+        app.apply_action(Action::IndexAtoms {
+            atoms: vec!["file:a".to_string(), "file:b".to_string()],
+            repos: vec![repo.display().to_string()],
+        })
+        .unwrap();
+        let result = app.detached[0].recv().unwrap();
+        assert_eq!(
+            result.toast, "indexed 2 patterns",
+            "a multi-atom batch reports the pattern count, not a per-atom match count"
+        );
+    }
+
     fn render_profile(app: &mut App) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1535,6 +1798,7 @@ mod tests {
                 draft: None,
                 scan: None,
                 uncovered: None,
+                index: None,
             }
         }));
         assert!(app.animating(), "job present → animating");
@@ -1740,6 +2004,7 @@ mod tests {
             draft: None,
             scan: None,
             uncovered: None,
+            index: None,
         }));
         // Let the trivial worker finish so its result is waiting in the channel.
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1878,6 +2143,7 @@ mod tests {
             draft: None,
             scan: None,
             uncovered: None,
+            index: None,
         }));
         assert!(app.job.is_some());
         // Pressing Esc moves the job to detached.

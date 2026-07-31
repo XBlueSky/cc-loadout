@@ -175,6 +175,14 @@ pub fn render(view: &ProfileView, f: &mut Frame, area: Rect, now_ms: i64) {
     bar.push(sep());
     bar.push(Span::styled("r", theme::accent()));
     bar.push(Span::styled(" roots", theme::dim()));
+    if view.indexing {
+        bar.push(sep());
+        let tail = match view.indexing_atoms.as_slice() {
+            [atom] => format!("indexing {atom}\u{2026}"),
+            atoms => format!("indexing {} patterns\u{2026}", atoms.len()),
+        };
+        bar.push(Span::styled(tail, theme::dim()));
+    }
 
     let bar_w: usize = bar.iter().map(|s| s.content.chars().count()).sum();
     let pad = (header_area.width as usize).saturating_sub(bar_w) / 2;

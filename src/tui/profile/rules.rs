@@ -374,10 +374,9 @@ pub struct RulesState {
     /// find atoms newly introduced by that commit (see `wants_index`).
     pub pending_atoms: Vec<String>,
     /// Atoms newly discovered pending at the moment a rule is committed via
-    /// the add/edit builder. `ProfileView` (Task 8) drains this to dispatch a
-    /// background atom-index job; empty until a builder commit introduces a
-    /// genuinely new atom.
-    #[allow(dead_code)] // consumed from Task 8 (detached IndexAtoms job + accept path)
+    /// the add/edit builder. `ProfileView` drains this (deduped) to dispatch a
+    /// background `Action::IndexAtoms` job; empty until a builder commit
+    /// introduces a genuinely new atom.
     pub wants_index: Vec<String>,
     /// Whether a background atom-index job is in flight for this profile's
     /// pending atoms. Set/cleared by `ProfileView` (Task 8) — `RulesState`

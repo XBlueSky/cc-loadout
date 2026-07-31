@@ -188,9 +188,41 @@ fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
     };
 
     // Answer every atom in the vocabulary. Glob atoms share ONE walk.
+    let rule_hits = answer_atoms(repo, vocab);
+    let override_names = std::fs::read_to_string(repo.join(".claude").join("profile"))
+        .ok()
+        .map(|text| {
+            let mut names: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        });
+
+    RepoSignal {
+        path: repo.display().to_string(),
+        marker_files,
+        marker_globs,
+        package_json_deps,
+        languages: root_extensions(repo),
+        rule_hits,
+        override_names,
+    }
+}
+
+/// Answer every atom in `atoms` against `repo`'s filesystem: `file:`/`content:`/
+/// `kw:` atoms are stat'd or read directly; `glob:` atoms share ONE
+/// `globs_exist` walk. Shared by `signals_for_repo` (the initial scan) and the
+/// background `Action::IndexAtoms` job (indexing newly-committed rule atoms
+/// after the fact), so the atom-evaluation rules live in exactly one place.
+pub(crate) fn answer_atoms(repo: &Path, atoms: &BTreeSet<String>) -> BTreeMap<String, bool> {
     let mut rule_hits = BTreeMap::new();
     let mut glob_pats: Vec<String> = Vec::new();
-    for atom in vocab {
+    for atom in atoms {
         if let Some(g) = atom.strip_prefix("glob:") {
             glob_pats.push(g.to_string());
         } else if let Some(f) = atom.strip_prefix("file:") {
@@ -215,29 +247,7 @@ fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
     for (g, hit) in glob_hits {
         rule_hits.insert(crate::profile::signal_detect::atom_glob(&g), hit);
     }
-    let override_names = std::fs::read_to_string(repo.join(".claude").join("profile"))
-        .ok()
-        .map(|text| {
-            let mut names: Vec<String> = text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(str::to_string)
-                .collect();
-            names.sort();
-            names.dedup();
-            names
-        });
-
-    RepoSignal {
-        path: repo.display().to_string(),
-        marker_files,
-        marker_globs,
-        package_json_deps,
-        languages: root_extensions(repo),
-        rule_hits,
-        override_names,
-    }
+    rule_hits
 }
 
 fn read_package_json_deps(repo: &Path) -> Vec<String> {
