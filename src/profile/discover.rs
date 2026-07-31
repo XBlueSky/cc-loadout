@@ -149,21 +149,54 @@ pub fn scan_repo_signals(
     max_depth: usize,
     vocab: &BTreeSet<String>,
 ) -> Vec<RepoSignal> {
+    scan_repo_signals_inner(roots, max_depth, vocab, detect::GLOB_WALK_BUDGET).0
+}
+
+/// Same as `scan_repo_signals`, but also counts repos where the vocabulary's
+/// `glob:` atoms could not all be answered because the single shared walk
+/// `answer_atoms` runs for them (`detect::globs_exist`) exhausted its dirent
+/// budget before finishing. Used by the Rescan job to warn the user that some
+/// repos' glob-type rule_hits may be incomplete — see `ScanOutcome::budget_hits`.
+pub fn scan_repo_signals_with_budget_hits(
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+) -> (Vec<RepoSignal>, usize) {
+    scan_repo_signals_inner(roots, max_depth, vocab, detect::GLOB_WALK_BUDGET)
+}
+
+/// Shared core for `scan_repo_signals`/`scan_repo_signals_with_budget_hits`,
+/// parameterized on the glob-walk budget so tests can inject a tiny one
+/// without needing a giant fixture (production always passes
+/// `detect::GLOB_WALK_BUDGET` via the two public wrappers above).
+fn scan_repo_signals_inner(
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+    budget: usize,
+) -> (Vec<RepoSignal>, usize) {
     let mut out = Vec::new();
+    let mut budget_hits = 0usize;
     for root in roots {
         let root = Path::new(root);
         if !root.is_dir() {
             continue;
         }
         for repo in scan::find_git_repos(root, max_depth) {
-            out.push(signals_for_repo(&repo, vocab));
+            let (sig, exhausted) = signals_for_repo(&repo, vocab, budget);
+            if exhausted {
+                budget_hits += 1;
+            }
+            out.push(sig);
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    (out, budget_hits)
 }
 
-fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
+/// Returns the repo's signal plus whether the vocabulary's glob-atom walk
+/// (`answer_atoms`) exhausted `budget` before answering every `glob:` atom.
+fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>, budget: usize) -> (RepoSignal, bool) {
     // Canonicalize up front so RepoSignal.path agrees with detect_one's own
     // canonicalize-before-match (detect.rs:27-28) — otherwise a repo reached
     // through a symlinked scan root would fail path_prefix rules that disk
@@ -188,7 +221,7 @@ fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
     };
 
     // Answer every atom in the vocabulary. Glob atoms share ONE walk.
-    let rule_hits = answer_atoms(repo, vocab);
+    let (rule_hits, exhausted) = answer_atoms(repo, vocab, budget);
     let override_names = std::fs::read_to_string(repo.join(".claude").join("profile"))
         .ok()
         .map(|text| {
@@ -203,23 +236,32 @@ fn signals_for_repo(repo: &Path, vocab: &BTreeSet<String>) -> RepoSignal {
             names
         });
 
-    RepoSignal {
-        path: repo.display().to_string(),
-        marker_files,
-        marker_globs,
-        package_json_deps,
-        languages: root_extensions(repo),
-        rule_hits,
-        override_names,
-    }
+    (
+        RepoSignal {
+            path: repo.display().to_string(),
+            marker_files,
+            marker_globs,
+            package_json_deps,
+            languages: root_extensions(repo),
+            rule_hits,
+            override_names,
+        },
+        exhausted,
+    )
 }
 
 /// Answer every atom in `atoms` against `repo`'s filesystem: `file:`/`content:`/
 /// `kw:` atoms are stat'd or read directly; `glob:` atoms share ONE
-/// `globs_exist` walk. Shared by `signals_for_repo` (the initial scan) and the
+/// `globs_exist` walk, spending at most `budget` dirents — the second return
+/// value is whether that walk exhausted `budget` before answering every
+/// `glob:` atom. Shared by `signals_for_repo` (the initial scan) and the
 /// background `Action::IndexAtoms` job (indexing newly-committed rule atoms
 /// after the fact), so the atom-evaluation rules live in exactly one place.
-pub(crate) fn answer_atoms(repo: &Path, atoms: &BTreeSet<String>) -> BTreeMap<String, bool> {
+pub(crate) fn answer_atoms(
+    repo: &Path,
+    atoms: &BTreeSet<String>,
+    budget: usize,
+) -> (BTreeMap<String, bool>, bool) {
     let mut rule_hits = BTreeMap::new();
     let mut glob_pats: Vec<String> = Vec::new();
     for atom in atoms {
@@ -243,11 +285,11 @@ pub(crate) fn answer_atoms(repo: &Path, atoms: &BTreeSet<String>) -> BTreeMap<St
             }
         }
     }
-    let (glob_hits, _exhausted) = detect::globs_exist(repo, &glob_pats, detect::GLOB_WALK_BUDGET);
+    let (glob_hits, exhausted) = detect::globs_exist(repo, &glob_pats, budget);
     for (g, hit) in glob_hits {
         rule_hits.insert(crate::profile::signal_detect::atom_glob(&g), hit);
     }
-    rule_hits
+    (rule_hits, exhausted)
 }
 
 fn read_package_json_deps(repo: &Path) -> Vec<String> {
@@ -282,7 +324,11 @@ fn root_extensions(repo: &Path) -> Vec<String> {
     exts.into_iter().collect()
 }
 
-const FRONTEND_DEPS: &[&str] = &["react", "vue", "svelte", "preact", "solid-js"];
+// pub(crate): also read by signal_detect::vocabulary, which must index these
+// as content atoms unconditionally (same reason MARKER_FILES/KNOWN_GLOBS are
+// unconditional) — see defining_signals's "frontend" arm below, whose
+// package_json_deps get converted to content rules by author::profile_from.
+pub(crate) const FRONTEND_DEPS: &[&str] = &["react", "vue", "svelte", "preact", "solid-js"];
 
 /// Cluster repos by a coarse signal key and propose one profile per cluster.
 /// Pure and fully overridable by the caller (TUI / agent).
@@ -476,6 +522,59 @@ mod tests {
         assert_eq!(
             got[1].shared_signals.marker_files,
             vec!["Cargo.toml".to_string()]
+        );
+    }
+
+    #[test]
+    fn signals_for_repo_reports_glob_walk_exhaustion() {
+        // The shared glob walk `answer_atoms` runs for the vocabulary's
+        // `glob:` atoms (detect::globs_exist) can exhaust its dirent budget
+        // before finishing — signals_for_repo must surface that per repo
+        // instead of swallowing it, so scan_repo_signals_with_budget_hits can
+        // count it into ScanOutcome::budget_hits (Task 9).
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut vocab = BTreeSet::new();
+        vocab.insert(crate::profile::signal_detect::atom_glob("*.svelte"));
+
+        let (_sig, exhausted) = signals_for_repo(dir.path(), &vocab, 3);
+        assert!(
+            exhausted,
+            "a budget smaller than the entry count must report exhaustion"
+        );
+
+        let (_sig2, not_exhausted) = signals_for_repo(dir.path(), &vocab, 200_000);
+        assert!(
+            !not_exhausted,
+            "a generous budget must not report exhaustion"
+        );
+    }
+
+    #[test]
+    fn scan_repo_signals_with_budget_hits_counts_zero_for_a_small_fixture() {
+        // Wiring-level check (can't inject a small budget here — production
+        // always spends the real GLOB_WALK_BUDGET — so this only proves a
+        // normal small fixture never exhausts it and the new (Vec, usize) API
+        // shape is correct; exhaustion itself is proven at the
+        // signals_for_repo level above, per Task 9's "no giant fixtures" note).
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
+
+        let default_vocab =
+            crate::profile::signal_detect::vocabulary(&crate::profile::config::Profiles::default());
+        let (repos, budget_hits) = scan_repo_signals_with_budget_hits(
+            &[root.path().display().to_string()],
+            6,
+            &default_vocab,
+        );
+        assert_eq!(repos.len(), 1);
+        assert_eq!(
+            budget_hits, 0,
+            "a small fixture must never hit the real walk budget"
         );
     }
 

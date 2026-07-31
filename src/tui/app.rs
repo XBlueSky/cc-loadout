@@ -19,6 +19,18 @@ use crate::tui::view::{Action, View};
 /// One knob: raise/lower to taste.
 pub(crate) const MIN_SPINNER_MS: i64 = 2000;
 
+/// The `Action::Rescan` completion toast: names the repo count, and appends a
+/// warning when `budget_hits` repos hit the glob-walk budget (see
+/// `ScanOutcome::budget_hits`) — those repos' `glob:` rule_hits may be
+/// incomplete until a follow-up scan/index run.
+fn rescan_toast(repo_count: usize, budget_hits: usize) -> String {
+    if budget_hits > 0 {
+        format!("scanned {repo_count} repos \u{b7} {budget_hits} repos hit walk budget")
+    } else {
+        format!("scanned {repo_count} repos")
+    }
+}
+
 pub struct App {
     tabs: Vec<Box<dyn View>>,
     active: usize,
@@ -563,12 +575,31 @@ impl App {
                     crate::now_epoch() * 1000,
                     move || {
                         let vocab = crate::profile::signal_detect::vocabulary(&working);
-                        let repos = crate::profile::discover::scan_repo_signals(&roots, 6, &vocab);
+                        let (repos, budget_hits) =
+                            crate::profile::discover::scan_repo_signals_with_budget_hits(
+                                &roots, 6, &vocab,
+                            );
                         let suggested = crate::profile::discover::suggest_profiles(&repos);
-                        // Compute the uncovered drift here (post-merge) so the UI
-                        // thread never re-walks every repo when folding the result.
-                        let uncovered = crate::profile::drift::uncovered_post_merge(
-                            &working, &suggested, &repos,
+                        // Compute the uncovered drift here (post-merge, from the
+                        // freshly-indexed signals) so the UI thread never re-walks
+                        // every repo when folding the result. A fresh scan indexes
+                        // the full current-rule vocabulary, so every rule is
+                        // index-answerable by construction — `pending` must be
+                        // false (debug-asserted below; if it somehow isn't, the
+                        // signal evaluator still degrades gracefully by leaving
+                        // undecided repos out of `uncovered` rather than guessing).
+                        let mut merged = working.clone();
+                        for sp in &suggested {
+                            merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
+                                crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
+                            });
+                        }
+                        let (uncovered, pending) =
+                            crate::profile::drift::uncovered_from_signals(&repos, &merged);
+                        debug_assert!(
+                            !pending,
+                            "a fresh scan indexes the full current-rule vocabulary; \
+                             uncovered_from_signals must be decisive right after Rescan"
                         );
                         let scanned_at = crate::now_epoch();
                         // Best-effort: persist so a reopen shows counts + drift
@@ -584,7 +615,7 @@ impl App {
                             },
                         );
                         crate::tui::job::JobResult {
-                            toast: format!("scanned {} repos", repos.len()),
+                            toast: rescan_toast(repos.len(), budget_hits),
                             needs_refresh: false,
                             draft: None,
                             scan: Some(crate::tui::job::ScanOutcome {
@@ -593,6 +624,7 @@ impl App {
                                 suggested,
                                 uncovered,
                                 scanned_at,
+                                budget_hits,
                             }),
                             uncovered: None,
                             index: None,
@@ -619,9 +651,14 @@ impl App {
                         std::collections::BTreeMap<String, bool>,
                     > = std::collections::BTreeMap::new();
                     for repo_path in &repos {
-                        let repo_hits = crate::profile::discover::answer_atoms(
+                        // Budget exhaustion isn't surfaced from this job (only
+                        // the Rescan job reports ScanOutcome::budget_hits) —
+                        // an atom this walk can't finish just stays unindexed
+                        // and gets picked up by the next scan/index batch.
+                        let (repo_hits, _exhausted) = crate::profile::discover::answer_atoms(
                             std::path::Path::new(repo_path),
                             &atom_set,
+                            crate::profile::detect::GLOB_WALK_BUDGET,
                         );
                         hits.insert(repo_path.clone(), repo_hits);
                     }
@@ -1274,6 +1311,86 @@ mod tests {
             app.toast.as_deref().unwrap_or("").contains("save failed"),
             "autosave failure must surface a toast, got: {:?}",
             app.toast
+        );
+    }
+
+    #[test]
+    fn rescan_toast_appends_budget_suffix_only_when_nonzero() {
+        assert_eq!(rescan_toast(3, 0), "scanned 3 repos");
+        assert_eq!(
+            rescan_toast(3, 2),
+            "scanned 3 repos \u{b7} 2 repos hit walk budget"
+        );
+        assert_eq!(rescan_toast(0, 0), "scanned 0 repos");
+    }
+
+    #[test]
+    fn rescan_indexes_glob_rule_atoms_and_leaves_the_rules_count_definite() {
+        // A fresh scan indexes the FULL current-rule vocabulary (Task 9's
+        // contract), so a committed glob rule's atom must land in rule_hits
+        // at scan time, the saved cache must be stamped v2, and the Rules
+        // tab's match count must be a definite number — never the pending
+        // ellipsis — the very first time the profile's Detail is opened.
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        let work = hdir.path().join("work");
+        let repo = work.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("App.svelte"), "").unwrap();
+        let root = work.display().to_string();
+
+        let cfg_json = r#"{"scan_roots":["__ROOT__"],"universal":[],"profiles":{"frontend":{"plugins":[],"detect":{"marker_globs":["*.svelte"]}}}}"#
+            .replace("__ROOT__", &root);
+        std::fs::write(hdir.path().join("profiles.json"), cfg_json).unwrap();
+
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        let mut app = App::new(ctx, 3).unwrap(); // Profile tab
+
+        app.handle_key(key(KeyCode::Char('s'))).unwrap(); // dispatch Rescan on the job thread
+        drain_until_idle(&mut app);
+
+        let cache =
+            crate::profile::scan_cache::load(ddir.path()).expect("scan must persist a cache");
+        assert_eq!(
+            cache.version,
+            crate::profile::scan_cache::SCAN_CACHE_VERSION,
+            "saved cache must be stamped with the current version"
+        );
+        let repo_cache = cache
+            .repos
+            .iter()
+            .find(|r| r.path.ends_with("/svc"))
+            .expect("svc repo must be scanned");
+        assert_eq!(
+            repo_cache.rule_hits.get("glob:*.svelte"),
+            Some(&true),
+            "the committed rule's glob atom must be indexed at scan time: {:?}",
+            repo_cache.rule_hits
+        );
+
+        // Open the "frontend" profile's Rules tab: the match count must be
+        // definite, never the pending ellipsis, since the scan just indexed
+        // every atom the committed rule needs.
+        app.handle_key(key(KeyCode::Char('v'))).unwrap(); // by-profile board
+        app.handle_key(key(KeyCode::Down)).unwrap(); // Universal -> "frontend"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // open Detail
+        app.handle_key(key(KeyCode::Tab)).unwrap(); // focus -> Rules
+        let text = render_profile(&mut app);
+        assert!(
+            text.contains("matches 1 of 1"),
+            "Rules count must be a definite number right after Rescan: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "Rules count must never show the pending ellipsis after a fresh Rescan: {text}"
         );
     }
 

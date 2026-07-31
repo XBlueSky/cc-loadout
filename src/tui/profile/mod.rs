@@ -209,6 +209,10 @@ impl ProfileView {
     /// Synchronous scan — walks the roots on the calling thread. Test-only now
     /// (the TUI dispatches `Action::Rescan` so the walk runs on the job thread,
     /// see `apply_scan`), kept as a convenience for exercising `apply_scan`.
+    /// Mirrors `Action::Rescan`'s job-thread computation in `app.rs`: merge
+    /// suggested profiles into a scratch config, then compute uncovered from
+    /// the freshly-indexed signals (`uncovered_from_signals`) — never a
+    /// second disk walk.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn scan(&mut self) {
         let Some(roots) = self.nonempty_scan_roots() else {
@@ -217,14 +221,25 @@ impl ProfileView {
         let vocab = crate::profile::signal_detect::vocabulary(&self.working);
         let repos = crate::profile::discover::scan_repo_signals(&roots, 6, &vocab);
         let suggested = crate::profile::discover::suggest_profiles(&repos);
-        let uncovered =
-            crate::profile::drift::uncovered_post_merge(&self.working, &suggested, &repos);
+        let mut merged = self.working.clone();
+        for sp in &suggested {
+            merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
+                crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
+            });
+        }
+        let (uncovered, pending) = crate::profile::drift::uncovered_from_signals(&repos, &merged);
+        debug_assert!(
+            !pending,
+            "a fresh scan indexes the full current-rule vocabulary; \
+             uncovered_from_signals must be decisive right after a scan"
+        );
         self.apply_scan(crate::tui::job::ScanOutcome {
             roots,
             repos,
             suggested,
             uncovered,
             scanned_at: crate::now_epoch(),
+            budget_hits: 0,
         });
     }
 
@@ -2067,6 +2082,15 @@ mod tests {
             vec![root.clone()],
             "scan records the scanned set"
         );
+        // The repo matches no PRE-EXISTING profile (working started empty) but
+        // IS covered by the "rust" bucket merged in from this very scan — it
+        // must not be reported uncovered (equivalent to the deleted
+        // uncovered_post_merge unit test, now exercised end-to-end here).
+        assert!(
+            v.uncovered_for_test().is_empty(),
+            "repo covered by a merged suggested profile must not be uncovered: {:?}",
+            v.uncovered_for_test()
+        );
         v.scan();
         assert_eq!(v.working_for_test().scan_roots, vec![root]);
         assert_eq!(v.working_for_test().profiles.len(), 1);
@@ -2417,6 +2441,7 @@ mod tests {
             }],
             uncovered: vec![],
             scanned_at: 0,
+            budget_hits: 0,
         };
         v.accept_scan(outcome);
         assert_eq!(v.inv_for_test().repos.len(), 1, "repos must be populated");
@@ -2457,6 +2482,7 @@ mod tests {
             suggested: vec![],
             uncovered: vec!["SENTINEL-not-from-disk".into()],
             scanned_at: 0,
+            budget_hits: 0,
         };
         v.accept_scan(outcome);
         assert_eq!(
@@ -2499,6 +2525,7 @@ mod tests {
             suggested: vec![],
             uncovered: vec!["/x/a".into()],
             scanned_at: 0,
+            budget_hits: 0,
         };
         v.accept_scan(outcome);
         assert_eq!(

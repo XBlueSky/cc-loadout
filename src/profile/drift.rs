@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::profile::config::Profiles;
 use crate::profile::detect;
-use crate::profile::discover::{Inventory, RepoSignal, SuggestedProfile};
+use crate::profile::discover::{Inventory, RepoSignal};
 use crate::profile::plugins::managed_keys;
 
 /// Managed plugin keys that are no longer installed (dead references in the config).
@@ -28,29 +28,6 @@ pub fn global_drift(working: &Profiles, global_enabled: &[String]) -> Vec<String
         .collect();
     out.sort();
     out
-}
-
-/// Uncovered repos as they would be AFTER merging `suggested` profiles into
-/// `working` — the post-scan drift. Mirrors the working-merge in
-/// `ProfileView::apply_scan`, so the value can be computed once on the job
-/// thread and reused by the UI thread without a second per-repo filesystem walk.
-pub fn uncovered_post_merge(
-    working: &Profiles,
-    suggested: &[SuggestedProfile],
-    repos: &[RepoSignal],
-) -> Vec<String> {
-    let mut merged = working.clone();
-    for sp in suggested {
-        merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
-            crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
-        });
-    }
-    let inv = Inventory {
-        plugins: Vec::new(),
-        repos: repos.to_vec(),
-        suggested_profiles: Vec::new(),
-    };
-    uncovered_repos(&inv, &merged)
 }
 
 /// Scanned repos that match no profile in `working` (sorted by path).
@@ -120,53 +97,7 @@ impl Drift {
 mod tests {
     use super::*;
     use crate::profile::config::Profiles;
-    use crate::profile::discover::{Inventory, PluginInfo, SharedSignals, SuggestedProfile};
-
-    #[test]
-    fn uncovered_post_merge_covers_repos_via_suggested_profiles() {
-        // A repo that matches no EXISTING profile but IS covered by a suggested
-        // one (merged in) must not count as uncovered — mirroring apply_scan.
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("svc");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
-        let path = repo.to_string_lossy().into_owned();
-        let signal = RepoSignal {
-            path: path.clone(),
-            marker_files: vec!["Cargo.toml".into()],
-            marker_globs: vec![],
-            package_json_deps: vec![],
-            languages: vec![],
-            rule_hits: Default::default(),
-            override_names: None,
-        };
-        // Empty working, but a suggested profile keyed on Cargo.toml.
-        let suggested = vec![SuggestedProfile {
-            name: "rust".into(),
-            repos: vec![path.clone()],
-            shared_signals: SharedSignals {
-                marker_files: vec!["Cargo.toml".into()],
-                ..Default::default()
-            },
-        }];
-        let out = uncovered_post_merge(
-            &Profiles::default(),
-            &suggested,
-            std::slice::from_ref(&signal),
-        );
-        assert!(
-            out.is_empty(),
-            "repo covered by a merged suggested profile is not uncovered: {out:?}"
-        );
-
-        // With NO suggested profile to merge, the same repo IS uncovered.
-        let out2 = uncovered_post_merge(&Profiles::default(), &[], &[signal]);
-        assert_eq!(
-            out2,
-            vec![path],
-            "unmatched repo must be reported uncovered"
-        );
-    }
+    use crate::profile::discover::{Inventory, PluginInfo};
 
     fn inv(keys: &[&str]) -> Inventory {
         Inventory {

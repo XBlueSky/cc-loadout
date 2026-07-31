@@ -13,6 +13,16 @@ pub struct ScanOutcome {
     pub uncovered: Vec<String>,
     /// Epoch seconds the scan finished — drives the by-plugin scan bar's age.
     pub scanned_at: i64,
+    /// Number of repos where the vocabulary's `glob:` atoms could not all be
+    /// answered because `discover::signals_for_repo`'s shared glob walk ran
+    /// out of its dirent budget before finishing — those repos' glob-type
+    /// `rule_hits` may be incomplete. The Rescan job folds this into the
+    /// scan-completion toast before the outcome is built, so nothing reads it
+    /// back off `ScanOutcome` today; kept on the struct (not just the toast
+    /// string) as the source of truth for a future persistent indicator, same
+    /// forward-scaffolding role as `JobResult.uncovered`.
+    #[allow(dead_code)]
+    pub budget_hits: usize,
 }
 
 /// The result of a background `Action::IndexAtoms` job: which atoms were
