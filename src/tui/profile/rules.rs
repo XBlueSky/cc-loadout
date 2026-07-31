@@ -4,6 +4,7 @@
 
 use crate::profile::config::{ContentRule, Detect, Profile, Profiles};
 use crate::profile::discover::{Inventory, RepoSignal};
+use crate::profile::signal_detect;
 use crate::tui::textinput::TextInput;
 use crate::tui::theme;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -135,10 +136,58 @@ pub struct NearMiss {
     pub suggestion: Option<RuleRow>,
 }
 
+/// Every atom `detect`'s rules would need from the index (mirrors the rule
+/// families `signal_detect::profile_answer` walks): marker files, marker
+/// globs, content rules, and each deps-keyword × marker-file pair.
+/// `path_prefixes` is excluded (answered directly from `sig.path`, never
+/// unknown) and so is `package_json_deps` (answered directly from
+/// `sig.package_json_deps`, always fully indexed) — neither ever goes
+/// through the atom index and so can never be pending.
+fn detect_atoms(detect: &Detect) -> Vec<String> {
+    use crate::profile::signal_detect::{atom_content, atom_file, atom_glob, atom_kw};
+    let mut atoms: Vec<String> = Vec::new();
+    atoms.extend(
+        detect
+            .marker_files
+            .iter()
+            .filter(|f| !f.is_empty())
+            .map(|f| atom_file(f)),
+    );
+    atoms.extend(
+        detect
+            .marker_globs
+            .iter()
+            .filter(|g| !g.is_empty())
+            .map(|g| atom_glob(g)),
+    );
+    atoms.extend(
+        detect
+            .content
+            .iter()
+            .filter(|c| !c.file.is_empty() && !c.word.is_empty())
+            .map(|c| atom_content(&c.file, &c.word)),
+    );
+    for kw in detect.deps_keywords.iter().filter(|k| !k.is_empty()) {
+        for f in detect.marker_files.iter().filter(|f| !f.is_empty()) {
+            atoms.push(atom_kw(f, kw));
+        }
+    }
+    atoms
+}
+
 /// Repos (from the scanned inventory) currently matched by `detect`, with
-/// provenance. Each repo is read from disk (content rules inspect file bodies)
-/// via a single-profile probe keyed "_".
-pub fn matching_repos(detect: &Detect, repos: &[RepoSignal]) -> Vec<Match> {
+/// provenance — evaluated purely from each repo's indexed signal (zero
+/// filesystem I/O) via `signal_detect::profile_answer` against a
+/// single-profile probe keyed "_". Repos carrying a `.claude/profile`
+/// override are excluded — detect rules never classify them, and the
+/// exclusion is read straight off the signal's `override_names` rather than
+/// stat-ing `.claude/profile` on disk.
+///
+/// The second return value is the atoms `detect` references that are absent
+/// from EVERY override-free repo's index — i.e. genuinely unindexed (never
+/// scanned with the current rule vocabulary), not merely `false` for that
+/// repo. Sorted and deduplicated; empty once every rule is fully answerable.
+pub fn matching_repos(detect: &Detect, repos: &[RepoSignal]) -> (Vec<Match>, Vec<String>) {
     let probe = Profiles {
         profiles: std::collections::BTreeMap::from([(
             "_".to_string(),
@@ -149,29 +198,62 @@ pub fn matching_repos(detect: &Detect, repos: &[RepoSignal]) -> Vec<Match> {
         )]),
         ..Default::default()
     };
-    repos
+    let profile = &probe.profiles["_"];
+    let owned: Vec<&RepoSignal> = repos
         .iter()
-        .filter_map(|r| {
-            crate::profile::detect::detect_profiles_explained(std::path::Path::new(&r.path), &probe)
-                .into_iter()
-                .find(|(name, _)| name == "_")
-                .map(|(_, reason)| Match {
-                    path: r.path.clone(),
-                    rule: reason.rule,
-                    value: reason.value,
-                })
-        })
-        .collect()
+        .filter(|r| r.override_names.is_none())
+        .collect();
+
+    let mut matched = Vec::new();
+    for r in &owned {
+        if let signal_detect::ProfileAnswer::Match(reason) =
+            signal_detect::profile_answer(r, profile)
+        {
+            matched.push(Match {
+                path: r.path.clone(),
+                rule: reason.rule,
+                value: reason.value,
+            });
+        }
+    }
+
+    let mut pending: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    if !owned.is_empty() {
+        for atom in detect_atoms(detect) {
+            if owned.iter().all(|r| !r.rule_hits.contains_key(&atom)) {
+                pending.insert(atom);
+            }
+        }
+    }
+    (matched, pending.into_iter().collect())
+}
+
+/// Outcome of evaluating the builder's in-progress rule (on top of the
+/// committed rules) against the index. Three states, not two — mirrors the
+/// top-level `RulesState` count line's own tri-state split, at the single
+/// in-progress-rule granularity.
+enum ScratchCount {
+    /// The in-progress value is empty (or, for `contains`, either half is) —
+    /// nothing to count yet. Renders nothing.
+    Incomplete,
+    /// The value is complete, but some rule in the scratch `Detect` (the
+    /// in-progress one or an already-committed one) references an atom the
+    /// index has never seen. An honest "unknown" — renders a dim `…` rather
+    /// than an undercount, and never fires a job on a keystroke.
+    Pending,
+    /// Every atom in the scratch `Detect` is answerable — a definite count.
+    Counted(usize),
 }
 
 /// Count repos the builder's in-progress rule (on top of the committed rules)
-/// would match. Returns None until the in-progress value is non-empty (and, for
-/// `contains`, until both file and word are non-empty).
-fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> Option<usize> {
-    let kind = ed.kind?;
+/// would match. See `ScratchCount` for the three possible outcomes.
+fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> ScratchCount {
+    let Some(kind) = ed.kind else {
+        return ScratchCount::Incomplete;
+    };
     let file = ed.file.value().trim().to_string();
     if file.is_empty() {
-        return None;
+        return ScratchCount::Incomplete;
     }
     let row = match kind {
         EditorKind::PathUnder => RuleRow::PathUnder(file),
@@ -184,7 +266,7 @@ fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> Opti
                 .map(|w| w.value().trim().to_string())
                 .unwrap_or_default();
             if word.is_empty() {
-                return None;
+                return ScratchCount::Incomplete;
             }
             RuleRow::Contains { file, word }
         }
@@ -197,7 +279,11 @@ fn scratch_count(detect: &Detect, ed: &RuleEditor, repos: &[RepoSignal]) -> Opti
         remove_at(&mut scratch, i);
     }
     add_rule(&mut scratch, row);
-    Some(matching_repos(&scratch, repos).len())
+    let (matched, pending) = matching_repos(&scratch, repos);
+    if !pending.is_empty() {
+        return ScratchCount::Pending;
+    }
+    ScratchCount::Counted(matched.len())
 }
 
 /// For each scanned repo NOT in `matched`, suggest one rule (derived from the
@@ -258,8 +344,16 @@ pub struct RuleEditor {
     editing: Option<usize>,
     /// Live count of repos the in-progress rule (committed rules + this one)
     /// would match, recomputed on each value keystroke. `None` until a
-    /// non-empty value exists. Spec §4.5.
+    /// non-empty value exists, AND while `live_pending` is true (an unindexed
+    /// atom is never rendered as a number). Spec §4.5.
     live_count: Option<usize>,
+    /// True when the in-progress rule (committed rules + this one) is
+    /// complete but references an atom the index has never seen — the count
+    /// can't be answered yet, so the builder renders a dim `…` instead of a
+    /// number instead of guessing or firing a job on a keystroke. Always
+    /// false while `live_count` is empty for lack of input (the "incomplete"
+    /// case, which renders nothing).
+    live_pending: bool,
     /// Ghost path-completion suffix for a `path under` value (the same
     /// dim-suffix completion the Scan Roots editor offers). `Some` only while
     /// editing a `path under` rule and there is a directory to complete to;
@@ -277,6 +371,7 @@ impl Default for RuleEditor {
             focus_word: false,
             editing: None,
             live_count: None,
+            live_pending: false,
             suggestion: None,
         }
     }
@@ -296,6 +391,21 @@ pub struct RulesState {
     /// Override-free repos (cached by `recompute`), reused by the builder's
     /// live-count so it does not rebuild the override filter each keystroke.
     live_owned: Vec<RepoSignal>,
+    /// Atoms the CURRENTLY COMMITTED rules reference but that are absent from
+    /// every scanned repo's index (recomputed in `recompute`). Drives the
+    /// three-state count-line render and is diffed at builder-commit time to
+    /// find atoms newly introduced by that commit (see `wants_index`).
+    pub pending_atoms: Vec<String>,
+    /// Atoms newly discovered pending at the moment a rule is committed via
+    /// the add/edit builder. `ProfileView` drains this (deduped) to dispatch a
+    /// background `Action::IndexAtoms` job; empty until a builder commit
+    /// introduces a genuinely new atom.
+    pub wants_index: Vec<String>,
+    /// Whether a background atom-index job is in flight for this profile's
+    /// pending atoms. Set/cleared by `ProfileView` (Task 8) — `RulesState`
+    /// only reads it, to choose between the "indexing …" and "press s to
+    /// index" render states.
+    pub indexing: bool,
 }
 
 impl RulesState {
@@ -310,6 +420,9 @@ impl RulesState {
             near: Vec::new(),
             total_repos: 0,
             live_owned: Vec::new(),
+            pending_atoms: Vec::new(),
+            wants_index: Vec::new(),
+            indexing: false,
         };
         s.recompute(inv);
         s
@@ -319,20 +432,19 @@ impl RulesState {
     /// rules. Repos that carry their own `.claude/profile` override are
     /// EXCLUDED from both lists — detect rules don't classify them, so showing
     /// them as matched or as a near-miss would mislead (Plan B review Minor #1).
+    /// The exclusion reads `RepoSignal.override_names` (a scanned field) —
+    /// zero filesystem I/O, unlike the `.claude/profile` stat this replaced.
     pub fn recompute(&mut self, inv: &Inventory) {
         self.live_owned = inv
             .repos
             .iter()
-            .filter(|r| {
-                !std::path::Path::new(&r.path)
-                    .join(".claude")
-                    .join("profile")
-                    .is_file()
-            })
+            .filter(|r| r.override_names.is_none())
             .cloned()
             .collect();
         self.total_repos = self.live_owned.len();
-        self.matched = matching_repos(&self.detect, &self.live_owned);
+        let (matched, pending) = matching_repos(&self.detect, &self.live_owned);
+        self.matched = matched;
+        self.pending_atoms = pending;
         let matched_paths: Vec<String> = self.matched.iter().map(|m| m.path.clone()).collect();
         self.near = near_misses(&self.detect, &self.live_owned, &matched_paths);
     }
@@ -408,7 +520,24 @@ impl RulesState {
         if let Some(idx) = rows.iter().rposition(|r| *r == row) {
             self.cursor = idx;
         }
+        self.recompute_and_queue_newly_pending(inv);
+    }
+
+    /// `recompute`, then diff `pending_atoms` before/after so only atoms THIS
+    /// commit introduced are queued in `wants_index` — not ones already
+    /// pending from an earlier, still-unindexed rule. Shared by every
+    /// `add_rule` commit site (`commit_editor`'s builder and the `f` picker's
+    /// derive-from-repo), so a newly-pending atom is queued for indexing no
+    /// matter which path introduced it.
+    fn recompute_and_queue_newly_pending(&mut self, inv: &Inventory) {
+        let before_pending: std::collections::BTreeSet<String> =
+            self.pending_atoms.iter().cloned().collect();
         self.recompute(inv);
+        for atom in &self.pending_atoms {
+            if !before_pending.contains(atom) {
+                self.wants_index.push(atom.clone());
+            }
+        }
     }
 
     /// Handle a key — builder-aware. When a builder is active, all keys are
@@ -434,7 +563,7 @@ impl RulesState {
                                 add_rule(&mut self.detect, row);
                             }
                         }
-                        self.recompute(inv);
+                        self.recompute_and_queue_newly_pending(inv);
                     }
                 }
                 _ => {}
@@ -503,7 +632,20 @@ impl RulesState {
                 // in-progress rule. Cheap COUNT only (no near-miss); reuses the
                 // cached override-free repo set. (Avoids re-running the full
                 // preview per keystroke — see Plan C c050de4.)
-                ed.live_count = scratch_count(&self.detect, ed, &self.live_owned);
+                match scratch_count(&self.detect, ed, &self.live_owned) {
+                    ScratchCount::Incomplete => {
+                        ed.live_count = None;
+                        ed.live_pending = false;
+                    }
+                    ScratchCount::Pending => {
+                        ed.live_count = None;
+                        ed.live_pending = true;
+                    }
+                    ScratchCount::Counted(n) => {
+                        ed.live_count = Some(n);
+                        ed.live_pending = false;
+                    }
+                }
                 // Refresh the ghost path-completion for a `path under` value.
                 ed.suggestion = if matches!(ed.kind, Some(EditorKind::PathUnder)) {
                     super::by_plugin::dir_suggestion(&ed.file.value())
@@ -554,9 +696,42 @@ impl RulesState {
         }
     }
 
+    /// The three-state match-count line:
+    /// - every rule answerable -> "matches {n} of {total}  ·  as of {age}"
+    ///   (definite count, age dim)
+    /// - pending atoms + an index job in flight -> "matches …  ·  indexing
+    ///   {first pending atom}" (all dim — an honest "can't say yet")
+    /// - pending atoms + no job yet -> "matches …  ·  press s to index"
+    fn count_line(&self, scanned_at: Option<i64>, now_ms: i64) -> Line<'static> {
+        if self.pending_atoms.is_empty() {
+            let age = scanned_at
+                .map(|t| super::fmt_age(t, now_ms / 1000))
+                .unwrap_or_else(|| "never".to_string());
+            return Line::from(vec![
+                Span::styled(
+                    format!("matches {} of {}", self.matched.len(), self.total_repos),
+                    theme::accent(),
+                ),
+                Span::styled(format!(" \u{b7} as of {age}"), theme::dim()),
+            ]);
+        }
+        let tail = if self.indexing {
+            let atom = self.pending_atoms.first().cloned().unwrap_or_default();
+            format!("indexing {atom}")
+        } else {
+            "press s to index".to_string()
+        };
+        Line::from(Span::styled(
+            format!("matches \u{2026} of {} \u{b7} {tail}", self.total_repos),
+            theme::dim(),
+        ))
+    }
+
     /// Render the Rules tab body: if a builder is open draw the builder overlay;
     /// otherwise draw the rule list, match-count line, and near-miss panel.
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    /// `scanned_at`/`now_ms` feed the count line's "as of {age}" tag (the same
+    /// scan-age formatter the by-plugin scan bar uses).
+    pub fn render(&self, f: &mut Frame, area: Rect, scanned_at: Option<i64>, now_ms: i64) {
         if let Some(pick) = &self.repo_pick {
             let mut lines: Vec<Line<'static>> = vec![
                 Line::from(Span::styled(
@@ -620,14 +795,7 @@ impl RulesState {
 
         // ── Match count + near-miss panel ───────────────────────────
         let mut preview: Vec<Line<'static>> = Vec::new();
-        preview.push(Line::from(Span::styled(
-            format!(
-                "● {} of {} scanned repos match",
-                self.matched.len(),
-                self.total_repos
-            ),
-            theme::accent(),
-        )));
+        preview.push(self.count_line(scanned_at, now_ms));
         for m in &self.matched {
             let why = m.value.clone().unwrap_or_default();
             preview.push(Line::from(Span::styled(
@@ -759,6 +927,12 @@ fn render_editor(ed: &RuleEditor, f: &mut Frame, area: Rect) {
                     format!("● matches {n} repos"),
                     theme::accent(),
                 )));
+            } else if ed.live_pending {
+                // Complete value, but an atom the index has never seen — an
+                // honest "can't say yet", not a guessed number, and never a
+                // job fired on this keystroke.
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled("matches …", theme::dim())));
             }
         }
     }
@@ -839,17 +1013,14 @@ mod tests {
 
     #[test]
     fn recompute_counts_matches_over_total() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        let path = dir.path().display().to_string();
         let inv = inv_with_repos(vec![
-            repo(&path, &["Cargo.toml"], &[], &[]),
-            repo("/nonexistent-xyz", &[], &[], &[]),
+            signal("/nonexistent-a", &[("file:Cargo.toml", true)], None),
+            signal("/nonexistent-xyz", &[("file:Cargo.toml", false)], None),
         ]);
         let mut d = Detect::default();
         d.marker_files.push("Cargo.toml".into());
         let st = RulesState::open(d, &inv);
-        assert_eq!(st.matched.len(), 1, "only the real Cargo.toml repo matches");
+        assert_eq!(st.matched.len(), 1, "only the indexed-true repo matches");
         assert_eq!(st.total_repos, 2);
     }
 
@@ -860,7 +1031,7 @@ mod tests {
         d.marker_files.push("Cargo.toml".into());
         let st = RulesState::open(d, &inv);
         let mut t = Terminal::new(TestBackend::new(70, 20)).unwrap();
-        t.draw(|f| st.render(f, f.area())).unwrap();
+        t.draw(|f| st.render(f, f.area(), None, 0)).unwrap();
         let text: String = t
             .backend()
             .buffer()
@@ -880,24 +1051,78 @@ mod tests {
             marker_globs: globs.iter().map(|s| s.to_string()).collect(),
             package_json_deps: deps.iter().map(|s| s.to_string()).collect(),
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
+        }
+    }
+
+    /// Build a `RepoSignal` at a nonexistent path with an explicit atom index
+    /// (`hits`) and override state — the shape `matching_repos` actually reads
+    /// (`rule_hits` + `override_names`), as opposed to `repo()`'s raw
+    /// marker/glob/dep fields (which only feed near-miss suggestions). The
+    /// path is fake by construction: if the code under test ever stat'd the
+    /// disk instead of reading the signal, these tests would fail rather than
+    /// silently pass on a real filesystem.
+    fn signal(path: &str, hits: &[(&str, bool)], override_names: Option<Vec<&str>>) -> RepoSignal {
+        RepoSignal {
+            path: path.into(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: hits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            override_names: override_names.map(|v| v.into_iter().map(String::from).collect()),
         }
     }
 
     #[test]
     fn matching_repos_reports_path_and_provenance() {
-        // Real temp repo with Cargo.toml so detect_profiles_explained can match on disk.
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        let path = dir.path().display().to_string();
         let mut d = Detect::default();
         d.marker_files.push("Cargo.toml".into());
 
-        let repos = vec![repo(&path, &["Cargo.toml"], &[], &[])];
-        let got = matching_repos(&d, &repos);
+        let repos = vec![signal(
+            "/nonexistent-fake/repo",
+            &[("file:Cargo.toml", true)],
+            None,
+        )];
+        let (got, pending) = matching_repos(&d, &repos);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].path, path);
+        assert_eq!(got[0].path, "/nonexistent-fake/repo");
         assert_eq!(got[0].rule, "marker_file");
         assert_eq!(got[0].value.as_deref(), Some("Cargo.toml"));
+        assert!(pending.is_empty(), "the atom is indexed, nothing pending");
+    }
+
+    /// An atom already present in a repo's index (whether true or false)
+    /// counts as indexed — the glob rule is answerable and the repo is
+    /// counted (or not) accordingly, never landing in the pending list.
+    #[test]
+    fn matching_repos_counts_a_repo_whose_glob_atom_is_indexed() {
+        let mut d = Detect::default();
+        d.marker_globs.push("*.vue".into());
+
+        let repos = vec![signal("/nonexistent-fake/a", &[("glob:*.vue", true)], None)];
+        let (matched, pending) = matching_repos(&d, &repos);
+        assert_eq!(matched.len(), 1, "indexed true -> counted as a match");
+        assert_eq!(matched[0].path, "/nonexistent-fake/a");
+        assert!(pending.is_empty(), "atom is indexed -> not pending");
+    }
+
+    /// An atom absent from every repo's index (never scanned with this rule's
+    /// vocabulary) must not be silently treated as a miss — it is reported as
+    /// pending, and the repo is excluded from `matched` (not asserted false).
+    #[test]
+    fn matching_repos_reports_an_unindexed_glob_atom_as_pending() {
+        let mut d = Detect::default();
+        d.marker_globs.push("*.vue".into());
+
+        let repos = vec![signal("/nonexistent-fake/a", &[], None)]; // atom never indexed
+        let (matched, pending) = matching_repos(&d, &repos);
+        assert!(
+            matched.is_empty(),
+            "an unanswerable rule must not count as a match"
+        );
+        assert_eq!(pending, vec!["glob:*.vue".to_string()]);
     }
 
     #[test]
@@ -1192,17 +1417,20 @@ mod tests {
     /// scratch clone AND added "go.mod", so the count would be 2 (both repos).
     #[test]
     fn edit_rule_live_count_does_not_double_count() {
-        let dir_a = tempfile::tempdir().unwrap();
-        std::fs::write(dir_a.path().join("Cargo.toml"), "[package]").unwrap();
-        let path_a = dir_a.path().display().to_string();
-
-        let dir_b = tempfile::tempdir().unwrap();
-        std::fs::write(dir_b.path().join("go.mod"), "module x").unwrap();
-        let path_b = dir_b.path().display().to_string();
-
+        // Both atoms are indexed (true or false) on both repos, so neither
+        // rule is ever "pending" — the live count stays a definite number
+        // throughout the edit.
         let inv = inv_with_repos(vec![
-            repo(&path_a, &["Cargo.toml"], &[], &[]),
-            repo(&path_b, &["go.mod"], &[], &[]),
+            signal(
+                "/nonexistent-a",
+                &[("file:Cargo.toml", true), ("file:go.mod", false)],
+                None,
+            ),
+            signal(
+                "/nonexistent-b",
+                &[("file:Cargo.toml", false), ("file:go.mod", true)],
+                None,
+            ),
         ]);
 
         let mut d = Detect::default();
@@ -1267,6 +1495,92 @@ mod tests {
         );
     }
 
+    /// Final-review fix: the builder's live count must distinguish "no value
+    /// typed yet" (renders nothing) from "value complete, but its atom is
+    /// unindexed" (renders a dim `…`, never a guessed number, never a job)
+    /// from "value complete and fully indexed" (renders the definite
+    /// number) — three states, not two. Drives real keystrokes through
+    /// `handle_key` and asserts on the actual rendered text, not just field
+    /// state.
+    #[test]
+    fn builder_live_count_shows_pending_ellipsis_for_an_unindexed_atom() {
+        // The index has answered "file:Cargo.toml" but has never seen
+        // "file:new.lock" for any repo.
+        let inv = inv_with_repos(vec![signal(
+            "/nonexistent-a",
+            &[("file:Cargo.toml", true)],
+            None,
+        )]);
+        let mut st = RulesState::open(Detect::default(), &inv);
+        st.handle_key(KeyEvent::from(KeyCode::Char('a')), &inv); // open builder (kind pick)
+        st.handle_key(KeyEvent::from(KeyCode::Down), &inv); // has file
+        st.handle_key(KeyEvent::from(KeyCode::Enter), &inv); // choose "has file"
+
+        let render = |st: &RulesState| -> String {
+            let mut t = Terminal::new(TestBackend::new(70, 20)).unwrap();
+            t.draw(|f| st.render(f, f.area(), None, 0)).unwrap();
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        // Stage 1: incomplete input -> nothing rendered (pinned).
+        let text = render(&st);
+        assert!(
+            !text.contains("matches"),
+            "no count line before any value is typed: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "no pending ellipsis before any value is typed: {text}"
+        );
+
+        // Stage 2: complete value, atom never indexed -> pending ellipsis,
+        // never a guessed number, never a job.
+        for c in "new.lock".chars() {
+            st.handle_key(key(c), &inv);
+        }
+        assert!(
+            st.editor.as_ref().unwrap().live_count.is_none(),
+            "an unindexed atom must never render a guessed number"
+        );
+        assert!(
+            st.editor.as_ref().unwrap().live_pending,
+            "a complete value whose atom is unindexed must be pending"
+        );
+        let text = render(&st);
+        assert!(
+            text.contains('\u{2026}'),
+            "unindexed atom shows the pending ellipsis: {text}"
+        );
+
+        // Stage 3: switch to a fully-indexed value -> definite number
+        // (existing behavior, pinned end-to-end through render this time).
+        for _ in 0.."new.lock".chars().count() {
+            st.handle_key(KeyEvent::from(KeyCode::Backspace), &inv);
+        }
+        for c in "Cargo.toml".chars() {
+            st.handle_key(key(c), &inv);
+        }
+        assert!(
+            !st.editor.as_ref().unwrap().live_pending,
+            "a fully-indexed atom is not pending"
+        );
+        assert_eq!(st.editor.as_ref().unwrap().live_count, Some(1));
+        let text = render(&st);
+        assert!(
+            text.contains("matches 1 repos"),
+            "indexed value shows the live number: {text}"
+        );
+        assert!(
+            !text.contains('\u{2026}'),
+            "a definite count must not also show the pending ellipsis: {text}"
+        );
+    }
+
     #[test]
     fn add_path_rule_via_builder() {
         let inv = inv_with_repos(vec![]);
@@ -1326,6 +1640,54 @@ mod tests {
         );
     }
 
+    /// Task 7: committing a brand-new rule whose atom the index has never
+    /// seen (on any override-free repo) must queue that atom in
+    /// `wants_index` — Task 8's dispatch drains this to launch a background
+    /// index job. Sanity-checks `commit_editor`'s before/after diff.
+    #[test]
+    fn committing_a_rule_via_the_builder_queues_its_newly_pending_atom() {
+        let inv = inv_with_repos(vec![signal("/nonexistent-a", &[], None)]);
+        let mut st = RulesState::open(Detect::default(), &inv);
+        assert!(
+            st.wants_index.is_empty(),
+            "nothing queued before any rule exists"
+        );
+        st.handle_key(KeyEvent::from(KeyCode::Char('a')), &inv); // open builder (kind pick)
+        st.handle_key(KeyEvent::from(KeyCode::Down), &inv); // has file
+        st.handle_key(KeyEvent::from(KeyCode::Enter), &inv); // choose "has file"
+        for c in "newmarker.toml".chars() {
+            st.handle_key(key(c), &inv);
+        }
+        st.handle_key(KeyEvent::from(KeyCode::Enter), &inv); // commit
+        assert_eq!(st.wants_index, vec!["file:newmarker.toml".to_string()]);
+    }
+
+    /// Task 7: the `f` ("derive rules from a repo") picker also calls
+    /// `add_rule` (a second commit path alongside the builder's
+    /// `commit_editor`) — a derived rule can equally introduce an atom the
+    /// index has never seen, since `RepoSignal.marker_files` (the raw scan)
+    /// is populated independently of `rule_hits` (the vocabulary-driven
+    /// index). It must be queued for indexing exactly like a builder commit.
+    #[test]
+    fn deriving_rules_from_a_picked_repo_queues_newly_pending_atoms() {
+        // marker_files is populated (the raw scan) but rule_hits is empty
+        // (no profile's rules have ever asked about "Cargo.toml" before) —
+        // so the derived HasFile("Cargo.toml") rule introduces a genuinely
+        // new, never-indexed atom.
+        let picked = repo("/x", &["Cargo.toml"], &[], &[]);
+        let inv = inv_with_repos(vec![picked]);
+        let mut st = RulesState::open(Detect::default(), &inv);
+        st.handle_key(KeyEvent::from(KeyCode::Char('f')), &inv); // open repo pick
+        st.handle_key(KeyEvent::from(KeyCode::Enter), &inv); // pick cursor 0 -> derive rules
+        assert_eq!(st.detect.marker_files, vec!["Cargo.toml".to_string()]);
+        assert_eq!(
+            st.wants_index,
+            vec!["file:Cargo.toml".to_string()],
+            "deriving a rule from a picked repo must queue its newly-pending \
+             atom for indexing, same as a builder commit"
+        );
+    }
+
     #[test]
     fn cursor_follows_committed_rule() {
         let inv = inv_with_repos(vec![]);
@@ -1374,22 +1736,23 @@ mod tests {
     /// review Minor #1). Verified end-to-end through `RulesState::recompute`.
     #[test]
     fn override_repos_excluded_from_matched_and_near() {
-        // Repo A: plain, has Cargo.toml -> should be MATCHED by a has-file rule.
-        let a = tempfile::tempdir().unwrap();
-        std::fs::write(a.path().join("Cargo.toml"), "[package]").unwrap();
-        let a_path = a.path().display().to_string();
+        // Repo A: plain, indexed Cargo.toml=true -> should be MATCHED by a
+        // has-file rule.
+        let a_path = "/nonexistent-a".to_string();
 
-        // Repo B: ALSO has Cargo.toml, but carries a .claude/profile override.
-        // It must not appear as matched, and must not appear as a near-miss.
-        let b = tempfile::tempdir().unwrap();
-        std::fs::write(b.path().join("Cargo.toml"), "[package]").unwrap();
-        std::fs::create_dir_all(b.path().join(".claude")).unwrap();
-        std::fs::write(b.path().join(".claude").join("profile"), "frontend\n").unwrap();
-        let b_path = b.path().display().to_string();
+        // Repo B: ALSO indexed Cargo.toml=true, but carries an override
+        // (`override_names`, the signal-based analog of a `.claude/profile`
+        // file). It must not appear as matched, and must not appear as a
+        // near-miss.
+        let b_path = "/nonexistent-b".to_string();
 
         let inv = inv_with_repos(vec![
-            repo(&a_path, &["Cargo.toml"], &[], &[]),
-            repo(&b_path, &["Cargo.toml"], &[], &[]),
+            signal(&a_path, &[("file:Cargo.toml", true)], None),
+            signal(
+                &b_path,
+                &[("file:Cargo.toml", true)],
+                Some(vec!["frontend"]),
+            ),
         ]);
         let mut d = Detect::default();
         d.marker_files.push("Cargo.toml".into());

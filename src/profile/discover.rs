@@ -18,6 +18,12 @@ pub struct RepoSignal {
     pub marker_globs: Vec<String>,
     pub package_json_deps: Vec<String>,
     pub languages: Vec<String>,
+    /// atom key (signal_detect::atom_*) → did this repo satisfy it at scan time.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub rule_hits: std::collections::BTreeMap<String, bool>,
+    /// Parsed `.claude/profile` override names; None = no override file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -123,7 +129,7 @@ pub fn list_plugins(registry_path: &Path) -> Vec<PluginInfo> {
     out
 }
 
-const MARKER_FILES: &[&str] = &[
+pub const MARKER_FILES: &[&str] = &[
     "package.json",
     "Cargo.toml",
     "pyproject.toml",
@@ -134,25 +140,77 @@ const MARKER_FILES: &[&str] = &[
     "composer.json",
     "build.gradle",
 ];
-const KNOWN_GLOBS: &[&str] = &["*.vue"];
+pub const KNOWN_GLOBS: &[&str] = &["*.vue"];
 
-/// Scan every git repo under `roots` and extract raw, detect-schema-aligned signals.
-pub fn scan_repo_signals(roots: &[String], max_depth: usize) -> Vec<RepoSignal> {
+/// Scan every git repo under `roots` and extract raw, detect-schema-aligned
+/// signals, plus every atom in `vocab` answered against that repo.
+pub fn scan_repo_signals(
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+) -> Vec<RepoSignal> {
+    scan_repo_signals_inner(roots, max_depth, vocab, detect::GLOB_WALK_BUDGET).0
+}
+
+/// Same as `scan_repo_signals`, but also counts repos where the vocabulary's
+/// `glob:` atoms could not all be answered because the single shared walk
+/// `answer_atoms` runs for them (`detect::globs_exist`) exhausted its dirent
+/// budget before finishing. Used by the Rescan job to warn the user that some
+/// repos' glob-type rule_hits may be incomplete — see `ScanOutcome::budget_hits`.
+pub fn scan_repo_signals_with_budget_hits(
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+) -> (Vec<RepoSignal>, usize) {
+    scan_repo_signals_inner(roots, max_depth, vocab, detect::GLOB_WALK_BUDGET)
+}
+
+/// Shared core for `scan_repo_signals`/`scan_repo_signals_with_budget_hits`,
+/// parameterized on the glob-walk budget so tests can inject a tiny one
+/// without needing a giant fixture (production always passes
+/// `detect::GLOB_WALK_BUDGET` via the two public wrappers above).
+fn scan_repo_signals_inner(
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+    budget: usize,
+) -> (Vec<RepoSignal>, usize) {
     let mut out = Vec::new();
+    let mut budget_hits = 0usize;
     for root in roots {
         let root = Path::new(root);
         if !root.is_dir() {
             continue;
         }
         for repo in scan::find_git_repos(root, max_depth) {
-            out.push(signals_for_repo(&repo));
+            let (sig, exhausted) = signals_for_repo(&repo, vocab, budget);
+            if exhausted {
+                budget_hits += 1;
+            }
+            out.push(sig);
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    out
+    (out, budget_hits)
 }
 
-fn signals_for_repo(repo: &Path) -> RepoSignal {
+/// Returns the repo's signal plus whether the vocabulary's glob-atom walk
+/// (`answer_atoms`) exhausted `budget` before answering every `glob:` atom.
+/// `pub(crate)` so `commit::commit` can recompute a single known repo's
+/// signal fresh at write time (mirroring `answer_atoms`'s same treatment for
+/// the `IndexAtoms` job) without re-walking a whole scan root.
+pub(crate) fn signals_for_repo(
+    repo: &Path,
+    vocab: &BTreeSet<String>,
+    budget: usize,
+) -> (RepoSignal, bool) {
+    // Canonicalize up front so RepoSignal.path agrees with detect_one's own
+    // canonicalize-before-match (detect.rs:27-28) — otherwise a repo reached
+    // through a symlinked scan root would fail path_prefix rules that disk
+    // detection resolves correctly. Same fallback semantics as detect.rs:26.
+    let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let repo = canonical.as_path();
+
     let marker_files = MARKER_FILES
         .iter()
         .filter(|m| repo.join(m).exists())
@@ -168,13 +226,77 @@ fn signals_for_repo(repo: &Path) -> RepoSignal {
     } else {
         Vec::new()
     };
-    RepoSignal {
-        path: repo.display().to_string(),
-        marker_files,
-        marker_globs,
-        package_json_deps,
-        languages: root_extensions(repo),
+
+    // Answer every atom in the vocabulary. Glob atoms share ONE walk.
+    let (rule_hits, exhausted) = answer_atoms(repo, vocab, budget);
+    let override_names = std::fs::read_to_string(repo.join(".claude").join("profile"))
+        .ok()
+        .map(|text| {
+            let mut names: Vec<String> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect();
+            names.sort();
+            names.dedup();
+            names
+        });
+
+    (
+        RepoSignal {
+            path: repo.display().to_string(),
+            marker_files,
+            marker_globs,
+            package_json_deps,
+            languages: root_extensions(repo),
+            rule_hits,
+            override_names,
+        },
+        exhausted,
+    )
+}
+
+/// Answer every atom in `atoms` against `repo`'s filesystem: `file:`/`content:`/
+/// `kw:` atoms are stat'd or read directly; `glob:` atoms share ONE
+/// `globs_exist` walk, spending at most `budget` dirents — the second return
+/// value is whether that walk exhausted `budget` before answering every
+/// `glob:` atom. Shared by `signals_for_repo` (the initial scan) and the
+/// background `Action::IndexAtoms` job (indexing newly-committed rule atoms
+/// after the fact), so the atom-evaluation rules live in exactly one place.
+pub(crate) fn answer_atoms(
+    repo: &Path,
+    atoms: &BTreeSet<String>,
+    budget: usize,
+) -> (BTreeMap<String, bool>, bool) {
+    let mut rule_hits = BTreeMap::new();
+    let mut glob_pats: Vec<String> = Vec::new();
+    for atom in atoms {
+        if let Some(g) = atom.strip_prefix("glob:") {
+            glob_pats.push(g.to_string());
+        } else if let Some(f) = atom.strip_prefix("file:") {
+            rule_hits.insert(atom.clone(), repo.join(f).exists());
+        } else if let Some(rest) = atom.strip_prefix("content:") {
+            if let Some((f, w)) = rest.split_once('\u{2192}') {
+                let hit = std::fs::read_to_string(repo.join(f))
+                    .map(|t| detect::contains_word(&t, w))
+                    .unwrap_or(false);
+                rule_hits.insert(atom.clone(), hit);
+            }
+        } else if let Some(rest) = atom.strip_prefix("kw:") {
+            if let Some((f, k)) = rest.split_once('\u{2192}') {
+                let hit = std::fs::read_to_string(repo.join(f))
+                    .map(|t| detect::contains_word(&t, k))
+                    .unwrap_or(false);
+                rule_hits.insert(atom.clone(), hit);
+            }
+        }
     }
+    let (glob_hits, exhausted) = detect::globs_exist(repo, &glob_pats, budget);
+    for (g, hit) in glob_hits {
+        rule_hits.insert(crate::profile::signal_detect::atom_glob(&g), hit);
+    }
+    (rule_hits, exhausted)
 }
 
 fn read_package_json_deps(repo: &Path) -> Vec<String> {
@@ -209,7 +331,11 @@ fn root_extensions(repo: &Path) -> Vec<String> {
     exts.into_iter().collect()
 }
 
-const FRONTEND_DEPS: &[&str] = &["react", "vue", "svelte", "preact", "solid-js"];
+// pub(crate): also read by signal_detect::vocabulary, which must index these
+// as content atoms unconditionally (same reason MARKER_FILES/KNOWN_GLOBS are
+// unconditional) — see defining_signals's "frontend" arm below, whose
+// package_json_deps get converted to content rules by author::profile_from.
+pub(crate) const FRONTEND_DEPS: &[&str] = &["react", "vue", "svelte", "preact", "solid-js"];
 
 /// Cluster repos by a coarse signal key and propose one profile per cluster.
 /// Pure and fully overridable by the caller (TUI / agent).
@@ -292,9 +418,14 @@ pub fn resolve_registry_path(home: &Path, config_override: Option<&Path>) -> Pat
 }
 
 /// Assemble the full inventory: plugins ∪ repo signals ∪ suggested profiles.
-pub fn build_inventory(registry_path: &Path, roots: &[String], max_depth: usize) -> Inventory {
+pub fn build_inventory(
+    registry_path: &Path,
+    roots: &[String],
+    max_depth: usize,
+    vocab: &BTreeSet<String>,
+) -> Inventory {
     let plugins = list_plugins(registry_path);
-    let repos = scan_repo_signals(roots, max_depth);
+    let repos = scan_repo_signals(roots, max_depth, vocab);
     let suggested_profiles = suggest_profiles(&repos);
     Inventory {
         plugins,
@@ -346,7 +477,14 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
         std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
 
-        let inv = build_inventory(&reg, &[roots.path().display().to_string()], 6);
+        let default_vocab =
+            crate::profile::signal_detect::vocabulary(&crate::profile::config::Profiles::default());
+        let inv = build_inventory(
+            &reg,
+            &[roots.path().display().to_string()],
+            6,
+            &default_vocab,
+        );
         assert_eq!(inv.plugins.len(), 1);
         assert_eq!(inv.repos.len(), 1);
         assert_eq!(inv.suggested_profiles.len(), 1);
@@ -360,6 +498,8 @@ mod tests {
             marker_globs: globs.iter().map(|s| s.to_string()).collect(),
             package_json_deps: deps.iter().map(|s| s.to_string()).collect(),
             languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
         }
     }
 
@@ -393,6 +533,59 @@ mod tests {
     }
 
     #[test]
+    fn signals_for_repo_reports_glob_walk_exhaustion() {
+        // The shared glob walk `answer_atoms` runs for the vocabulary's
+        // `glob:` atoms (detect::globs_exist) can exhaust its dirent budget
+        // before finishing — signals_for_repo must surface that per repo
+        // instead of swallowing it, so scan_repo_signals_with_budget_hits can
+        // count it into ScanOutcome::budget_hits (Task 9).
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..10 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let mut vocab = BTreeSet::new();
+        vocab.insert(crate::profile::signal_detect::atom_glob("*.svelte"));
+
+        let (_sig, exhausted) = signals_for_repo(dir.path(), &vocab, 3);
+        assert!(
+            exhausted,
+            "a budget smaller than the entry count must report exhaustion"
+        );
+
+        let (_sig2, not_exhausted) = signals_for_repo(dir.path(), &vocab, 200_000);
+        assert!(
+            !not_exhausted,
+            "a generous budget must not report exhaustion"
+        );
+    }
+
+    #[test]
+    fn scan_repo_signals_with_budget_hits_counts_zero_for_a_small_fixture() {
+        // Wiring-level check (can't inject a small budget here — production
+        // always spends the real GLOB_WALK_BUDGET — so this only proves a
+        // normal small fixture never exhausts it and the new (Vec, usize) API
+        // shape is correct; exhaustion itself is proven at the
+        // signals_for_repo level above, per Task 9's "no giant fixtures" note).
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
+
+        let default_vocab =
+            crate::profile::signal_detect::vocabulary(&crate::profile::config::Profiles::default());
+        let (repos, budget_hits) = scan_repo_signals_with_budget_hits(
+            &[root.path().display().to_string()],
+            6,
+            &default_vocab,
+        );
+        assert_eq!(repos.len(), 1);
+        assert_eq!(
+            budget_hits, 0,
+            "a small fixture must never hit the real walk budget"
+        );
+    }
+
+    #[test]
     fn scan_repo_signals_extracts_markers_and_deps() {
         let root = tempfile::tempdir().unwrap();
         let repo = root.path().join("app");
@@ -404,7 +597,9 @@ mod tests {
         .unwrap();
         std::fs::write(repo.join("src.vue"), "x").unwrap();
 
-        let got = scan_repo_signals(&[root.path().display().to_string()], 6);
+        let default_vocab =
+            crate::profile::signal_detect::vocabulary(&crate::profile::config::Profiles::default());
+        let got = scan_repo_signals(&[root.path().display().to_string()], 6, &default_vocab);
         assert_eq!(got.len(), 1);
         let s = &got[0];
         assert!(s.path.ends_with("app"));
@@ -513,5 +708,35 @@ mod tests {
             inv.suggested_profiles.is_empty(),
             "no-scan inventory must not suggest profiles"
         );
+    }
+
+    #[test]
+    fn signals_include_rule_hits_and_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude/profile"), "frontend\n# comment\n").unwrap();
+        std::fs::write(repo.join("a.svelte"), "x").unwrap();
+        std::fs::write(repo.join("Notes.md"), "syno kw here").unwrap();
+
+        let mut vocab = std::collections::BTreeSet::new();
+        vocab.insert(crate::profile::signal_detect::atom_glob("*.svelte"));
+        vocab.insert(crate::profile::signal_detect::atom_file("Notes.md"));
+        vocab.insert(crate::profile::signal_detect::atom_content(
+            "Notes.md", "syno",
+        ));
+        vocab.insert(crate::profile::signal_detect::atom_kw("Notes.md", "kw"));
+        vocab.insert(crate::profile::signal_detect::atom_glob("*.vue"));
+
+        let sigs = scan_repo_signals(&[dir.path().display().to_string()], 6, &vocab);
+        assert_eq!(sigs.len(), 1);
+        let s = &sigs[0];
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_glob("*.svelte")]);
+        assert!(!s.rule_hits[&crate::profile::signal_detect::atom_glob("*.vue")]);
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_file("Notes.md")]);
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_content("Notes.md", "syno")]);
+        assert!(s.rule_hits[&crate::profile::signal_detect::atom_kw("Notes.md", "kw")]);
+        assert_eq!(s.override_names, Some(vec!["frontend".to_string()]));
     }
 }

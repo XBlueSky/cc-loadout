@@ -1,9 +1,7 @@
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use crate::profile::config::Profiles;
-use crate::profile::detect;
-use crate::profile::discover::{Inventory, RepoSignal, SuggestedProfile};
+use crate::profile::discover::{Inventory, RepoSignal};
 use crate::profile::plugins::managed_keys;
 
 /// Managed plugin keys that are no longer installed (dead references in the config).
@@ -30,39 +28,27 @@ pub fn global_drift(working: &Profiles, global_enabled: &[String]) -> Vec<String
     out
 }
 
-/// Uncovered repos as they would be AFTER merging `suggested` profiles into
-/// `working` — the post-scan drift. Mirrors the working-merge in
-/// `ProfileView::apply_scan`, so the value can be computed once on the job
-/// thread and reused by the UI thread without a second per-repo filesystem walk.
-pub fn uncovered_post_merge(
-    working: &Profiles,
-    suggested: &[SuggestedProfile],
-    repos: &[RepoSignal],
-) -> Vec<String> {
-    let mut merged = working.clone();
-    for sp in suggested {
-        merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
-            crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
-        });
+/// Uncovered repos computed purely from indexed signals — zero filesystem I/O,
+/// via `signal_detect::detect_from_signal`. A repo whose evaluation could not
+/// be decided for every profile (some rule needed an atom the index never
+/// recorded) is left out of the list rather than guessed at; the second
+/// return value is `true` when any repo is still undecided, telling the
+/// caller the result is provisional until a full atom index lands.
+pub fn uncovered_from_signals(repos: &[RepoSignal], cfg: &Profiles) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut any_pending = false;
+    for r in repos {
+        let (matched, pending) = crate::profile::signal_detect::detect_from_signal(r, cfg);
+        if pending {
+            any_pending = true;
+            continue;
+        }
+        if matched.is_empty() {
+            out.push(r.path.clone());
+        }
     }
-    let inv = Inventory {
-        plugins: Vec::new(),
-        repos: repos.to_vec(),
-        suggested_profiles: Vec::new(),
-    };
-    uncovered_repos(&inv, &merged)
-}
-
-/// Scanned repos that match no profile in `working` (sorted by path).
-pub fn uncovered_repos(inv: &Inventory, working: &Profiles) -> Vec<String> {
-    let mut out: Vec<String> = inv
-        .repos
-        .iter()
-        .filter(|r| detect::detect_profiles(Path::new(&r.path), working).is_empty())
-        .map(|r| r.path.clone())
-        .collect();
     out.sort();
-    out
+    (out, any_pending)
 }
 
 /// The five re-edit drift signals.
@@ -97,51 +83,7 @@ impl Drift {
 mod tests {
     use super::*;
     use crate::profile::config::Profiles;
-    use crate::profile::discover::{Inventory, PluginInfo, SharedSignals, SuggestedProfile};
-
-    #[test]
-    fn uncovered_post_merge_covers_repos_via_suggested_profiles() {
-        // A repo that matches no EXISTING profile but IS covered by a suggested
-        // one (merged in) must not count as uncovered — mirroring apply_scan.
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = tmp.path().join("svc");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
-        let path = repo.to_string_lossy().into_owned();
-        let signal = RepoSignal {
-            path: path.clone(),
-            marker_files: vec!["Cargo.toml".into()],
-            marker_globs: vec![],
-            package_json_deps: vec![],
-            languages: vec![],
-        };
-        // Empty working, but a suggested profile keyed on Cargo.toml.
-        let suggested = vec![SuggestedProfile {
-            name: "rust".into(),
-            repos: vec![path.clone()],
-            shared_signals: SharedSignals {
-                marker_files: vec!["Cargo.toml".into()],
-                ..Default::default()
-            },
-        }];
-        let out = uncovered_post_merge(
-            &Profiles::default(),
-            &suggested,
-            std::slice::from_ref(&signal),
-        );
-        assert!(
-            out.is_empty(),
-            "repo covered by a merged suggested profile is not uncovered: {out:?}"
-        );
-
-        // With NO suggested profile to merge, the same repo IS uncovered.
-        let out2 = uncovered_post_merge(&Profiles::default(), &[], &[signal]);
-        assert_eq!(
-            out2,
-            vec![path],
-            "unmatched repo must be reported uncovered"
-        );
-    }
+    use crate::profile::discover::{Inventory, PluginInfo};
 
     fn inv(keys: &[&str]) -> Inventory {
         Inventory {
@@ -179,43 +121,6 @@ mod tests {
     }
 
     #[test]
-    fn uncovered_repos_are_those_matching_no_profile() {
-        use crate::profile::discover::RepoSignal;
-        let tmp = tempfile::tempdir().unwrap();
-        let rust = tmp.path().join("rusty");
-        std::fs::create_dir_all(&rust).unwrap();
-        std::fs::write(rust.join("Cargo.toml"), "[package]").unwrap();
-        let plain = tmp.path().join("plain");
-        std::fs::create_dir_all(&plain).unwrap();
-
-        let mut inv = inv(&[]);
-        inv.repos = vec![
-            RepoSignal {
-                path: rust.display().to_string(),
-                marker_files: vec!["Cargo.toml".into()],
-                marker_globs: vec![],
-                package_json_deps: vec![],
-                languages: vec![],
-            },
-            RepoSignal {
-                path: plain.display().to_string(),
-                marker_files: vec![],
-                marker_globs: vec![],
-                package_json_deps: vec![],
-                languages: vec![],
-            },
-        ];
-        let working: Profiles = serde_json::from_str(
-            r#"{"profiles":{"rust":{"plugins":[],"detect":{"marker_files":["Cargo.toml"]}}}}"#,
-        )
-        .unwrap();
-        let got = uncovered_repos(&inv, &working);
-        // the rust repo matches; the plain repo does not.
-        assert_eq!(got.len(), 1);
-        assert!(got[0].ends_with("plain"));
-    }
-
-    #[test]
     fn review_count_sums_all_four() {
         let d = Drift {
             new_unassigned: vec!["a".into()],
@@ -247,5 +152,35 @@ mod tests {
         };
         assert_eq!(d.review_count(), 1);
         assert!(!d.is_clean());
+    }
+
+    fn sig(path: &str, hits: &[(&str, bool)]) -> RepoSignal {
+        RepoSignal {
+            path: path.to_string(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: hits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            override_names: None,
+        }
+    }
+
+    fn sig_no_hits(path: &str) -> RepoSignal {
+        sig(path, &[])
+    }
+
+    #[test]
+    fn uncovered_from_signals_excludes_pending_repos() {
+        let cfg: Profiles = serde_json::from_str(
+            r#"{"universal": [], "profiles": {
+        "rust": {"plugins": [], "detect": {"marker_files": ["Cargo.toml"]}}}}"#,
+        )
+        .unwrap();
+        let hit = |b| sig("/a", &[("file:Cargo.toml", b)]);
+        let unknown = sig_no_hits("/b"); // empty rule_hits → Unknown
+        let (unc, pending) = uncovered_from_signals(&[hit(false), unknown], &cfg);
+        assert_eq!(unc, vec!["/a".to_string()]); // definite no-match
+        assert!(pending); // /b is undecided, not "uncovered"
     }
 }

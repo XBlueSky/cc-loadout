@@ -8,10 +8,11 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use std::path::Path;
 
 use crate::profile::config::{Detect, Profile, Profiles};
 use crate::profile::detect::MatchReason;
+use crate::profile::discover::RepoSignal;
+use crate::profile::signal_detect::{self, ProfileAnswer};
 use crate::tui::profile::rules::{flatten, RuleRow};
 use crate::tui::theme;
 
@@ -19,23 +20,30 @@ use crate::tui::theme;
 pub struct ExplainReport {
     /// Profiles this repo currently matches, with a short "rule → value" string.
     pub matched_profiles: Vec<(String, String)>,
+    /// True when at least one profile in `working` (not necessarily the one
+    /// being edited) has a rule this repo's index can't yet answer — the
+    /// "currently matches" list above may be missing an entry.
+    pub cross_pending: bool,
     /// Whether the profile being edited matches this repo at all.
     pub overall: bool,
     /// Per-rule breakdown for the edited profile: (human label+value, fires?).
     pub this_rules: Vec<(String, bool)>,
+    /// True when the edited profile's OWN rules couldn't be fully answered
+    /// from the index (a referenced atom was never scanned) — `this_rules`
+    /// is not a decisive verdict and must not be rendered as one.
+    pub this_pending: bool,
 }
 
-/// Explain `repo_path` against `working`, with the edited profile's rules taken
+/// Explain `sig` against `working`, with the edited profile's rules taken
 /// from `this_detect` (the live, possibly-unsaved edits) rather than the saved
-/// copy in `working`.
+/// copy in `working`. Zero disk I/O: evaluated purely from the indexed
+/// `RepoSignal` via `signal_detect`.
 pub fn explain_repo(
-    repo_path: &str,
+    sig: &RepoSignal,
     this_name: &str,
     this_detect: &Detect,
     working: &Profiles,
 ) -> ExplainReport {
-    let path = Path::new(repo_path);
-
     // Cross-profile provenance: probe against the full config, but with THIS
     // profile's detect swapped to the live-edited rules so the breakdown matches
     // what the user is editing.
@@ -51,13 +59,7 @@ pub fn explain_repo(
             },
         );
     }
-    let explained = crate::profile::detect::detect_profiles_explained(path, &probe);
-
-    // Extract the MatchReason the engine attributed to this_name (if any).
-    let this_reason: Option<&MatchReason> = explained
-        .iter()
-        .find(|(name, _)| name == this_name)
-        .map(|(_, reason)| reason);
+    let (explained, cross_pending) = signal_detect::detect_from_signal_explained(sig, &probe);
 
     let matched_profiles: Vec<(String, String)> = explained
         .iter()
@@ -71,6 +73,16 @@ pub fn explain_repo(
         })
         .collect();
 
+    // Resolve THIS profile's own answer directly (Match/NoMatch/Unknown) —
+    // more precise than searching `explained`, which can't distinguish "no
+    // match" from "not yet indexed" (an Unknown answer never lands there).
+    let this_answer = signal_detect::profile_answer(sig, &probe.profiles[this_name]);
+    let (this_reason, this_pending) = match this_answer {
+        ProfileAnswer::Match(reason) => (Some(reason), false),
+        ProfileAnswer::NoMatch => (None, false),
+        ProfileAnswer::Unknown => (None, true),
+    };
+
     let overall = this_reason.is_some();
 
     // Per-rule breakdown: a row fires iff the engine attributed the match to
@@ -81,15 +93,19 @@ pub fn explain_repo(
         .into_iter()
         .map(|row| {
             let label = format!("{}  {}", row.label(), row.value());
-            let fires = this_reason.is_some_and(|reason| row_matches_reason(&row, reason));
+            let fires = this_reason
+                .as_ref()
+                .is_some_and(|reason| row_matches_reason(&row, reason));
             (label, fires)
         })
         .collect();
 
     ExplainReport {
         matched_profiles,
+        cross_pending,
         overall,
         this_rules,
+        this_pending,
     }
 }
 
@@ -117,10 +133,18 @@ fn row_matches_reason(row: &RuleRow, reason: &MatchReason) -> bool {
 }
 
 /// Open explain overlay: a repo list + the report for the selected repo.
+///
+/// `repos` is a frozen snapshot taken when the overlay opened — a detached
+/// rescan can replace `inv.repos` wholesale while the overlay stays open
+/// (Task 9's `s` → Esc detach → the scan lands later), so a path in `repos`
+/// is not guaranteed to still have a signal in `inv.repos` by the time the
+/// user navigates to it. `report` is `None` in exactly that case: the caller
+/// couldn't find a signal for the selected path, and `render` must say so
+/// honestly rather than require a report to exist.
 pub struct ExplainState {
     pub repos: Vec<String>,
     pub cursor: usize,
-    pub report: ExplainReport,
+    pub report: Option<ExplainReport>,
 }
 
 /// Render the explain overlay (borderless).
@@ -149,38 +173,78 @@ pub fn render(ex: &ExplainState, f: &mut Frame, area: Rect) {
 
     // ── Report lines (provenance + per-rule breakdown) ────────────────────
     let mut report: Vec<Line<'static>> = Vec::new();
-    if ex.report.matched_profiles.is_empty() {
-        report.push(Line::from(Span::styled(
-            "Matches no profile",
-            theme::faint(),
-        )));
-    } else {
-        report.push(Line::from(Span::styled("Currently matches", theme::dim())));
-        for (name, why) in &ex.report.matched_profiles {
+    match &ex.report {
+        None => {
+            // No signal for the selected path — e.g. a detached rescan
+            // replaced `inv.repos` while this overlay's `repos` snapshot
+            // still names it (the repo was deleted/renamed on disk in the
+            // meantime). Say so honestly; there is no reasoning to show,
+            // not a decisive no-match.
             report.push(Line::from(Span::styled(
-                format!("   {name}   {why}"),
-                theme::text(),
+                "repo no longer indexed — rescan may have removed it",
+                theme::faint(),
             )));
         }
-    }
-    report.push(Line::raw(""));
-    let head = if ex.report.overall {
-        "This profile's rules (matches)"
-    } else {
-        "This profile's rules (no rule fires)"
-    };
-    report.push(Line::from(Span::styled(head.to_string(), theme::dim())));
-    for (label, fires) in &ex.report.this_rules {
-        let mark = if *fires { "●" } else { "╴" };
-        let style = if *fires {
-            theme::accent()
-        } else {
-            theme::faint()
-        };
-        report.push(Line::from(vec![
-            Span::styled(format!("   {mark} "), style),
-            Span::styled(label.clone(), theme::text()),
-        ]));
+        Some(rep) => {
+            if rep.matched_profiles.is_empty() {
+                // An empty list is only a decisive "no profile matches" when
+                // nothing in the config is still pending an index answer —
+                // otherwise a profile that would have matched may simply not
+                // be indexed yet, and saying "no profile" outright would be a
+                // fabricated no-match.
+                if rep.cross_pending {
+                    report.push(Line::from(Span::styled(
+                        "(pending — some rules not yet indexed)",
+                        theme::faint(),
+                    )));
+                } else {
+                    report.push(Line::from(Span::styled(
+                        "Matches no profile",
+                        theme::faint(),
+                    )));
+                }
+            } else {
+                report.push(Line::from(Span::styled("Currently matches", theme::dim())));
+                for (name, why) in &rep.matched_profiles {
+                    report.push(Line::from(Span::styled(
+                        format!("   {name}   {why}"),
+                        theme::text(),
+                    )));
+                }
+            }
+            report.push(Line::raw(""));
+            let head = if rep.overall {
+                "This profile's rules (matches)"
+            } else if rep.this_pending {
+                "This profile's rules (pending — some rules not yet indexed)"
+            } else {
+                "This profile's rules (no rule fires)"
+            };
+            report.push(Line::from(Span::styled(head.to_string(), theme::dim())));
+            if rep.this_pending {
+                // This profile's own answer is Unknown: the disk question
+                // behind at least one row was never indexed, so per-row
+                // fire/no-fire marks would be fabricated. Say so honestly
+                // instead of drawing dashes.
+                report.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled("… pending index", theme::faint()),
+                ]));
+            } else {
+                for (label, fires) in &rep.this_rules {
+                    let mark = if *fires { "●" } else { "╴" };
+                    let style = if *fires {
+                        theme::accent()
+                    } else {
+                        theme::faint()
+                    };
+                    report.push(Line::from(vec![
+                        Span::styled(format!("   {mark} "), style),
+                        Span::styled(label.clone(), theme::text()),
+                    ]));
+                }
+            }
+        }
     }
 
     // Report takes up to half the height (plus a blank separator); the selector
@@ -197,6 +261,22 @@ pub fn render(ex: &ExplainState, f: &mut Frame, area: Rect) {
 mod tests {
     use super::*;
     use crate::profile::config::{Profile, Profiles};
+    use crate::profile::signal_detect::{atom_content, atom_file, atom_glob};
+
+    /// Hand-built signal for a repo that was never touched on disk — every
+    /// test in this module proves the explain path is zero-I/O by using a
+    /// nonexistent path and answering purely from `rule_hits`.
+    fn sig_with(path: &str, hits: &[(&str, bool)]) -> RepoSignal {
+        RepoSignal {
+            path: path.to_string(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: hits.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            override_names: None,
+        }
+    }
 
     fn working_two() -> Profiles {
         let mut p = std::collections::BTreeMap::new();
@@ -215,15 +295,21 @@ mod tests {
 
     #[test]
     fn explain_reports_overall_and_per_rule_for_this_profile() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
-        let path = dir.path().display().to_string();
+        // Fake path, no disk: Cargo.toml is indexed present, *.vue indexed absent.
+        let sig = sig_with(
+            "/does/not/exist/rust-repo",
+            &[
+                (&atom_file("Cargo.toml"), true),
+                (&atom_glob("*.vue"), false),
+            ],
+        );
 
         let working = working_two();
         let this_detect = &working.profiles["rust"].detect;
-        let rep = explain_repo(&path, "rust", this_detect, &working);
+        let rep = explain_repo(&sig, "rust", this_detect, &working);
 
         assert!(rep.overall, "rust matches via Cargo.toml");
+        assert!(!rep.this_pending, "every atom this rule needs is indexed");
         // Cross-profile: rust matches (marker_file Cargo.toml); frontend does NOT.
         assert!(rep.matched_profiles.iter().any(|(n, _)| n == "rust"));
         assert!(!rep.matched_profiles.iter().any(|(n, _)| n == "frontend"));
@@ -244,12 +330,20 @@ mod tests {
 
     #[test]
     fn explain_overall_false_when_nothing_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().display().to_string();
+        // Both atoms are indexed and decisively absent — a real no-match,
+        // not an unindexed one.
+        let sig = sig_with(
+            "/does/not/exist/empty-repo",
+            &[
+                (&atom_file("Cargo.toml"), false),
+                (&atom_glob("*.vue"), false),
+            ],
+        );
         let working = working_two();
         let this_detect = &working.profiles["rust"].detect;
-        let rep = explain_repo(&path, "rust", this_detect, &working);
+        let rep = explain_repo(&sig, "rust", this_detect, &working);
         assert!(!rep.overall, "empty repo matches no rule");
+        assert!(!rep.this_pending, "both atoms are decisively indexed");
         assert!(rep.this_rules.iter().all(|(_, fires)| !fires));
     }
 
@@ -264,12 +358,16 @@ mod tests {
     /// fix resolves this: no MatchReason is returned for this_name, so no row fires.
     #[test]
     fn explain_does_not_show_gated_marker_as_firing() {
-        use crate::profile::config::{ContentRule, Profile, Profiles};
+        use crate::profile::config::ContentRule;
 
-        let dir = tempfile::tempdir().unwrap();
-        // package.json exists but does NOT contain "react".
-        std::fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
-        let path = dir.path().display().to_string();
+        // package.json is indexed present but does NOT contain "react".
+        let sig = sig_with(
+            "/does/not/exist/fe-repo",
+            &[
+                (&atom_file("package.json"), true),
+                (&atom_content("package.json", "react"), false),
+            ],
+        );
 
         let mut detect = Detect::default();
         detect.marker_files.push("package.json".into());
@@ -291,12 +389,13 @@ mod tests {
             ..Default::default()
         };
 
-        let rep = explain_repo(&path, "fe", &detect, &working);
+        let rep = explain_repo(&sig, "fe", &detect, &working);
 
         assert!(
             !rep.overall,
             "engine must not match: package.json lacks 'react'"
         );
+        assert!(!rep.this_pending, "both referenced atoms are indexed");
         // The HasFile(package.json) row must NOT show as firing.
         let has_file_row = rep
             .this_rules
@@ -306,6 +405,155 @@ mod tests {
         assert!(
             !has_file_row.1,
             "gated marker_file must NOT show as firing (overall=false, no rule attributed)"
+        );
+    }
+
+    /// Task 12 Step 1: explain over a hand-built signal (fake path, zero
+    /// disk) reports provenance straight from the index — `marker_glob` with
+    /// the pattern value, exactly as `detect_from_signal_explained` attributes it.
+    #[test]
+    fn explain_over_signal_reports_marker_glob_provenance_zero_disk() {
+        let sig = sig_with("/does/not/exist/vue-repo", &[(&atom_glob("*.vue"), true)]);
+
+        let mut profiles_map = std::collections::BTreeMap::new();
+        let mut fe = Profile::default();
+        fe.detect.marker_globs.push("*.vue".into());
+        profiles_map.insert("frontend".to_string(), fe);
+        let working = Profiles {
+            profiles: profiles_map,
+            ..Default::default()
+        };
+        let this_detect = &working.profiles["frontend"].detect;
+
+        let rep = explain_repo(&sig, "frontend", this_detect, &working);
+
+        assert!(rep.overall);
+        assert!(!rep.this_pending);
+        let (_, why) = rep
+            .matched_profiles
+            .iter()
+            .find(|(n, _)| n == "frontend")
+            .expect("frontend must be reported as a match");
+        assert!(
+            why.contains("marker_glob"),
+            "rule name in provenance: {why}"
+        );
+        assert!(why.contains("*.vue"), "pattern value in provenance: {why}");
+        let glob_row = rep
+            .this_rules
+            .iter()
+            .find(|(label, _)| label.contains("*.vue"))
+            .expect("*.vue row must exist");
+        assert!(glob_row.1, "*.vue row must show as firing");
+    }
+
+    /// Pending case: the profile's own rule references an atom the index
+    /// never scanned. The report must say so honestly, not fabricate a
+    /// decisive no-match.
+    #[test]
+    fn explain_reports_pending_not_fabricated_no_match_when_atom_unindexed() {
+        // Empty index: the *.tsx atom was never scanned for this repo.
+        let sig = sig_with("/does/not/exist/pending-repo", &[]);
+
+        let mut profiles_map = std::collections::BTreeMap::new();
+        let mut fe = Profile::default();
+        fe.detect.marker_globs.push("*.tsx".into());
+        profiles_map.insert("frontend".to_string(), fe);
+        let working = Profiles {
+            profiles: profiles_map,
+            ..Default::default()
+        };
+        let this_detect = &working.profiles["frontend"].detect;
+
+        let rep = explain_repo(&sig, "frontend", this_detect, &working);
+
+        assert!(!rep.overall, "an unindexed atom is not a decisive match");
+        assert!(
+            rep.this_pending,
+            "unindexed atom must mark this profile pending, not resolved"
+        );
+        assert!(
+            rep.cross_pending,
+            "the only profile in the config is pending, so the cross-profile list is too"
+        );
+    }
+
+    #[test]
+    fn render_pending_shows_honest_line_not_fabricated_no_match() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let sig = sig_with("/does/not/exist/pending-repo", &[]);
+        let mut profiles_map = std::collections::BTreeMap::new();
+        let mut fe = Profile::default();
+        fe.detect.marker_globs.push("*.tsx".into());
+        profiles_map.insert("frontend".to_string(), fe);
+        let working = Profiles {
+            profiles: profiles_map,
+            ..Default::default()
+        };
+        let this_detect = working.profiles["frontend"].detect.clone();
+        let report = explain_repo(&sig, "frontend", &this_detect, &working);
+        let ex = ExplainState {
+            repos: vec![sig.path.clone()],
+            cursor: 0,
+            report: Some(report),
+        };
+
+        let mut t = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        t.draw(|f| render(&ex, f, f.area())).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            text.contains("pending"),
+            "overlay must announce the pending index honestly: {text}"
+        );
+        assert!(
+            !text.contains("Matches no profile"),
+            "must not fabricate a decisive no-match: {text}"
+        );
+        assert!(
+            !text.contains("no rule fires"),
+            "must not fabricate a decisive no-fire verdict: {text}"
+        );
+    }
+
+    /// Fix round 1 (Critical): a repo can vanish from `inv.repos` out from
+    /// under an open explain overlay (a detached rescan lands on a frozen
+    /// `ExplainState.repos` snapshot — see detail.rs's regression test for
+    /// the full traced sequence). `render` must accept a missing report and
+    /// say so honestly, by construction, rather than requiring the caller to
+    /// have a report at all.
+    #[test]
+    fn render_shows_honest_message_when_report_missing_zero_disk() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let ex = ExplainState {
+            repos: vec!["/does/not/exist/vanished".into()],
+            cursor: 0,
+            report: None,
+        };
+
+        let mut t = Terminal::new(TestBackend::new(90, 20)).unwrap();
+        t.draw(|f| render(&ex, f, f.area())).unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            text.contains("no longer indexed"),
+            "must render an honest message instead of requiring a report: {text}"
         );
     }
 }

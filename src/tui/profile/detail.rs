@@ -142,21 +142,21 @@ impl DetailState {
                             KeyCode::Esc => self.explain = None,
                             KeyCode::Down | KeyCode::Char('j') if n > 0 => {
                                 ex.cursor = (ex.cursor + 1) % n;
-                                let path = ex.repos[ex.cursor].clone();
-                                ex.report = crate::tui::profile::explain::explain_repo(
-                                    &path,
+                                ex.report = explain_report_for(
+                                    &ex.repos[ex.cursor],
                                     &self.name,
                                     &self.rules.detect,
+                                    inv,
                                     working,
                                 );
                             }
                             KeyCode::Up | KeyCode::Char('k') if n > 0 => {
                                 ex.cursor = (ex.cursor + n - 1) % n;
-                                let path = ex.repos[ex.cursor].clone();
-                                ex.report = crate::tui::profile::explain::explain_repo(
-                                    &path,
+                                ex.report = explain_report_for(
+                                    &ex.repos[ex.cursor],
                                     &self.name,
                                     &self.rules.detect,
+                                    inv,
                                     working,
                                 );
                             }
@@ -190,25 +190,22 @@ impl DetailState {
                                 // Exclude repos with a .claude/profile override — detect
                                 // rules do not classify them, so the per-rule breakdown
                                 // would be meaningless. Mirrors the filter in
-                                // RulesState::recompute.
+                                // RulesState::recompute / matching_repos: read straight
+                                // off the signal's `override_names`, zero disk I/O.
                                 let repos: Vec<String> = inv
                                     .repos
                                     .iter()
-                                    .filter(|r| {
-                                        !std::path::Path::new(&r.path)
-                                            .join(".claude")
-                                            .join("profile")
-                                            .is_file()
-                                    })
+                                    .filter(|r| r.override_names.is_none())
                                     .map(|r| r.path.clone())
                                     .collect();
                                 if repos.is_empty() {
                                     return false;
                                 }
-                                let report = crate::tui::profile::explain::explain_repo(
+                                let report = explain_report_for(
                                     &repos[0],
                                     &self.name,
                                     &self.rules.detect,
+                                    inv,
                                     working,
                                 );
                                 self.explain = Some(crate::tui::profile::explain::ExplainState {
@@ -259,14 +256,45 @@ impl DetailState {
     }
 }
 
+/// Build an explain report for the repo at `path`, looking its indexed
+/// signal up in `inv.repos`. `ExplainState.repos` is a frozen snapshot taken
+/// when the overlay opened, but `inv.repos` can be wholesale-replaced under
+/// an OPEN overlay by a detached rescan landing (`s` → Esc detaches it,
+/// `apply_scan` later does `self.inv.repos = outcome.repos` with no explain
+/// reset) — an ordinary "repo deleted/renamed on disk" leaves a path in
+/// `repos` with no signal in the fresh `inv.repos`. `None` here, not a
+/// panic: `explain::render` renders an honest "no longer indexed" line for
+/// it. Zero disk I/O either way.
+fn explain_report_for(
+    path: &str,
+    name: &str,
+    detect: &crate::profile::config::Detect,
+    inv: &Inventory,
+    working: &Profiles,
+) -> Option<crate::tui::profile::explain::ExplainReport> {
+    let sig = inv.repos.iter().find(|r| r.path == path)?;
+    Some(crate::tui::profile::explain::explain_repo(
+        sig, name, detect, working,
+    ))
+}
+
 /// Render the Detail sub-view.
 ///
 /// Layout (when not renaming):
 ///   header_lines tall — profile name + tab bar (3 rows)
 ///   body           — the focused tab content
 ///
-/// When renaming, the rename prompt occupies the header area.
-pub fn render(state: &DetailState, _inv: &Inventory, f: &mut Frame, area: Rect) {
+/// When renaming, the rename prompt occupies the header area. `now_ms` /
+/// `scanned_at` are threaded through to the Rules tab's count line, which
+/// tags a fully-answerable count with the scan's age.
+pub fn render(
+    state: &DetailState,
+    _inv: &Inventory,
+    f: &mut Frame,
+    area: Rect,
+    now_ms: i64,
+    scanned_at: Option<i64>,
+) {
     if let Some(ti) = &state.renaming {
         // Rename mode: just the prompt, no tab content.
         let lines: Vec<Line<'static>> = vec![
@@ -311,7 +339,7 @@ pub fn render(state: &DetailState, _inv: &Inventory, f: &mut Frame, area: Rect) 
                 if let Some(ex) = &state.explain {
                     crate::tui::profile::explain::render(ex, f, chunks[1]);
                 } else {
-                    state.rules.render(f, chunks[1]);
+                    state.rules.render(f, chunks[1], scanned_at, now_ms);
                 }
             }
         }
@@ -343,6 +371,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec!["rs".into()],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested_profiles: vec![SuggestedProfile {
                 name: "rust".into(),
@@ -449,15 +479,26 @@ mod tests {
     }
 
     #[test]
-    fn detail_done_after_rule_edit_emits_background_recompute() {
-        // Editing detection rules DOES change uncovered, so done emits a
-        // background RecomputeUncovered (spinner) rather than freezing.
-        let inv = inv_with_cargo_repo("/tmp/none");
+    fn detail_done_after_rule_edit_recomputes_uncovered_synchronously() {
+        // Editing detection rules DOES change uncovered, but the recompute now
+        // runs inline over the indexed signal (zero I/O) instead of dispatching
+        // a background job: `done` emits no Action, and `uncovered` already
+        // reflects the new rule by the time `on_key` returns.
+        let inv = inv_with_cargo_repo("/workspace/svc");
         let working = working_rust_profile(vec![]);
-        let mut view = open_detail_on_rust(inv, working);
+        // `ProfileView::new` no longer walks the disk to seed `uncovered` (that
+        // synchronous per-repo walk is gone) — seed the starting precondition
+        // the same way a real scan-cache reopen would, via `with_uncovered`.
+        let mut view =
+            open_detail_on_rust(inv, working).with_uncovered(vec!["/workspace/svc".to_string()]);
         let (_h, _d, ctx) = test_support::ctx();
         let snap = test_support::snap();
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // open Detail(rust)
+        assert_eq!(
+            view.uncovered_for_test(),
+            &["/workspace/svc".to_string()],
+            "empty detect rules match nothing yet"
+        );
         view.on_key(k(KeyCode::Tab), &ctx, &snap); // focus -> Rules
         view.on_key(k(KeyCode::Char('a')), &ctx, &snap); // open builder (kind pick)
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // choose "path under"
@@ -467,11 +508,12 @@ mod tests {
         view.on_key(k(KeyCode::Enter), &ctx, &snap); // commit rule
         let action = view.on_key(k(KeyCode::Enter), &ctx, &snap); // done
         assert!(
-            matches!(
-                action,
-                Some(crate::tui::view::Action::RecomputeUncovered { .. })
-            ),
-            "a rule change must recompute uncovered on the job thread, got {action:?}"
+            action.is_none(),
+            "the recompute is inline now — no background Action, got {action:?}"
+        );
+        assert!(
+            view.uncovered_for_test().is_empty(),
+            "the new path_prefix rule now matches the repo, coverage updated synchronously"
         );
     }
 
@@ -800,6 +842,75 @@ mod tests {
         assert!(
             state.explain.is_some(),
             "explain overlay must still be open after Tab"
+        );
+    }
+
+    /// Fix round 1 (Critical): traced sequence — `s` (rescan) → Esc detaches
+    /// it (app.rs, full keyboard control returns immediately) → open Detail →
+    /// Rules → `?` opens the explain overlay on a frozen `ExplainState.repos`
+    /// snapshot → the detached rescan completes and `apply_scan` does
+    /// `self.inv.repos = outcome.repos` with no explain reset → the repo the
+    /// overlay is showing was deleted/renamed on disk in the meantime, so it
+    /// is simply absent from the fresh inventory. The next Up/Down in the
+    /// still-open overlay used to `.expect()` a hit in `inv.repos` and panic,
+    /// taking down the whole TUI.
+    ///
+    /// `DetailState::handle_key` takes `inv: &Inventory` fresh on every call
+    /// (never cached) — exactly how `ProfileView` threads a live inventory
+    /// through on each key event, after `apply_scan` mutates `self.inv.repos`
+    /// in place. Passing a DIFFERENT `inv` (repo-less, as a post-rescan
+    /// inventory would be) on the next key event reproduces the traced
+    /// sequence directly, without fabricating job-dispatch/detach scaffolding
+    /// the bug doesn't touch.
+    #[test]
+    fn explain_survives_repo_vanishing_from_inv_after_a_detached_rescan() {
+        let repo_path = "/does/not/exist/vanishing-repo";
+        let inv_before = inv_with_cargo_repo(repo_path);
+        let working = working_rust_profile(vec![]);
+
+        let mut state = DetailState::open("rust", &inv_before, &working);
+        let mut w = working.clone();
+        state.handle_key(k(KeyCode::Tab), &inv_before, &mut w); // focus Rules
+        state.handle_key(k(KeyCode::Char('?')), &inv_before, &mut w); // open explain
+        assert!(state.explain.is_some(), "'?' should open explain overlay");
+        assert!(
+            state.explain.as_ref().unwrap().report.is_some(),
+            "the repo exists in inv_before, so the initial report must resolve"
+        );
+
+        // The detached rescan lands: the repo vanished, so the fresh
+        // inventory `apply_scan` would install no longer carries its signal.
+        let mut inv_after = inv_before.clone();
+        inv_after.repos.clear();
+
+        // Must not panic.
+        state.handle_key(k(KeyCode::Down), &inv_after, &mut w);
+
+        assert!(
+            state.explain.is_some(),
+            "overlay must remain open, not crash the TUI"
+        );
+        assert!(
+            state.explain.as_ref().unwrap().report.is_none(),
+            "the vanished repo's signal is gone -> no report, not a panic"
+        );
+
+        // Render must produce the honest message, not crash.
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).unwrap();
+        t.draw(|f| {
+            crate::tui::profile::explain::render(state.explain.as_ref().unwrap(), f, f.area())
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("no longer indexed"),
+            "overlay must render the honest miss message: {text}"
         );
     }
 
