@@ -1,5 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use time::OffsetDateTime;
 
@@ -7,6 +9,7 @@ use crate::profile::config::Profiles;
 use crate::profile::discover::Inventory;
 use crate::tui::ctx::AppCtx;
 use crate::tui::snapshot::Snapshot;
+use crate::tui::theme;
 use crate::tui::view::{Action, View};
 
 mod apply;
@@ -102,6 +105,11 @@ pub struct ProfileView {
     /// The atom batch of the currently in-flight `Action::IndexAtoms` job (or
     /// about to be dispatched), for the scan bar / count-line "indexing …" text.
     pub(super) indexing_atoms: Vec<String>,
+    /// Whether a background rebuild of a stale-version scan cache (Task 10) is
+    /// currently in flight. While true, the board/by-plugin body renders a dim
+    /// banner above itself. Cleared by `accept_scan` (a completed scan IS the
+    /// rebuild) or `accept_rebuild_failed` (the worker died first).
+    pub(super) index_rebuilding: bool,
 }
 
 impl ProfileView {
@@ -134,6 +142,7 @@ impl ProfileView {
             index_queue: Vec::new(),
             indexing: false,
             indexing_atoms: Vec::new(),
+            index_rebuilding: false,
         };
         v.recompute_uncovered();
         v.saved_uncovered = v.uncovered.clone();
@@ -186,6 +195,14 @@ impl ProfileView {
     /// renders the pending cue over the empty seeded set.
     pub(crate) fn with_uncovered_pending(mut self, pending: bool) -> Self {
         self.uncovered_pending = pending;
+        self
+    }
+
+    /// Mark that a background rebuild of a stale-version scan cache (Task 10)
+    /// is in flight — the board/by-plugin body renders a dim banner above
+    /// itself until `accept_scan` or `accept_rebuild_failed` clears it.
+    pub(crate) fn with_index_rebuilding(mut self, rebuilding: bool) -> Self {
+        self.index_rebuilding = rebuilding;
         self
     }
 
@@ -336,6 +353,13 @@ impl ProfileView {
         self.uncovered_pending
     }
 
+    /// Test-visible accessor for whether a background scan-cache rebuild
+    /// (Task 10) is currently in flight.
+    #[cfg(test)]
+    pub fn index_rebuilding_for_test(&self) -> bool {
+        self.index_rebuilding
+    }
+
     /// Test-visible accessor for Apply state (returns None if not in Apply).
     #[cfg(test)]
     pub fn apply_state_for_test(&self) -> Option<&apply::ApplyState> {
@@ -363,6 +387,27 @@ impl ProfileView {
     #[cfg(test)]
     pub fn pick_for_test(&self) -> Option<&by_plugin::MembershipPick> {
         self.pick.as_ref()
+    }
+
+    /// When a background scan-cache rebuild (Task 10: migrating a
+    /// stale-version cache to the atom index) is in flight, render a
+    /// one-line dim banner at the top of `area` and return the remaining
+    /// area for the board/by-plugin body below it — matches this file's
+    /// borderless, inline-text idiom (no boxes). Returns `area` unchanged
+    /// (no banner) otherwise.
+    fn render_rebuild_banner(&self, f: &mut Frame, area: Rect) -> Rect {
+        if !self.index_rebuilding {
+            return area;
+        }
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "index outdated \u{2014} rebuilding in background\u{2026}",
+                theme::dim(),
+            ))),
+            chunks[0],
+        );
+        chunks[1]
     }
 }
 
@@ -1033,14 +1078,16 @@ impl View for ProfileView {
                     } else if let Some(pick) = &self.pick {
                         by_plugin::render_picker(pick, f, area);
                     } else {
-                        by_plugin::render(self, f, area, now_ms);
+                        let body = self.render_rebuild_banner(f, area);
+                        by_plugin::render(self, f, body, now_ms);
                     }
                 }
                 ViewMode::ByProfile => {
                     if self.on_demand_help {
                         on_demand_help::render(f, area);
                     } else {
-                        board::render(self, snap, f, area)
+                        let body = self.render_rebuild_banner(f, area);
+                        board::render(self, snap, f, body)
                     }
                 }
             },
@@ -1068,6 +1115,10 @@ impl View for ProfileView {
     fn accept_scan(&mut self, outcome: crate::tui::job::ScanOutcome) {
         self.scanned_at = Some(outcome.scanned_at);
         self.apply_scan(outcome);
+        // A completed scan IS the rebuild (Task 10) — whichever detached job
+        // produced it (an explicit 's' or App::new's startup rebuild), the
+        // cache is now current, so the "index outdated" banner clears too.
+        self.index_rebuilding = false;
     }
 
     fn accept_uncovered(&mut self, uncovered: Vec<String>) {
@@ -1128,6 +1179,20 @@ impl View for ProfileView {
         if let Sub::Detail(state) = &mut self.sub {
             state.rules.indexing = false;
         }
+    }
+
+    fn accept_rebuild_failed(&mut self) {
+        // The background rebuild worker died before producing a ScanOutcome
+        // (e.g. it panicked). The cache is still stale (no rule_hits) and
+        // startup can't cheaply retry the walk itself — clear the banner (it
+        // would otherwise never clear) and fall back to the same "unknown,
+        // press s to index" pending UX a stale cache got before Task 10,
+        // regardless of whether the seeded uncovered value happened to be
+        // concrete (the version<current + uncovered:Some case starts with
+        // pending == false) — a dead rebuild means the index is genuinely
+        // unreliable either way.
+        self.index_rebuilding = false;
+        self.uncovered_pending = true;
     }
 
     fn dirty_config(&mut self) -> Option<Profiles> {
@@ -2536,6 +2601,192 @@ mod tests {
         assert!(
             !v.uncovered_pending_for_test(),
             "a full rescan is decisive — the pending flag must clear"
+        );
+    }
+
+    // ── Task 10: v1 scan-cache migration (banner + background rebuild) ──────
+
+    #[test]
+    fn accept_scan_clears_the_rebuild_banner_along_with_uncovered_pending() {
+        // A completed scan IS the rebuild — whichever detached job produced
+        // it (an explicit 's' or App::new's startup rebuild), landing it must
+        // clear BOTH the "index outdated — rebuilding…" banner and any
+        // pending-seed left over from a cache that had `uncovered: None`.
+        use crate::profile::discover::RepoSignal;
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_index_rebuilding(true)
+            .with_uncovered_pending(true);
+        assert!(v.index_rebuilding_for_test(), "seeded rebuilding");
+        assert!(v.uncovered_pending_for_test(), "seeded pending");
+        let outcome = crate::tui::job::ScanOutcome {
+            roots: vec!["/x".into()],
+            repos: vec![RepoSignal {
+                path: "/x/a".into(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
+            }],
+            suggested: vec![],
+            uncovered: vec![],
+            scanned_at: 0,
+            budget_hits: 0,
+        };
+        v.accept_scan(outcome);
+        assert!(
+            !v.index_rebuilding_for_test(),
+            "a completed scan must clear the rebuild banner"
+        );
+        assert!(
+            !v.uncovered_pending_for_test(),
+            "a completed scan is decisive — pending must clear too"
+        );
+    }
+
+    #[test]
+    fn accept_rebuild_failed_clears_the_banner_and_falls_back_to_the_pending_ux() {
+        // The rebuild worker died before producing a ScanOutcome (e.g. it
+        // panicked). The cache is still stale (no rule_hits) and startup
+        // can't cheaply retry the walk itself — clear the banner (it would
+        // otherwise never clear) and fall back to the same "unknown, press s
+        // to index" pending UX a stale cache got before Task 10, regardless
+        // of whether the seeded uncovered value happened to be concrete
+        // (the version<2 + uncovered:Some case starts with pending == false).
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_index_rebuilding(true)
+            .with_uncovered(vec!["/x/a".into()]); // concrete, not pending, at seed time
+        assert!(v.index_rebuilding_for_test(), "seeded rebuilding");
+        assert!(
+            !v.uncovered_pending_for_test(),
+            "seeded with a concrete uncovered value, not pending"
+        );
+        v.accept_rebuild_failed();
+        assert!(
+            !v.index_rebuilding_for_test(),
+            "a dead rebuild worker must clear the banner"
+        );
+        assert!(
+            v.uncovered_pending_for_test(),
+            "a dead rebuild must fall back to the pending UX — the cache is still stale"
+        );
+    }
+
+    #[test]
+    fn by_plugin_render_shows_the_rebuild_banner_above_the_body() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let v =
+            ProfileView::new(inv, Profiles::default(), false, false).with_index_rebuilding(true);
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            v.render(f, area, &snap, 0, now);
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("rebuilding in background"),
+            "the by-plugin body must show the rebuild banner: {text}"
+        );
+        assert!(
+            text.contains("All plugins"),
+            "the banner must sit above the body, not replace it: {text}"
+        );
+    }
+
+    #[test]
+    fn by_profile_board_render_shows_the_rebuild_banner_above_the_body() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v =
+            ProfileView::new(inv, Profiles::default(), false, false).with_index_rebuilding(true);
+        v.switch_to_by_profile_for_test();
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            v.render(f, area, &snap, 0, now);
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("rebuilding in background"),
+            "the by-profile board must show the rebuild banner: {text}"
+        );
+        assert!(
+            text.contains("Universal"),
+            "the banner must sit above the body, not replace it: {text}"
+        );
+    }
+
+    #[test]
+    fn render_omits_the_rebuild_banner_when_not_rebuilding() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let v = ProfileView::new(inv, Profiles::default(), false, false); // index_rebuilding defaults false
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            v.render(f, area, &snap, 0, now);
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !text.contains("rebuilding in background"),
+            "no banner when no rebuild is in flight: {text}"
         );
     }
 

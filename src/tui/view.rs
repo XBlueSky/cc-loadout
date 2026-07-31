@@ -87,9 +87,10 @@ pub trait View {
     fn accept_scan(&mut self, _outcome: crate::tui::job::ScanOutcome) {}
     /// Receive a recomputed uncovered-repos set delivered via the shared
     /// `JobResult.uncovered` slot. Currently unused forward scaffolding: no
-    /// producer sets that field today — `Rescan`'s uncovered set flows through
+    /// producer sets that field today — `Rescan`'s uncovered set, and the
+    /// Task 10 startup rebuild's (both share `rescan_job`), flow through
     /// `ScanOutcome.uncovered` → `accept_scan` instead. Kept for a future
-    /// off-thread producer (e.g. Task 10's v1-cache migration rebuild).
+    /// off-thread producer that isn't a full rescan.
     /// Default: ignore (only the Profile view consumes it).
     fn accept_uncovered(&mut self, _uncovered: Vec<String>) {}
     /// Receive a completed background atom-index (from `Action::IndexAtoms`).
@@ -100,6 +101,14 @@ pub trait View {
     /// per-job liveness state so a future `IndexAtoms` dispatch is never
     /// wedged behind it. Default: ignore (only the Profile view consumes it).
     fn accept_index_failed(&mut self) {}
+    /// The background startup rebuild (Task 10: migrating a stale-version scan
+    /// cache to the atom index) died without producing a `ScanOutcome` (e.g.
+    /// its worker thread panicked). Clear the "index outdated — rebuilding…"
+    /// banner so it doesn't stay up forever, and fall back to the pending UX —
+    /// the cache is still stale and startup can't cheaply retry the walk
+    /// itself; the next explicit `s` rescan (not gated by this flag) is the
+    /// way out. Default: ignore (only the Profile view consumes it).
+    fn accept_rebuild_failed(&mut self) {}
     /// Return the working config to persist when it has unsaved edits, marking it
     /// clean. Default: `None` (only the Profile view holds a persistent config).
     /// `App` calls this after every key and job result; `Some(cfg)` triggers an

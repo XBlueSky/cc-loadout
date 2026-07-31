@@ -75,6 +75,12 @@ pub enum DetachedKind {
     Generic,
     /// An `Action::IndexAtoms` job — `accept_index_failed` must run on death.
     IndexAtoms,
+    /// A startup rebuild of a stale-version scan cache (Task 10's
+    /// `App::new` `needs_rebuild` branch) — `accept_rebuild_failed` must run
+    /// on death so the "index outdated — rebuilding…" banner doesn't stay up
+    /// forever. Mirrors `IndexAtoms`: a silent `Generic` drop would leave the
+    /// user staring at a banner for a rebuild that will never land.
+    Rebuild,
 }
 
 /// A receiver held in `App::detached`, tagged with `kind` so `drain_jobs`
