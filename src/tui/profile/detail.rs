@@ -257,21 +257,25 @@ impl DetailState {
 }
 
 /// Build an explain report for the repo at `path`, looking its indexed
-/// signal up in `inv.repos` — the explain overlay's repo list is itself
-/// derived from `inv.repos`, so the signal is always present. Zero disk I/O.
+/// signal up in `inv.repos`. `ExplainState.repos` is a frozen snapshot taken
+/// when the overlay opened, but `inv.repos` can be wholesale-replaced under
+/// an OPEN overlay by a detached rescan landing (`s` → Esc detaches it,
+/// `apply_scan` later does `self.inv.repos = outcome.repos` with no explain
+/// reset) — an ordinary "repo deleted/renamed on disk" leaves a path in
+/// `repos` with no signal in the fresh `inv.repos`. `None` here, not a
+/// panic: `explain::render` renders an honest "no longer indexed" line for
+/// it. Zero disk I/O either way.
 fn explain_report_for(
     path: &str,
     name: &str,
     detect: &crate::profile::config::Detect,
     inv: &Inventory,
     working: &Profiles,
-) -> crate::tui::profile::explain::ExplainReport {
-    let sig = inv
-        .repos
-        .iter()
-        .find(|r| r.path == path)
-        .expect("explain repo list is built from inv.repos");
-    crate::tui::profile::explain::explain_repo(sig, name, detect, working)
+) -> Option<crate::tui::profile::explain::ExplainReport> {
+    let sig = inv.repos.iter().find(|r| r.path == path)?;
+    Some(crate::tui::profile::explain::explain_repo(
+        sig, name, detect, working,
+    ))
 }
 
 /// Render the Detail sub-view.
@@ -834,6 +838,75 @@ mod tests {
         assert!(
             state.explain.is_some(),
             "explain overlay must still be open after Tab"
+        );
+    }
+
+    /// Fix round 1 (Critical): traced sequence — `s` (rescan) → Esc detaches
+    /// it (app.rs, full keyboard control returns immediately) → open Detail →
+    /// Rules → `?` opens the explain overlay on a frozen `ExplainState.repos`
+    /// snapshot → the detached rescan completes and `apply_scan` does
+    /// `self.inv.repos = outcome.repos` with no explain reset → the repo the
+    /// overlay is showing was deleted/renamed on disk in the meantime, so it
+    /// is simply absent from the fresh inventory. The next Up/Down in the
+    /// still-open overlay used to `.expect()` a hit in `inv.repos` and panic,
+    /// taking down the whole TUI.
+    ///
+    /// `DetailState::handle_key` takes `inv: &Inventory` fresh on every call
+    /// (never cached) — exactly how `ProfileView` threads a live inventory
+    /// through on each key event, after `apply_scan` mutates `self.inv.repos`
+    /// in place. Passing a DIFFERENT `inv` (repo-less, as a post-rescan
+    /// inventory would be) on the next key event reproduces the traced
+    /// sequence directly, without fabricating job-dispatch/detach scaffolding
+    /// the bug doesn't touch.
+    #[test]
+    fn explain_survives_repo_vanishing_from_inv_after_a_detached_rescan() {
+        let repo_path = "/does/not/exist/vanishing-repo";
+        let inv_before = inv_with_cargo_repo(repo_path);
+        let working = working_rust_profile(vec![]);
+
+        let mut state = DetailState::open("rust", &inv_before, &working);
+        let mut w = working.clone();
+        state.handle_key(k(KeyCode::Tab), &inv_before, &mut w); // focus Rules
+        state.handle_key(k(KeyCode::Char('?')), &inv_before, &mut w); // open explain
+        assert!(state.explain.is_some(), "'?' should open explain overlay");
+        assert!(
+            state.explain.as_ref().unwrap().report.is_some(),
+            "the repo exists in inv_before, so the initial report must resolve"
+        );
+
+        // The detached rescan lands: the repo vanished, so the fresh
+        // inventory `apply_scan` would install no longer carries its signal.
+        let mut inv_after = inv_before.clone();
+        inv_after.repos.clear();
+
+        // Must not panic.
+        state.handle_key(k(KeyCode::Down), &inv_after, &mut w);
+
+        assert!(
+            state.explain.is_some(),
+            "overlay must remain open, not crash the TUI"
+        );
+        assert!(
+            state.explain.as_ref().unwrap().report.is_none(),
+            "the vanished repo's signal is gone -> no report, not a panic"
+        );
+
+        // Render must produce the honest message, not crash.
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 20)).unwrap();
+        t.draw(|f| {
+            crate::tui::profile::explain::render(state.explain.as_ref().unwrap(), f, f.area())
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("no longer indexed"),
+            "overlay must render the honest miss message: {text}"
         );
     }
 
