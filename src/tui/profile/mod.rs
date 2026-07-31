@@ -1135,23 +1135,36 @@ impl View for ProfileView {
                 }
             }
         }
-        // An atom re-queued while THIS batch was still in flight (the
-        // delete-then-recommit case) is now redundant — this delivery already
-        // answered it. Drop it so the next `on_key` doesn't dispatch a
-        // pointless follow-up for an atom that's already indexed.
-        self.index_queue.retain(|a| !o.atoms.contains(a));
-        self.indexing = false;
-        self.indexing_atoms.clear();
-        if let Sub::Detail(state) = &mut self.sub {
-            state.rules.indexing = false;
-            // Refresh the cached match/near-miss preview + pending-atom set
-            // against the now-merged index, so the count line reflects the
-            // just-answered atom immediately rather than on the next edit.
-            state.rules.recompute(&self.inv);
+        // An empty `atoms` list marks this outcome as a repo-signal refresh
+        // that isn't the completion of a real IndexAtoms batch — e.g. Task
+        // 11's post-commit cache/index sync, which re-answers atoms a repo
+        // ALREADY has (nothing new was "indexed"). `Action::Commit` runs
+        // through the modal `self.job` slot while `Action::IndexAtoms` runs
+        // detached, so a real batch CAN genuinely still be in flight when a
+        // commit's refresh lands. Skip the job-bookkeeping below in that
+        // case — clearing it here would falsely tell the UI (and a future
+        // dispatch's `!self.indexing` guard) that the real batch finished.
+        if !o.atoms.is_empty() {
+            // An atom re-queued while THIS batch was still in flight (the
+            // delete-then-recommit case) is now redundant — this delivery
+            // already answered it. Drop it so the next `on_key` doesn't
+            // dispatch a pointless follow-up for an atom that's already
+            // indexed.
+            self.index_queue.retain(|a| !o.atoms.contains(a));
+            self.indexing = false;
+            self.indexing_atoms.clear();
+            if let Sub::Detail(state) = &mut self.sub {
+                state.rules.indexing = false;
+                // Refresh the cached match/near-miss preview + pending-atom
+                // set against the now-merged index, so the count line
+                // reflects the just-answered atom immediately rather than on
+                // the next edit.
+                state.rules.recompute(&self.inv);
+            }
         }
         // Detection didn't change (no rule was added/removed), but the index
         // backing it did — recompute uncovered the same zero-I/O way as any
-        // other signal update.
+        // other signal update. Always runs, even for an empty-atoms refresh.
         let (unc, pending) =
             crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
         if !pending {
@@ -3191,6 +3204,194 @@ mod tests {
             ),
             _ => panic!("expected Sub::Detail"),
         }
+    }
+
+    /// Task 11 fix round 1: `Action::Commit` runs through the modal `self.job`
+    /// slot while `Action::IndexAtoms` runs detached — the two CAN be in
+    /// flight at the same time. Commit's post-write cache/index refresh is
+    /// delivered through the SAME `accept_index` path as a real IndexAtoms
+    /// batch, tagged with an empty `atoms` list (nothing was "indexed", a
+    /// repo's already-known atoms were just re-answered). That empty-atoms
+    /// delivery must merge its `hits` but MUST NOT clear the bookkeeping for
+    /// a genuinely still-running IndexAtoms batch, or the UI would falsely
+    /// think that unrelated batch finished (unwedging the `!indexing` guard
+    /// early, and forgetting which atoms/Detail state it's still waiting on).
+    #[test]
+    fn accept_index_with_empty_atoms_never_clobbers_an_unrelated_in_flight_batch() {
+        use crate::profile::discover::RepoSignal;
+
+        let repo = RepoSignal {
+            path: "/does/not/exist/refresh".into(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
+        };
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![repo],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
+        // A REAL IndexAtoms batch is genuinely in flight for a DIFFERENT atom.
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string()];
+        v.index_queue = vec!["glob:*.tsx".to_string()];
+        if let Sub::Detail(state) = &mut v.sub {
+            state.rules.indexing = true;
+        }
+
+        // A concurrent Commit's post-write refresh lands: empty `atoms`,
+        // carrying only the freshly re-detected rule_hits for the repo it
+        // just wrote.
+        let mut hits = std::collections::BTreeMap::new();
+        hits.insert(
+            "/does/not/exist/refresh".to_string(),
+            [("file:Cargo.toml".to_string(), true)]
+                .into_iter()
+                .collect(),
+        );
+        v.accept_index(crate::tui::job::IndexOutcome {
+            atoms: vec![],
+            hits,
+        });
+
+        assert!(
+            v.indexing,
+            "an empty-atoms refresh must not clear a genuinely in-flight IndexAtoms batch"
+        );
+        assert_eq!(
+            v.indexing_atoms,
+            vec!["glob:*.tsx".to_string()],
+            "the real batch's tracked atoms must survive untouched"
+        );
+        assert_eq!(
+            v.index_queue,
+            vec!["glob:*.tsx".to_string()],
+            "the real batch's queue must survive untouched"
+        );
+        match &v.sub {
+            Sub::Detail(state) => assert!(
+                state.rules.indexing,
+                "the open Detail's RulesState.indexing must survive too"
+            ),
+            _ => panic!("expected Sub::Detail"),
+        }
+        // The merge itself must still have happened.
+        assert_eq!(
+            v.inv.repos[0].rule_hits.get("file:Cargo.toml"),
+            Some(&true),
+            "the empty-atoms outcome must still merge its rule_hits"
+        );
+    }
+
+    /// Task 11 fix round 1's required regression: after a commit, reopening
+    /// Apply must show the FRESH matched set — no restart, no explicit
+    /// rescan. `commit()` (the real function, real tempdir/disk) recomputes
+    /// the written repo's signal; this feeds `accept_index` the same shape
+    /// `App::drain_jobs` will (empty atoms, path -> rule_hits), then Apply is
+    /// reopened straight off `v.inv.repos` to prove the merge landed.
+    #[test]
+    fn commit_refresh_via_accept_index_is_visible_when_apply_reopens_without_rescan() {
+        use crate::profile::config::{Detect, Profile};
+        use crate::profile::discover::RepoSignal;
+
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = home.path().join("app");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("Cargo.toml"), "[package]").unwrap();
+        let canon = std::fs::canonicalize(&repo_dir).unwrap();
+        let repo_path = canon.display().to_string();
+
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "rust".to_string(),
+            Profile {
+                plugins: vec!["ra@x".to_string()],
+                detect: Detect {
+                    marker_files: vec!["Cargo.toml".to_string()],
+                    ..Default::default()
+                },
+            },
+        );
+        let working = Profiles {
+            profiles,
+            ..Default::default()
+        };
+
+        // The in-memory inventory's cached signal is STALE — the preview
+        // would have shown "no match" (as if scanned before Cargo.toml
+        // existed).
+        let stale_repo = RepoSignal {
+            path: repo_path.clone(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: [("file:Cargo.toml".to_string(), false)]
+                .into_iter()
+                .collect(),
+            override_names: None,
+        };
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![stale_repo],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, working.clone(), false, false);
+
+        // Reopening Apply now (before any refresh) shows the stale no-match.
+        let (_home2, _data2, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Char('w')), &c, &s);
+        assert!(
+            v.apply_state_for_test().unwrap().rows[0].matched.is_empty(),
+            "sanity: preview must start stale (no match)"
+        );
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s);
+
+        // Real commit() writes the repo and recomputes its signal fresh.
+        let cfg_path = home.path().join("profiles.json");
+        let settings_path = home.path().join("settings.json");
+        let rep = crate::profile::commit::commit(
+            &cfg_path,
+            &settings_path,
+            home.path(),
+            &working,
+            std::slice::from_ref(&canon),
+            &[(canon.clone(), vec![])],
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            rep.diverged, 1,
+            "sanity: fresh write-time detect did diverge"
+        );
+
+        // Exactly what App::drain_jobs would build from CommitReport.fresh_signals.
+        let hits: std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>> =
+            rep.fresh_signals
+                .iter()
+                .map(|sig| (sig.path.clone(), sig.rule_hits.clone()))
+                .collect();
+        v.accept_index(crate::tui::job::IndexOutcome {
+            atoms: vec![],
+            hits,
+        });
+
+        // Reopening Apply now — no rescan, no restart — must show the FRESH
+        // matched set.
+        v.on_key(KeyEvent::from(KeyCode::Char('w')), &c, &s);
+        let state = v.apply_state_for_test().unwrap();
+        assert_eq!(
+            state.rows[0].matched,
+            vec!["rust".to_string()],
+            "reopening Apply after a commit must reflect fresh truth, not the stale preview"
+        );
     }
 
     /// The IndexAtoms worker died (e.g. panicked) before producing an

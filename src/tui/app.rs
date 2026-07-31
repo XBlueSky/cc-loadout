@@ -628,13 +628,42 @@ impl App {
                                     r.diverged
                                 ));
                             }
+                            // Fold the freshly re-detected repos back into the
+                            // in-memory inventory via the same accept_index
+                            // path IndexAtoms uses, tagged with an EMPTY atoms
+                            // list — this is a repo-signal refresh, not the
+                            // completion of a real atom-indexing batch (see
+                            // accept_index's own doc comment on why that
+                            // distinction matters: an IndexAtoms job can be
+                            // genuinely in flight at the same time, since
+                            // Commit uses the modal job slot and IndexAtoms
+                            // runs detached). Without this, reopening Apply
+                            // right after a commit would show the stale
+                            // pre-commit preview until the next explicit
+                            // rescan.
+                            let index = if r.fresh_signals.is_empty() {
+                                None
+                            } else {
+                                let hits: std::collections::BTreeMap<
+                                    String,
+                                    std::collections::BTreeMap<String, bool>,
+                                > = r
+                                    .fresh_signals
+                                    .iter()
+                                    .map(|sig| (sig.path.clone(), sig.rule_hits.clone()))
+                                    .collect();
+                                Some(crate::tui::job::IndexOutcome {
+                                    atoms: vec![],
+                                    hits,
+                                })
+                            };
                             crate::tui::job::JobResult {
                                 toast,
                                 needs_refresh: true,
                                 draft: None,
                                 scan: None,
                                 uncovered: None,
-                                index: None,
+                                index,
                             }
                         }
                         Err(e) => crate::tui::job::JobResult {
