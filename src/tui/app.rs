@@ -29,9 +29,12 @@ pub struct App {
     toast_at_ms: Option<i64>,
     pub frame: u64,
     pub job: Option<crate::tui::job::Job>,
-    /// Receivers for jobs that were detached via Esc. Their results are still
-    /// delivered when the worker finishes.
-    pub(crate) detached: Vec<std::sync::mpsc::Receiver<crate::tui::job::JobResult>>,
+    /// Receivers for jobs that were detached via Esc, or that always run
+    /// detached (e.g. `Action::IndexAtoms`). Their results are still
+    /// delivered when the worker finishes; each entry is tagged with its
+    /// `DetachedKind` so `drain_jobs` knows what to recover if the worker
+    /// dies without sending a result.
+    pub(crate) detached: Vec<crate::tui::job::Detached>,
     ctx: AppCtx,
     snap: Snapshot,
 }
@@ -279,19 +282,24 @@ impl App {
             }
             ActivePoll::Pending => {}
         }
-        // detached receivers: deliver their result (or drop on disconnect), keep pending.
+        // detached receivers: deliver their result (or recover on disconnect), keep pending.
         // Collect into local vecs first so we don't hold a mutable borrow on
         // self.detached while calling self.set_toast later.
-        let mut still_pending: Vec<std::sync::mpsc::Receiver<crate::tui::job::JobResult>> =
-            Vec::new();
+        let mut still_pending: Vec<crate::tui::job::Detached> = Vec::new();
         let mut completed_toasts: Vec<String> = Vec::new();
         let mut completed_drafts: Vec<crate::profile::config::Profiles> = Vec::new();
         let mut completed_scans: Vec<crate::tui::job::ScanOutcome> = Vec::new();
         let mut completed_uncovered: Vec<Vec<String>> = Vec::new();
         let mut completed_index: Vec<crate::tui::job::IndexOutcome> = Vec::new();
+        // An IndexAtoms worker that disconnected without sending a result
+        // (e.g. it panicked) — recovery is routed after the loop, once the
+        // borrow on self.detached is released. Most detached jobs (Generic)
+        // have no per-job view state to recover, so a disconnect there is
+        // still silently dropped, same as before this fix.
+        let mut index_job_died = false;
         let mut refresh_needed = false;
-        for rx in self.detached.drain(..) {
-            match rx.try_recv() {
+        for job in self.detached.drain(..) {
+            match job.rx.try_recv() {
                 Ok(result) => {
                     if result.needs_refresh {
                         refresh_needed = true;
@@ -310,8 +318,13 @@ impl App {
                     }
                     completed_toasts.push(result.toast);
                 }
-                Err(TryRecvError::Disconnected) => {} // worker gone, nothing to show
-                Err(TryRecvError::Empty) => still_pending.push(rx), // keep polling
+                Err(TryRecvError::Disconnected) => {
+                    if job.kind == crate::tui::job::DetachedKind::IndexAtoms {
+                        index_job_died = true;
+                    }
+                    // Generic: worker gone, nothing to show (unchanged).
+                }
+                Err(TryRecvError::Empty) => still_pending.push(job), // keep polling
             }
         }
         self.detached = still_pending;
@@ -329,6 +342,14 @@ impl App {
         }
         for o in completed_index {
             self.tabs[crate::tui::TAB_PROFILE].accept_index(o);
+        }
+        if index_job_died {
+            // Mirrors the modal path's ActivePoll::Aborted → "operation
+            // aborted" toast: a dead worker is a real, user-visible event,
+            // not something to recover silently — even though the flag
+            // itself clears without the user having to do anything.
+            self.tabs[crate::tui::TAB_PROFILE].accept_index_failed();
+            completed_toasts.push("indexing aborted".to_string());
         }
         // Apply the last toast (if multiple completed, only the last is shown).
         for toast in completed_toasts {
@@ -636,7 +657,12 @@ impl App {
                 });
                 // Detached, not modal: the whole point of this feature is that
                 // committing a new rule atom never swallows the keyboard.
-                self.detached.push(job.rx);
+                // Tagged IndexAtoms so drain_jobs can recover the view's
+                // indexing flag if the worker dies without a result.
+                self.detached.push(crate::tui::job::Detached {
+                    kind: crate::tui::job::DetachedKind::IndexAtoms,
+                    rx: job.rx,
+                });
             }
             Action::RunTask(id) => {
                 let store = self.ctx.store.clone();
@@ -788,9 +814,14 @@ impl App {
             match key.code {
                 KeyCode::Esc => {
                     // Move the receiver into detached so the result is still
-                    // delivered when the worker finishes.
+                    // delivered when the worker finishes. Generic: whatever
+                    // Action was in the modal slot, no per-job view state
+                    // depends on it living or dying detached.
                     if let Some(j) = self.job.take() {
-                        self.detached.push(j.rx);
+                        self.detached.push(crate::tui::job::Detached {
+                            kind: crate::tui::job::DetachedKind::Generic,
+                            rx: j.rx,
+                        });
                     }
                 }
                 KeyCode::Char('q') => {
@@ -1421,7 +1452,7 @@ mod tests {
         assert_eq!(app.detached.len(), 1, "must dispatch detached, not modal");
         assert!(app.job.is_none());
 
-        let result = app.detached[0].recv().unwrap();
+        let result = app.detached[0].rx.recv().unwrap();
         assert_eq!(
             result.toast, "indexed file:go.mod \u{b7} 1 repos match",
             "singular toast names the atom and the exact match count"
@@ -1450,10 +1481,113 @@ mod tests {
             repos: vec![repo.display().to_string()],
         })
         .unwrap();
-        let result = app.detached[0].recv().unwrap();
+        let result = app.detached[0].rx.recv().unwrap();
         assert_eq!(
             result.toast, "indexed 2 patterns",
             "a multi-atom batch reports the pattern count, not a per-atom match count"
+        );
+    }
+
+    #[test]
+    fn index_atoms_worker_death_clears_indexing_and_retries_the_batch() {
+        // If the IndexAtoms job thread panics (or otherwise dies) before
+        // sending a JobResult, its `tx` drops and the detached receiver
+        // disconnects. `drain_jobs` must recover ProfileView.indexing (and
+        // the open Detail's rules.indexing) — otherwise every future
+        // IndexAtoms dispatch wedges forever behind the `!self.indexing`
+        // guard, and the scan-bar/count-line "indexing …" text never clears.
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
+        let repo_dir = hdir.path().join("repo1");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let repo_path = std::fs::canonicalize(&repo_dir)
+            .unwrap()
+            .display()
+            .to_string();
+        let root = hdir.path().display().to_string();
+
+        let cfg_json = r#"{"scan_roots":["__ROOT__"],"universal":[],"profiles":{"web":{"plugins":[],"detect":{}}}}"#
+            .replace("__ROOT__", &root);
+        std::fs::write(hdir.path().join("profiles.json"), cfg_json).unwrap();
+        crate::profile::scan_cache::save(
+            ddir.path(),
+            &crate::profile::scan_cache::ScanCache {
+                version: crate::profile::scan_cache::SCAN_CACHE_VERSION,
+                roots: vec![root.clone()],
+                repos: vec![crate::profile::discover::RepoSignal {
+                    path: repo_path.clone(),
+                    marker_files: vec![],
+                    marker_globs: vec![],
+                    package_json_deps: vec![],
+                    languages: vec![],
+                    rule_hits: Default::default(),
+                    override_names: None,
+                }],
+                uncovered: Some(vec![repo_path.clone()]),
+                scanned_at: 1_700_000_000,
+            },
+        )
+        .unwrap();
+
+        let ctx = AppCtx {
+            store: Store::new(ddir.path()),
+            claude: paths::resolve(hdir.path(), None),
+            home: hdir.path().to_path_buf(),
+            data_root: ddir.path().to_path_buf(),
+            cfg_path: hdir.path().join("profiles.json"),
+            registry_path: hdir.path().join("none-registry.json"),
+            cwd: hdir.path().to_path_buf(),
+        };
+        let mut app = App::new(ctx, 3).unwrap();
+
+        app.handle_key(key(KeyCode::Char('v'))).unwrap(); // by-profile board
+        app.handle_key(key(KeyCode::Down)).unwrap(); // Universal -> "web"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // open Detail
+        app.handle_key(key(KeyCode::Tab)).unwrap(); // focus -> Rules
+        app.handle_key(key(KeyCode::Char('a'))).unwrap(); // builder (kind-pick)
+        app.handle_key(key(KeyCode::Down)).unwrap();
+        app.handle_key(key(KeyCode::Down)).unwrap(); // -> "has any"
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // choose "has any"
+        for c in "*.tsx".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap(); // commit -> real IndexAtoms job dispatched
+
+        assert_eq!(app.detached.len(), 1, "the real index job must be detached");
+        assert!(app.job.is_none());
+
+        // Simulate the worker dying before it could send a result: swap the
+        // real job's receiver for one backed by a deliberately panicking
+        // closure, tagged the same IndexAtoms kind a real dispatch would use.
+        app.detached[0] = crate::tui::job::Detached {
+            kind: crate::tui::job::DetachedKind::IndexAtoms,
+            rx: crate::tui::job::spawn("simulated crash", 0, || panic!("simulated worker crash"))
+                .rx,
+        };
+
+        drain_until_settled(&mut app);
+        assert!(
+            app.detached.is_empty(),
+            "a disconnected receiver must not be kept forever"
+        );
+        assert!(
+            app.toast
+                .as_deref()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("index"),
+            "a user-visible signal must appear when the worker dies, got {:?}",
+            app.toast
+        );
+
+        // The flag must not wedge: the very next key press re-dispatches the
+        // SAME batch as a fresh job — proving `indexing` cleared and the
+        // atom was requeued rather than silently dropped.
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+        assert_eq!(
+            app.detached.len(),
+            1,
+            "indexing must not wedge: a new IndexAtoms batch must dispatch after the worker dies"
         );
     }
 

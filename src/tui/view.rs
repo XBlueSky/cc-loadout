@@ -95,6 +95,11 @@ pub trait View {
     /// Receive a completed background atom-index (from `Action::IndexAtoms`).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_index(&mut self, _o: crate::tui::job::IndexOutcome) {}
+    /// The background `Action::IndexAtoms` job died without producing an
+    /// `IndexOutcome` (e.g. its worker thread panicked) — recover any
+    /// per-job liveness state so a future `IndexAtoms` dispatch is never
+    /// wedged behind it. Default: ignore (only the Profile view consumes it).
+    fn accept_index_failed(&mut self) {}
     /// Return the working config to persist when it has unsaved edits, marking it
     /// clean. Default: `None` (only the Profile view holds a persistent config).
     /// `App` calls this after every key and job result; `Some(cfg)` triggers an
