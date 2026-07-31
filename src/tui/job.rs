@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
@@ -14,6 +15,15 @@ pub struct ScanOutcome {
     pub scanned_at: i64,
 }
 
+/// The result of a background `Action::IndexAtoms` job: which atoms were
+/// answered, and each repo's hit/miss for them. Delivered back to the Profile
+/// view via `accept_index`.
+pub struct IndexOutcome {
+    pub atoms: Vec<String>,
+    /// repo path -> (atom -> hit).
+    pub hits: BTreeMap<String, BTreeMap<String, bool>>,
+}
+
 /// The outcome of a background operation, surfaced to the UI.
 #[derive(Default)]
 pub struct JobResult {
@@ -26,6 +36,9 @@ pub struct JobResult {
     /// set flows through `ScanOutcome.uncovered` → `accept_scan` instead).
     /// Reserved for a future off-thread producer that isn't a full rescan.
     pub uncovered: Option<Vec<String>>,
+    /// Set by a background `Action::IndexAtoms` job; delivered to the active
+    /// view's `accept_index`.
+    pub index: Option<IndexOutcome>,
 }
 
 /// A running background operation. The UI shows a spinner with `label` until
@@ -64,6 +77,7 @@ mod tests {
             draft: None,
             scan: None,
             uncovered: None,
+            index: None,
         });
         let r = job.rx.recv().unwrap();
         assert_eq!(r.toast, "done");
