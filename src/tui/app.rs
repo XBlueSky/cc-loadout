@@ -595,9 +595,14 @@ impl App {
             Action::RelaunchClaude => {
                 self.relaunch = true;
             }
-            Action::Commit { cfg, repos } => {
+            Action::Commit {
+                cfg,
+                repos,
+                expected,
+            } => {
                 let cfg_path = self.ctx.cfg_path.clone();
                 let settings_path = crate::profile::apply::global_settings_path(&self.ctx.claude);
+                let data_root = self.ctx.data_root.clone();
                 let now = crate::now_epoch();
                 self.job = Some(crate::tui::job::spawn(
                     format!("writing {}", self.ctx.cfg_path.display()),
@@ -605,22 +610,33 @@ impl App {
                     move || match crate::profile::commit::commit(
                         &cfg_path,
                         &settings_path,
+                        &data_root,
                         &cfg,
                         &repos,
+                        &expected,
                         now,
                     ) {
-                        Ok(r) => crate::tui::job::JobResult {
-                            toast: format!(
+                        Ok(r) => {
+                            let mut toast = format!(
                                 "wrote {} · global synced · {} repos applied",
                                 r.profiles_path.display(),
                                 r.repos_applied
-                            ),
-                            needs_refresh: true,
-                            draft: None,
-                            scan: None,
-                            uncovered: None,
-                            index: None,
-                        },
+                            );
+                            if r.diverged > 0 {
+                                toast.push_str(&format!(
+                                    " · {} matched differently than preview",
+                                    r.diverged
+                                ));
+                            }
+                            crate::tui::job::JobResult {
+                                toast,
+                                needs_refresh: true,
+                                draft: None,
+                                scan: None,
+                                uncovered: None,
+                                index: None,
+                            }
+                        }
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("commit failed: {e}"),
                             needs_refresh: false,
@@ -1292,6 +1308,7 @@ mod tests {
         app.apply_action(Action::Commit {
             cfg: profiles,
             repos: vec![],
+            expected: vec![],
         })
         .unwrap();
         // Commit is async: drain the background job to ensure the write
@@ -1302,8 +1319,55 @@ mod tests {
             "expected toast about write, got: {}",
             result.toast
         );
+        assert!(
+            !result.toast.contains("matched differently"),
+            "no repos written => no divergence suffix, got: {}",
+            result.toast
+        );
         let on_disk = load(&cfg_path).unwrap();
         assert_eq!(on_disk.universal, vec!["u@m".to_string()]);
+    }
+
+    #[test]
+    fn commit_toast_appends_divergence_count_when_fresh_disagrees_with_preview() {
+        use crate::profile::config::{Detect, Profile, Profiles};
+        let (_h, _d, ctx) = empty_ctx();
+        let mut app = App::new(ctx, 0).unwrap();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        std::fs::write(repo_dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let repo = repo_dir.path().to_path_buf();
+
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "rust".to_string(),
+            Profile {
+                plugins: vec!["ra@x".to_string()],
+                detect: Detect {
+                    marker_files: vec!["Cargo.toml".to_string()],
+                    ..Default::default()
+                },
+            },
+        );
+        let cfg = Profiles {
+            profiles,
+            ..Profiles::default()
+        };
+
+        // `expected` (the stale preview) claims no match, but the repo has
+        // Cargo.toml on disk right now — fresh write-time detect disagrees.
+        app.apply_action(Action::Commit {
+            cfg,
+            repos: vec![repo.clone()],
+            expected: vec![(repo, vec![])],
+        })
+        .unwrap();
+        let result = app.job.as_ref().unwrap().rx.recv().unwrap();
+        assert!(
+            result.toast.contains("1 matched differently than preview"),
+            "expected divergence suffix, got: {}",
+            result.toast
+        );
     }
 
     #[test]
@@ -2239,6 +2303,7 @@ mod tests {
         app.apply_action(Action::Commit {
             cfg: profiles,
             repos: vec![],
+            expected: vec![],
         })
         .unwrap();
         // Drain the background job so the writes complete.

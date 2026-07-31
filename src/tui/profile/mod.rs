@@ -1095,7 +1095,9 @@ impl View for ProfileView {
             Sub::Detail(state) => {
                 detail::render(state, &self.inv, f, area, now_ms, self.scanned_at)
             }
-            Sub::Apply(state) => apply::render(state, &self.working, f, area),
+            Sub::Apply(state) => {
+                apply::render(state, &self.working, self.scanned_at, now_ms, f, area)
+            }
         }
     }
 
