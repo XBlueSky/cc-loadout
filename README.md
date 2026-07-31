@@ -200,6 +200,16 @@ from an example repo, `?` explain why a chosen repo matches (or doesn't). A
 pin themselves with a `.claude/profile` override are left out of the preview,
 since detect rules don't classify them.
 
+Match counts, drift, and the Apply preview are a snapshot as of the last
+scan, not a live disk check: `s` walks every scan root and answers every
+current rule in one pass. A count showing `…` means a rule touched an atom
+the index hasn't seen yet; committing the rule auto-indexes just that atom
+in the background, or press `s` to index everything at once. Writes are the
+exception — `apply`/`w` always re-detects each repo fresh at write time,
+regardless of what the preview showed. A `profiles.json` cache built by an
+older version of `cc-loadout` opens with a dim "index outdated — rebuilding
+in background…" banner while it upgrades itself automatically.
+
 ### Headless setup (agents / CI)
 
 `profile init` opens the interactive TUI by default. Pass `--assign` to run it

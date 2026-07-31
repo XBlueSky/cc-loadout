@@ -56,10 +56,17 @@ pub fn render(view: &ProfileView, snap: &Snapshot, f: &mut Frame, area: Rect) {
         )));
         if !d.uncovered.is_empty() {
             let k = d.uncovered.len();
-            lines.push(Line::from(Span::styled(
+            let mut spans = vec![Span::styled(
                 format!("⚠ {k} repos match nothing"),
                 theme::alert(),
-            )));
+            )];
+            // A held last-known value (the signal recompute couldn't decide
+            // every repo yet) gets a trailing dim "…" — an honest cue that
+            // this count is provisional, not a fresh drift signal.
+            if view.uncovered_pending {
+                spans.push(Span::styled(" \u{2026}", theme::dim()));
+            }
+            lines.push(Line::from(spans));
         }
         if !d.global.is_empty() {
             let g = d.global.len();
@@ -278,6 +285,48 @@ mod tests {
         assert!(
             !text[univ..od].contains('?'),
             "rows before On-demand must not carry ?; got: {text}"
+        );
+    }
+
+    /// Task 7: while `uncovered_pending` is true, the board keeps rendering the
+    /// last-known uncovered count (never blanks it) but tags it with a
+    /// trailing dim "…" — an honest "this is provisional" cue, not a fresh
+    /// drift signal.
+    #[test]
+    fn uncovered_pending_appends_a_dim_ellipsis_cue_to_the_drift_header() {
+        use crate::profile::config::Profiles;
+        use crate::profile::discover::Inventory;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let view = super::ProfileView::new(inv, Profiles::default(), false, false)
+            .with_uncovered(vec!["/workspace/a".into()])
+            .with_uncovered_pending(true);
+        let snap = crate::tui::profile::test_support::snap();
+
+        let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        t.draw(|f| super::render(&view, &snap, f, f.area()))
+            .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(
+            text.contains("repos match nothing"),
+            "held uncovered count still shown while pending: {text}"
+        );
+        assert!(
+            text.contains('\u{2026}'),
+            "pending cue (…) shown when uncovered_pending: {text}"
         );
     }
 }

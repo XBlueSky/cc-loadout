@@ -25,10 +25,14 @@ pub enum Action {
     /// Remove a task (id), on the job thread.
     RemoveTask(String),
     /// Write profiles.json + global settings + the selected repos' settings.local.json.
-    /// Emitted by the Apply sub-view.
+    /// Emitted by the Apply sub-view. `expected` carries each written repo's
+    /// preview matched-set (name-only) alongside it, so `commit()` can report
+    /// how many repos' FRESH write-time detect diverged from what the
+    /// (zero-I/O, index-driven) Apply preview showed.
     Commit {
         cfg: crate::profile::config::Profiles,
         repos: Vec<std::path::PathBuf>,
+        expected: Vec<(std::path::PathBuf, Vec<String>)>,
     },
     /// Ask Claude to draft the plugin→profile assignment for these scanned inputs.
     DraftWithClaude {
@@ -43,12 +47,14 @@ pub enum Action {
         roots: Vec<String>,
         working: crate::profile::config::Profiles,
     },
-    /// Recompute the uncovered-repos drift on the job thread (detection over every
-    /// repo touches the filesystem and must not freeze the UI). Emitted after an
-    /// edit that changed detection; the result is handed back via `accept_uncovered`.
-    RecomputeUncovered {
-        repos: Vec<crate::profile::discover::RepoSignal>,
-        working: crate::profile::config::Profiles,
+    /// Answer a batch of newly-committed-but-unindexed atoms on the job
+    /// thread — real disk I/O (file/content/kw stats + one `globs_exist` walk
+    /// per repo) — so committing a rule that introduces a new atom never
+    /// blocks the UI. Always runs detached (never through the modal job
+    /// slot); the result is handed back via `accept_index`.
+    IndexAtoms {
+        atoms: Vec<String>,
+        repos: Vec<String>,
     },
 }
 
@@ -83,9 +89,30 @@ pub trait View {
     /// Receive a completed background repo scan (from `Action::Rescan`).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_scan(&mut self, _outcome: crate::tui::job::ScanOutcome) {}
-    /// Receive a recomputed uncovered-repos set (from `Action::RecomputeUncovered`).
+    /// Receive a recomputed uncovered-repos set delivered via the shared
+    /// `JobResult.uncovered` slot. Currently unused forward scaffolding: no
+    /// producer sets that field today — `Rescan`'s uncovered set, and the
+    /// Task 10 startup rebuild's (both share `rescan_job`), flow through
+    /// `ScanOutcome.uncovered` → `accept_scan` instead. Kept for a future
+    /// off-thread producer that isn't a full rescan.
     /// Default: ignore (only the Profile view consumes it).
     fn accept_uncovered(&mut self, _uncovered: Vec<String>) {}
+    /// Receive a completed background atom-index (from `Action::IndexAtoms`).
+    /// Default: ignore (only the Profile view consumes it).
+    fn accept_index(&mut self, _o: crate::tui::job::IndexOutcome) {}
+    /// The background `Action::IndexAtoms` job died without producing an
+    /// `IndexOutcome` (e.g. its worker thread panicked) — recover any
+    /// per-job liveness state so a future `IndexAtoms` dispatch is never
+    /// wedged behind it. Default: ignore (only the Profile view consumes it).
+    fn accept_index_failed(&mut self) {}
+    /// The background startup rebuild (Task 10: migrating a stale-version scan
+    /// cache to the atom index) died without producing a `ScanOutcome` (e.g.
+    /// its worker thread panicked). Clear the "index outdated — rebuilding…"
+    /// banner so it doesn't stay up forever, and fall back to the pending UX —
+    /// the cache is still stale and startup can't cheaply retry the walk
+    /// itself; the next explicit `s` rescan (not gated by this flag) is the
+    /// way out. Default: ignore (only the Profile view consumes it).
+    fn accept_rebuild_failed(&mut self) {}
     /// Return the working config to persist when it has unsaved edits, marking it
     /// clean. Default: `None` (only the Profile view holds a persistent config).
     /// `App` calls this after every key and job result; `Some(cfg)` triggers an
@@ -99,19 +126,6 @@ pub trait View {
     /// authoritative uncovered source across sessions, regardless of which code
     /// path recomputed the set. Default: `None` (only the Profile view holds it).
     fn dirty_uncovered(&mut self) -> Option<Vec<String>> {
-        None
-    }
-    /// Return `(repos, working)` for a pending off-thread uncovered recompute,
-    /// clearing the request. `App` polls this after every key and job result and
-    /// dispatches an `Action::RecomputeUncovered`-equivalent background job. Used
-    /// by view paths that change detection but cannot return an `Action`
-    /// themselves (e.g. `accept_draft`). Default: `None`.
-    fn take_recompute_request(
-        &mut self,
-    ) -> Option<(
-        Vec<crate::profile::discover::RepoSignal>,
-        crate::profile::config::Profiles,
-    )> {
         None
     }
 }

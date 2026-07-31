@@ -16,6 +16,7 @@ pub mod plugins;
 pub mod registry;
 pub mod scan;
 pub mod scan_cache;
+pub mod signal_detect;
 
 use anyhow::{bail, Result};
 use std::path::{Path, PathBuf};
@@ -260,7 +261,7 @@ pub fn inventory(
         Some(r) => vec![r.display().to_string()],
         None => cfg.scan_roots.clone(),
     };
-    let inv = discover::build_inventory(&registry, &roots, 6);
+    let inv = discover::build_inventory(&registry, &roots, 6, &signal_detect::vocabulary(cfg));
     if json {
         crate::json::emit(&inv)?;
         return Ok(());

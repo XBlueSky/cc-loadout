@@ -4,9 +4,9 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::profile::config::Profile;
+use crate::profile::config::{Profile, Profiles};
 use crate::profile::plugins::managed_keys;
-use crate::profile::{apply, author, discover};
+use crate::profile::{apply, author, discover, signal_detect};
 
 /// The AI/script's decision: which plugins are universal, and which plugins each
 /// (scan-suggested) profile gets. Profile keys are suggested-profile names.
@@ -94,8 +94,19 @@ pub fn init_noninteractive(
 ) -> Result<()> {
     let assign: Assignment = serde_json::from_str(assign_json).context("parsing --assign JSON")?;
 
+    // The vocabulary to index comes from any profiles.json already on disk
+    // (so a re-run keeps indexing its existing detect rules); a first-run
+    // `init` has none yet, so fall back to the marker/glob defaults.
+    let preexisting_cfg = if cfg_path.exists() {
+        crate::profile::config::load(cfg_path)
+            .with_context(|| format!("loading existing {}", cfg_path.display()))?
+    } else {
+        Profiles::default()
+    };
+    let vocab = signal_detect::vocabulary(&preexisting_cfg);
+
     let roots = vec![root.to_string()];
-    let inv = discover::build_inventory(registry_path, &roots, 6);
+    let inv = discover::build_inventory(registry_path, &roots, 6, &vocab);
     validate(&assign, &inv)?;
 
     let mut cfg = assemble_profiles(&assign, &inv, vec![root.to_string()]);
@@ -106,9 +117,7 @@ pub fn init_noninteractive(
     // `assemble_profiles` builds a fresh `Profiles` from scratch. If
     // `cfg_path` doesn't exist yet, `cfg.on_demand` stays empty (`Default`).
     if cfg_path.exists() {
-        let existing = crate::profile::config::load(cfg_path)
-            .with_context(|| format!("loading existing {}", cfg_path.display()))?;
-        cfg.on_demand = existing.on_demand;
+        cfg.on_demand = preexisting_cfg.on_demand;
     }
 
     author::write_profiles(cfg_path, &cfg, now)?;

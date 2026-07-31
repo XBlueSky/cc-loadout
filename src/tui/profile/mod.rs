@@ -1,5 +1,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use time::OffsetDateTime;
 
@@ -7,6 +9,7 @@ use crate::profile::config::Profiles;
 use crate::profile::discover::Inventory;
 use crate::tui::ctx::AppCtx;
 use crate::tui::snapshot::Snapshot;
+use crate::tui::theme;
 use crate::tui::view::{Action, View};
 
 mod apply;
@@ -19,6 +22,22 @@ pub(crate) mod on_demand_help;
 pub(crate) mod rules;
 #[cfg(test)]
 pub(crate) mod test_support;
+
+/// Compact "3d ago" / "2h ago" / "5m ago" / "just now" for a past epoch-seconds
+/// value relative to `now_secs`. Shared by the by-plugin scan bar and the
+/// Rules tab's index-age tag.
+fn fmt_age(then: i64, now_secs: i64) -> String {
+    let d = (now_secs - then).max(0);
+    if d < 60 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86_400 {
+        format!("{}h ago", d / 3600)
+    } else {
+        format!("{}d ago", d / 86_400)
+    }
+}
 
 /// Which sub-view is active.
 enum Sub {
@@ -60,14 +79,37 @@ pub struct ProfileView {
     /// Snapshot of `uncovered` as last persisted to the scan cache; `dirty_uncovered`
     /// compares against it so a cache write fires exactly when the set changed.
     saved_uncovered: Vec<String>,
-    /// Set when an edit changed detection but the (filesystem-walking) uncovered
-    /// recompute must run off the UI thread. `App` drains it via
-    /// `take_recompute_request` and dispatches the background job. Used by paths
-    /// that cannot themselves return an `Action` (e.g. `accept_draft`).
-    needs_recompute: bool,
+    /// Set when the last signal-based recompute (`uncovered_from_signals`) could
+    /// not decide every repo — some profile's rule needed an atom the index
+    /// never recorded. While true, `self.uncovered` keeps its last value and the
+    /// board renders a trailing `…` cue (Task 7) rather than claiming a stale
+    /// answer is final.
+    pub(super) uncovered_pending: bool,
     /// Epoch seconds of the scan whose repos are loaded (from cache or a live
     /// scan); `None` until anything is scanned. Drives the scan bar's age/stale.
     pub(super) scanned_at: Option<i64>,
+    /// Newly-pending atoms drained from an open Detail's `RulesState::wants_index`,
+    /// waiting to be dispatched as the next `Action::IndexAtoms` batch. Deduped
+    /// on every push (both against what's already queued and within the drained
+    /// batch itself) so a delete-then-recommit cycle can never queue the same
+    /// atom twice — `RulesState` has no memory of prior pushes, so this is
+    /// where duplicates are caught.
+    pub(super) index_queue: Vec<String>,
+    /// Whether a background `Action::IndexAtoms` job is currently in flight.
+    /// While true, a non-empty `index_queue` waits: once this flag clears
+    /// (`accept_index` on success, `accept_index_failed` if the worker dies
+    /// without a result) the next `on_key` call sees `!indexing` and
+    /// dispatches the follow-up batch — so batches are always sequential,
+    /// never two jobs racing each other, and never permanently wedged.
+    pub(super) indexing: bool,
+    /// The atom batch of the currently in-flight `Action::IndexAtoms` job (or
+    /// about to be dispatched), for the scan bar / count-line "indexing …" text.
+    pub(super) indexing_atoms: Vec<String>,
+    /// Whether a background rebuild of a stale-version scan cache (Task 10) is
+    /// currently in flight. While true, the board/by-plugin body renders a dim
+    /// banner above itself. Cleared by `accept_scan` (a completed scan IS the
+    /// rebuild) or `accept_rebuild_failed` (the worker died first).
+    pub(super) index_rebuilding: bool,
 }
 
 impl ProfileView {
@@ -79,13 +121,17 @@ impl ProfileView {
     pub fn new(inv: Inventory, working: Profiles, claude_available: bool, offer: bool) -> Self {
         let ai_offer = claude_available && offer;
         let saved = working.clone();
-        let mut v = ProfileView {
+        ProfileView {
             inv,
             working,
             cursor: 0,
             plugin_cursor: 0,
             view: ViewMode::ByPlugin,
             sub: Sub::Board,
+            // Repos are seeded empty (or via `with_scan_repos`/`with_uncovered`
+            // right after construction) — the TUI never walks the filesystem
+            // synchronously, so `uncovered` simply starts empty and is filled
+            // in by a scan outcome or a seeded cache value.
             uncovered: Vec::new(),
             claude_available,
             ai_offer,
@@ -95,16 +141,13 @@ impl ProfileView {
             on_demand_help: false,
             saved,
             saved_uncovered: Vec::new(),
-            needs_recompute: false,
+            uncovered_pending: false,
             scanned_at: None,
-        };
-        v.recompute_uncovered();
-        v.saved_uncovered = v.uncovered.clone();
-        v
-    }
-
-    fn recompute_uncovered(&mut self) {
-        self.uncovered = crate::profile::drift::uncovered_repos(&self.inv, &self.working);
+            index_queue: Vec::new(),
+            indexing: false,
+            indexing_atoms: Vec::new(),
+            index_rebuilding: false,
+        }
     }
 
     /// Set the suggested/confirmed scan roots. Used by `App::new`; the header
@@ -136,10 +179,27 @@ impl ProfileView {
     /// Seed the uncovered-repos drift from the scan cache (the authoritative
     /// value computed at scan time), marking it clean so it is not re-persisted
     /// on the first key. No filesystem I/O — this is the startup fast path that
-    /// replaces the synchronous `recompute_uncovered()` walk over every repo.
+    /// fills in what used to require a synchronous disk walk over every repo.
     pub(crate) fn with_uncovered(mut self, uncovered: Vec<String>) -> Self {
         self.saved_uncovered = uncovered.clone();
         self.uncovered = uncovered;
+        self
+    }
+
+    /// Mark the seeded `uncovered` set as provisional (a v1 scan cache predates
+    /// the atom index, so nothing can be decided from it yet). Task 10 replaces
+    /// this seed with an explicit rebuild + banner; until then the board just
+    /// renders the pending cue over the empty seeded set.
+    pub(crate) fn with_uncovered_pending(mut self, pending: bool) -> Self {
+        self.uncovered_pending = pending;
+        self
+    }
+
+    /// Mark that a background rebuild of a stale-version scan cache (Task 10)
+    /// is in flight — the board/by-plugin body renders a dim banner above
+    /// itself until `accept_scan` or `accept_rebuild_failed` clears it.
+    pub(crate) fn with_index_rebuilding(mut self, rebuilding: bool) -> Self {
+        self.index_rebuilding = rebuilding;
         self
     }
 
@@ -163,21 +223,37 @@ impl ProfileView {
     /// Synchronous scan — walks the roots on the calling thread. Test-only now
     /// (the TUI dispatches `Action::Rescan` so the walk runs on the job thread,
     /// see `apply_scan`), kept as a convenience for exercising `apply_scan`.
+    /// Mirrors `Action::Rescan`'s job-thread computation in `app.rs`: merge
+    /// suggested profiles into a scratch config, then compute uncovered from
+    /// the freshly-indexed signals (`uncovered_from_signals`) — never a
+    /// second disk walk.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn scan(&mut self) {
         let Some(roots) = self.nonempty_scan_roots() else {
             return;
         };
-        let repos = crate::profile::discover::scan_repo_signals(&roots, 6);
+        let vocab = crate::profile::signal_detect::vocabulary(&self.working);
+        let repos = crate::profile::discover::scan_repo_signals(&roots, 6, &vocab);
         let suggested = crate::profile::discover::suggest_profiles(&repos);
-        let uncovered =
-            crate::profile::drift::uncovered_post_merge(&self.working, &suggested, &repos);
+        let mut merged = self.working.clone();
+        for sp in &suggested {
+            merged.profiles.entry(sp.name.clone()).or_insert_with(|| {
+                crate::profile::author::profile_from(Vec::new(), &sp.shared_signals)
+            });
+        }
+        let (uncovered, pending) = crate::profile::drift::uncovered_from_signals(&repos, &merged);
+        debug_assert!(
+            !pending,
+            "a fresh scan indexes the full current-rule vocabulary; \
+             uncovered_from_signals must be decisive right after a scan"
+        );
         self.apply_scan(crate::tui::job::ScanOutcome {
             roots,
             repos,
             suggested,
             uncovered,
             scanned_at: crate::now_epoch(),
+            budget_hits: 0,
         });
     }
 
@@ -200,8 +276,11 @@ impl ProfileView {
         self.working.scan_roots = outcome.roots;
         // The uncovered drift was computed on the job thread (post-merge) and
         // handed back in the outcome — assign it directly rather than re-walking
-        // every repo on the UI thread.
+        // every repo on the UI thread. A full rescan is always decisive (it
+        // walked every repo live), so it also resolves any pending state left
+        // over from a seeded-but-undecided legacy cache.
         self.uncovered = outcome.uncovered;
+        self.uncovered_pending = false;
     }
 
     /// Build the AI-draft action, scanning first when no repos have been
@@ -264,6 +343,20 @@ impl ProfileView {
         &self.uncovered
     }
 
+    /// Test-visible accessor for whether the last signal-based recompute was
+    /// undecided for some repo (see `uncovered_pending`).
+    #[cfg(test)]
+    pub fn uncovered_pending_for_test(&self) -> bool {
+        self.uncovered_pending
+    }
+
+    /// Test-visible accessor for whether a background scan-cache rebuild
+    /// (Task 10) is currently in flight.
+    #[cfg(test)]
+    pub fn index_rebuilding_for_test(&self) -> bool {
+        self.index_rebuilding
+    }
+
     /// Test-visible accessor for Apply state (returns None if not in Apply).
     #[cfg(test)]
     pub fn apply_state_for_test(&self) -> Option<&apply::ApplyState> {
@@ -291,6 +384,27 @@ impl ProfileView {
     #[cfg(test)]
     pub fn pick_for_test(&self) -> Option<&by_plugin::MembershipPick> {
         self.pick.as_ref()
+    }
+
+    /// When a background scan-cache rebuild (Task 10: migrating a
+    /// stale-version cache to the atom index) is in flight, render a
+    /// one-line dim banner at the top of `area` and return the remaining
+    /// area for the board/by-plugin body below it — matches this file's
+    /// borderless, inline-text idiom (no boxes). Returns `area` unchanged
+    /// (no banner) otherwise.
+    fn render_rebuild_banner(&self, f: &mut Frame, area: Rect) -> Rect {
+        if !self.index_rebuilding {
+            return area;
+        }
+        let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "index outdated \u{2014} rebuilding in background\u{2026}",
+                theme::dim(),
+            ))),
+            chunks[0],
+        );
+        chunks[1]
     }
 }
 
@@ -893,16 +1007,53 @@ impl View for ProfileView {
         if detail_done {
             self.sub = Sub::Board;
         }
-        // When detection changed, the uncovered set must be recomputed — but that
-        // walks every scanned repo (filesystem I/O), so run it on the job thread
-        // behind a spinner instead of freezing the event loop. The board shows the
-        // spinner and its drift updates via `accept_uncovered` when it lands.
+        // When detection changed, the uncovered set is recomputed in place from
+        // the indexed signal (signal_detect over self.inv.repos) — zero
+        // filesystem I/O, so this runs synchronously, no job/spinner needed.
         if recompute {
             self.sub = Sub::Board;
-            action_out = Some(Action::RecomputeUncovered {
-                repos: self.inv.repos.clone(),
-                working: self.working.clone(),
-            });
+            let (unc, pending) =
+                crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
+            if !pending {
+                self.uncovered = unc;
+            }
+            self.uncovered_pending = pending;
+        }
+
+        // Task 8: drain any newly-pending atoms an open Detail's Rules tab just
+        // queued (a builder commit or `f`-derive can introduce one whether or
+        // not `detection_changed()` fired this key) into the index queue, then
+        // dispatch a background `Action::IndexAtoms` batch once idle. Dedupe
+        // both the incoming batch and against what's already queued — `RulesState`
+        // has no memory of prior pushes, so a delete-then-recommit cycle would
+        // otherwise queue the same atom twice.
+        if let Sub::Detail(state) = &mut self.sub {
+            if !state.rules.wants_index.is_empty() {
+                let mut seen: std::collections::BTreeSet<String> =
+                    self.index_queue.iter().cloned().collect();
+                for atom in std::mem::take(&mut state.rules.wants_index) {
+                    if seen.insert(atom.clone()) {
+                        self.index_queue.push(atom);
+                    }
+                }
+            }
+        }
+        // A batch already queued while a job was in flight waits here: once
+        // `indexing` clears (`accept_index` on success, `accept_index_failed`
+        // if the worker died first) the first `on_key` call afterward sees
+        // `!indexing` and dispatches it, so batches are always sequential,
+        // never racing each other, and a dead worker never wedges the queue.
+        // `action_out.is_none()` lets an Apply commit (the only other action
+        // this function can emit) win if both happen to land on the same key.
+        if action_out.is_none() && !self.index_queue.is_empty() && !self.indexing {
+            let atoms = std::mem::take(&mut self.index_queue);
+            let repos: Vec<String> = self.inv.repos.iter().map(|r| r.path.clone()).collect();
+            self.indexing = true;
+            self.indexing_atoms = atoms.clone();
+            if let Sub::Detail(state) = &mut self.sub {
+                state.rules.indexing = true;
+            }
+            action_out = Some(Action::IndexAtoms { atoms, repos });
         }
 
         action_out
@@ -924,20 +1075,26 @@ impl View for ProfileView {
                     } else if let Some(pick) = &self.pick {
                         by_plugin::render_picker(pick, f, area);
                     } else {
-                        by_plugin::render(self, f, area, now_ms);
+                        let body = self.render_rebuild_banner(f, area);
+                        by_plugin::render(self, f, body, now_ms);
                     }
                 }
                 ViewMode::ByProfile => {
                     if self.on_demand_help {
                         on_demand_help::render(f, area);
                     } else {
-                        board::render(self, snap, f, area)
+                        let body = self.render_rebuild_banner(f, area);
+                        board::render(self, snap, f, body)
                     }
                 }
             },
             Sub::Assign(state) => assign::render(state, &self.working, f, area),
-            Sub::Detail(state) => detail::render(state, &self.inv, f, area),
-            Sub::Apply(state) => apply::render(state, &self.working, f, area),
+            Sub::Detail(state) => {
+                detail::render(state, &self.inv, f, area, now_ms, self.scanned_at)
+            }
+            Sub::Apply(state) => {
+                apply::render(state, &self.working, self.scanned_at, now_ms, f, area)
+            }
         }
     }
 
@@ -945,29 +1102,109 @@ impl View for ProfileView {
         self.working = draft;
         self.ai_offer = false;
         // The draft replaces every profile's detect rules, so coverage changes —
-        // but recomputing walks every repo. Flag it for `App` to run off the UI
-        // thread (accept_draft cannot itself return an `Action`).
-        self.needs_recompute = true;
-    }
-
-    fn take_recompute_request(
-        &mut self,
-    ) -> Option<(Vec<crate::profile::discover::RepoSignal>, Profiles)> {
-        if self.needs_recompute {
-            self.needs_recompute = false;
-            Some((self.inv.repos.clone(), self.working.clone()))
-        } else {
-            None
+        // recompute it in place from the indexed signal (zero filesystem I/O).
+        let (unc, pending) =
+            crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
+        if !pending {
+            self.uncovered = unc;
         }
+        self.uncovered_pending = pending;
     }
 
     fn accept_scan(&mut self, outcome: crate::tui::job::ScanOutcome) {
         self.scanned_at = Some(outcome.scanned_at);
         self.apply_scan(outcome);
+        // A completed scan IS the rebuild (Task 10) — whichever detached job
+        // produced it (an explicit 's' or App::new's startup rebuild), the
+        // cache is now current, so the "index outdated" banner clears too.
+        self.index_rebuilding = false;
     }
 
     fn accept_uncovered(&mut self, uncovered: Vec<String>) {
         self.uncovered = uncovered;
+    }
+
+    fn accept_index(&mut self, o: crate::tui::job::IndexOutcome) {
+        for repo in &mut self.inv.repos {
+            if let Some(hits) = o.hits.get(&repo.path) {
+                for (atom, hit) in hits {
+                    repo.rule_hits.insert(atom.clone(), *hit);
+                }
+            }
+        }
+        // An empty `atoms` list marks this outcome as a repo-signal refresh
+        // that isn't the completion of a real IndexAtoms batch — e.g. Task
+        // 11's post-commit cache/index sync, which re-answers atoms a repo
+        // ALREADY has (nothing new was "indexed"). `Action::Commit` runs
+        // through the modal `self.job` slot while `Action::IndexAtoms` runs
+        // detached, so a real batch CAN genuinely still be in flight when a
+        // commit's refresh lands. Skip the job-bookkeeping below in that
+        // case — clearing it here would falsely tell the UI (and a future
+        // dispatch's `!self.indexing` guard) that the real batch finished.
+        if !o.atoms.is_empty() {
+            // An atom re-queued while THIS batch was still in flight (the
+            // delete-then-recommit case) is now redundant — this delivery
+            // already answered it. Drop it so the next `on_key` doesn't
+            // dispatch a pointless follow-up for an atom that's already
+            // indexed.
+            self.index_queue.retain(|a| !o.atoms.contains(a));
+            self.indexing = false;
+            self.indexing_atoms.clear();
+            if let Sub::Detail(state) = &mut self.sub {
+                state.rules.indexing = false;
+                // Refresh the cached match/near-miss preview + pending-atom
+                // set against the now-merged index, so the count line
+                // reflects the just-answered atom immediately rather than on
+                // the next edit.
+                state.rules.recompute(&self.inv);
+            }
+        }
+        // Detection didn't change (no rule was added/removed), but the index
+        // backing it did — recompute uncovered the same zero-I/O way as any
+        // other signal update. Always runs, even for an empty-atoms refresh.
+        let (unc, pending) =
+            crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
+        if !pending {
+            self.uncovered = unc;
+        }
+        self.uncovered_pending = pending;
+    }
+
+    fn accept_index_failed(&mut self) {
+        // The worker died before producing an `IndexOutcome` (e.g. it
+        // panicked) — the atoms it was about to answer are still genuinely
+        // unindexed, so requeue them (deduped, same rule as any other queue
+        // push) rather than dropping them: the very next `on_key` retries
+        // them as a fresh batch instead of leaving the rule permanently
+        // stuck on "press s to index". Clear both `indexing` flags
+        // unconditionally so dispatch (and the scan-bar/count-line
+        // "indexing …" text) can never wedge behind a worker that will
+        // never report back.
+        let mut seen: std::collections::BTreeSet<String> =
+            self.index_queue.iter().cloned().collect();
+        for atom in std::mem::take(&mut self.indexing_atoms) {
+            if seen.insert(atom.clone()) {
+                self.index_queue.push(atom);
+            }
+        }
+        self.indexing = false;
+        if let Sub::Detail(state) = &mut self.sub {
+            state.rules.indexing = false;
+        }
+    }
+
+    fn accept_rebuild_failed(&mut self) {
+        // The background rebuild worker died before producing a ScanOutcome
+        // (e.g. it panicked). The cache is still stale (no rule_hits) and
+        // startup can't cheaply retry the walk itself — clear the banner (it
+        // would otherwise never clear) and fall back to the same "unknown,
+        // press s to index" pending UX a stale cache got before Task 10,
+        // regardless of whether the seeded uncovered value happened to be
+        // concrete (the version<current + uncovered:Some case starts with
+        // pending == false) — a dead rebuild means the index is genuinely
+        // unreliable either way.
+        self.index_rebuilding = false;
+        self.uncovered_pending = true;
     }
 
     fn dirty_config(&mut self) -> Option<Profiles> {
@@ -1112,26 +1349,54 @@ mod tests {
     }
 
     #[test]
-    fn accept_draft_requests_recompute_off_thread() {
-        use crate::tui::view::View;
-        // accept_draft changes every detect rule, so coverage must be recomputed
-        // — but off the UI thread. It must NOT walk synchronously; instead it
-        // flags a request App drains via take_recompute_request.
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        let mut v = ProfileView::new(inv, working, false, false);
-        assert!(
-            v.take_recompute_request().is_none(),
-            "no pending recompute before a draft"
+    fn accept_draft_recomputes_uncovered_from_the_index_not_the_disk() {
+        // accept_draft changes every detect rule, so coverage must be
+        // recomputed — but there is no filesystem walk to wait on: the repo's
+        // directory below does not exist on disk, only its indexed signal says
+        // Cargo.toml is present. A stale disk-walking recompute would find
+        // nothing and leave the repo uncovered; the signal-based recompute
+        // must pick it up synchronously, no job required.
+        use crate::profile::discover::RepoSignal;
+        let repo = RepoSignal {
+            path: "/does/not/exist/a".into(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: [("file:Cargo.toml".to_string(), true)]
+                .into_iter()
+                .collect(),
+            override_names: None,
+        };
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![repo],
+            suggested_profiles: vec![],
+        };
+        // `ProfileView::new` no longer walks the disk to seed `uncovered` — seed
+        // the starting precondition ("no profiles yet, so this repo counts as
+        // uncovered") the same way a real scan-cache reopen would.
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_uncovered(vec!["/does/not/exist/a".to_string()]);
+        assert_eq!(
+            v.uncovered_for_test(),
+            &["/does/not/exist/a".to_string()],
+            "no profiles yet: the repo is uncovered"
         );
-        v.accept_draft(crate::profile::config::Profiles::default());
+
+        let draft: Profiles = serde_json::from_str(
+            r#"{"universal": [], "profiles": {
+                "rust": {"plugins": [], "detect": {"marker_files": ["Cargo.toml"]}}}}"#,
+        )
+        .unwrap();
+        v.accept_draft(draft);
         assert!(
-            v.take_recompute_request().is_some(),
-            "accept_draft must request an off-thread recompute"
+            v.uncovered_for_test().is_empty(),
+            "the indexed marker_file hit must cover the repo synchronously"
         );
         assert!(
-            v.take_recompute_request().is_none(),
-            "the request must be one-shot (drained)"
+            !v.uncovered_pending_for_test(),
+            "a fully indexed repo must not be pending"
         );
     }
 
@@ -1162,6 +1427,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested_profiles: vec![],
         };
@@ -1896,6 +2163,15 @@ mod tests {
             vec![root.clone()],
             "scan records the scanned set"
         );
+        // The repo matches no PRE-EXISTING profile (working started empty) but
+        // IS covered by the "rust" bucket merged in from this very scan — it
+        // must not be reported uncovered (equivalent to the deleted
+        // uncovered_post_merge unit test, now exercised end-to-end here).
+        assert!(
+            v.uncovered_for_test().is_empty(),
+            "repo covered by a merged suggested profile must not be uncovered: {:?}",
+            v.uncovered_for_test()
+        );
         v.scan();
         assert_eq!(v.working_for_test().scan_roots, vec![root]);
         assert_eq!(v.working_for_test().profiles.len(), 1);
@@ -2236,6 +2512,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested: vec![SuggestedProfile {
                 name: "rust".into(),
@@ -2244,6 +2522,7 @@ mod tests {
             }],
             uncovered: vec![],
             scanned_at: 0,
+            budget_hits: 0,
         };
         v.accept_scan(outcome);
         assert_eq!(v.inv_for_test().repos.len(), 1, "repos must be populated");
@@ -2278,16 +2557,252 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }],
             suggested: vec![],
             uncovered: vec!["SENTINEL-not-from-disk".into()],
             scanned_at: 0,
+            budget_hits: 0,
         };
         v.accept_scan(outcome);
         assert_eq!(
             v.uncovered_for_test(),
             &["SENTINEL-not-from-disk".to_string()],
             "apply_scan must use the outcome's uncovered set, not walk the FS"
+        );
+    }
+
+    #[test]
+    fn apply_scan_clears_uncovered_pending_after_a_full_rescan() {
+        // A legacy v1-cache seeds uncovered_pending = true at startup (App::new).
+        // A Rescan's outcome is fully decisive (computed from a live walk, no
+        // "pending" concept) — apply_scan must clear the flag along with
+        // replacing `uncovered`, or Task 7's "…" cue would stay stuck on
+        // forever even after a successful rescan resolves it.
+        use crate::profile::discover::RepoSignal;
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v =
+            ProfileView::new(inv, Profiles::default(), false, false).with_uncovered_pending(true);
+        assert!(
+            v.uncovered_pending_for_test(),
+            "seeded pending from a legacy cache"
+        );
+        let outcome = crate::tui::job::ScanOutcome {
+            roots: vec!["/x".into()],
+            repos: vec![RepoSignal {
+                path: "/x/a".into(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
+            }],
+            suggested: vec![],
+            uncovered: vec!["/x/a".into()],
+            scanned_at: 0,
+            budget_hits: 0,
+        };
+        v.accept_scan(outcome);
+        assert_eq!(
+            v.uncovered_for_test(),
+            &["/x/a".to_string()],
+            "uncovered must be replaced by the rescan outcome"
+        );
+        assert!(
+            !v.uncovered_pending_for_test(),
+            "a full rescan is decisive — the pending flag must clear"
+        );
+    }
+
+    // ── Task 10: v1 scan-cache migration (banner + background rebuild) ──────
+
+    #[test]
+    fn accept_scan_clears_the_rebuild_banner_along_with_uncovered_pending() {
+        // A completed scan IS the rebuild — whichever detached job produced
+        // it (an explicit 's' or App::new's startup rebuild), landing it must
+        // clear BOTH the "index outdated — rebuilding…" banner and any
+        // pending-seed left over from a cache that had `uncovered: None`.
+        use crate::profile::discover::RepoSignal;
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_index_rebuilding(true)
+            .with_uncovered_pending(true);
+        assert!(v.index_rebuilding_for_test(), "seeded rebuilding");
+        assert!(v.uncovered_pending_for_test(), "seeded pending");
+        let outcome = crate::tui::job::ScanOutcome {
+            roots: vec!["/x".into()],
+            repos: vec![RepoSignal {
+                path: "/x/a".into(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
+            }],
+            suggested: vec![],
+            uncovered: vec![],
+            scanned_at: 0,
+            budget_hits: 0,
+        };
+        v.accept_scan(outcome);
+        assert!(
+            !v.index_rebuilding_for_test(),
+            "a completed scan must clear the rebuild banner"
+        );
+        assert!(
+            !v.uncovered_pending_for_test(),
+            "a completed scan is decisive — pending must clear too"
+        );
+    }
+
+    #[test]
+    fn accept_rebuild_failed_clears_the_banner_and_falls_back_to_the_pending_ux() {
+        // The rebuild worker died before producing a ScanOutcome (e.g. it
+        // panicked). The cache is still stale (no rule_hits) and startup
+        // can't cheaply retry the walk itself — clear the banner (it would
+        // otherwise never clear) and fall back to the same "unknown, press s
+        // to index" pending UX a stale cache got before Task 10, regardless
+        // of whether the seeded uncovered value happened to be concrete
+        // (the version<2 + uncovered:Some case starts with pending == false).
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_index_rebuilding(true)
+            .with_uncovered(vec!["/x/a".into()]); // concrete, not pending, at seed time
+        assert!(v.index_rebuilding_for_test(), "seeded rebuilding");
+        assert!(
+            !v.uncovered_pending_for_test(),
+            "seeded with a concrete uncovered value, not pending"
+        );
+        v.accept_rebuild_failed();
+        assert!(
+            !v.index_rebuilding_for_test(),
+            "a dead rebuild worker must clear the banner"
+        );
+        assert!(
+            v.uncovered_pending_for_test(),
+            "a dead rebuild must fall back to the pending UX — the cache is still stale"
+        );
+    }
+
+    #[test]
+    fn by_plugin_render_shows_the_rebuild_banner_above_the_body() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let v =
+            ProfileView::new(inv, Profiles::default(), false, false).with_index_rebuilding(true);
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            v.render(f, area, &snap, 0, now);
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("rebuilding in background"),
+            "the by-plugin body must show the rebuild banner: {text}"
+        );
+        assert!(
+            text.contains("All plugins"),
+            "the banner must sit above the body, not replace it: {text}"
+        );
+    }
+
+    #[test]
+    fn by_profile_board_render_shows_the_rebuild_banner_above_the_body() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v =
+            ProfileView::new(inv, Profiles::default(), false, false).with_index_rebuilding(true);
+        v.switch_to_by_profile_for_test();
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            v.render(f, area, &snap, 0, now);
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            text.contains("rebuilding in background"),
+            "the by-profile board must show the rebuild banner: {text}"
+        );
+        assert!(
+            text.contains("Universal"),
+            "the banner must sit above the body, not replace it: {text}"
+        );
+    }
+
+    #[test]
+    fn render_omits_the_rebuild_banner_when_not_rebuilding() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let v = ProfileView::new(inv, Profiles::default(), false, false); // index_rebuilding defaults false
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        t.draw(|f| {
+            let area = f.area();
+            v.render(f, area, &snap, 0, now);
+        })
+        .unwrap();
+        let text: String = t
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !text.contains("rebuilding in background"),
+            "no banner when no rebuild is in flight: {text}"
         );
     }
 
@@ -2311,6 +2826,8 @@ mod tests {
                 marker_globs: vec![],
                 package_json_deps: vec![],
                 languages: vec![],
+                rule_hits: Default::default(),
+                override_names: None,
             }])
             .with_uncovered(vec![]);
         assert_eq!(
@@ -2627,6 +3144,421 @@ mod tests {
         assert!(
             text.contains("/cc-loadout:acquire"),
             "overlay content must replace the board; got: {text}"
+        );
+    }
+
+    // ── Task 8: detached IndexAtoms job — ProfileView-level state ────────────
+
+    fn working_with_empty_web_profile() -> Profiles {
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "web".to_string(),
+            crate::profile::config::Profile {
+                plugins: vec![],
+                detect: crate::profile::config::Detect::default(),
+            },
+        );
+        Profiles {
+            profiles,
+            ..Default::default()
+        }
+    }
+
+    /// A batch that answered zero repos (e.g. the repo set was empty, or none
+    /// of them produced a hit) must still clear both `indexing` flags — the
+    /// flag must never wedge just because the answer happened to be empty.
+    #[test]
+    fn accept_index_clears_indexing_flags_even_with_no_hits() {
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string()];
+        v.index_queue = vec!["glob:*.tsx".to_string()];
+        if let Sub::Detail(state) = &mut v.sub {
+            state.rules.indexing = true;
+        }
+
+        v.accept_index(crate::tui::job::IndexOutcome {
+            atoms: vec!["glob:*.tsx".to_string()],
+            hits: std::collections::BTreeMap::new(), // no repo answered anything
+        });
+
+        assert!(
+            !v.indexing,
+            "ProfileView.indexing must clear even with empty hits"
+        );
+        assert!(v.indexing_atoms.is_empty());
+        assert!(
+            v.index_queue.is_empty(),
+            "the answered atom must be dropped from the queue even though no repo hit"
+        );
+        match &v.sub {
+            Sub::Detail(state) => assert!(
+                !state.rules.indexing,
+                "the open Detail's RulesState.indexing must clear too — it must never wedge"
+            ),
+            _ => panic!("expected Sub::Detail"),
+        }
+    }
+
+    /// Task 11 fix round 1: `Action::Commit` runs through the modal `self.job`
+    /// slot while `Action::IndexAtoms` runs detached — the two CAN be in
+    /// flight at the same time. Commit's post-write cache/index refresh is
+    /// delivered through the SAME `accept_index` path as a real IndexAtoms
+    /// batch, tagged with an empty `atoms` list (nothing was "indexed", a
+    /// repo's already-known atoms were just re-answered). That empty-atoms
+    /// delivery must merge its `hits` but MUST NOT clear the bookkeeping for
+    /// a genuinely still-running IndexAtoms batch, or the UI would falsely
+    /// think that unrelated batch finished (unwedging the `!indexing` guard
+    /// early, and forgetting which atoms/Detail state it's still waiting on).
+    #[test]
+    fn accept_index_with_empty_atoms_never_clobbers_an_unrelated_in_flight_batch() {
+        use crate::profile::discover::RepoSignal;
+
+        let repo = RepoSignal {
+            path: "/does/not/exist/refresh".into(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: Default::default(),
+            override_names: None,
+        };
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![repo],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
+        // A REAL IndexAtoms batch is genuinely in flight for a DIFFERENT atom.
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string()];
+        v.index_queue = vec!["glob:*.tsx".to_string()];
+        if let Sub::Detail(state) = &mut v.sub {
+            state.rules.indexing = true;
+        }
+
+        // A concurrent Commit's post-write refresh lands: empty `atoms`,
+        // carrying only the freshly re-detected rule_hits for the repo it
+        // just wrote.
+        let mut hits = std::collections::BTreeMap::new();
+        hits.insert(
+            "/does/not/exist/refresh".to_string(),
+            [("file:Cargo.toml".to_string(), true)]
+                .into_iter()
+                .collect(),
+        );
+        v.accept_index(crate::tui::job::IndexOutcome {
+            atoms: vec![],
+            hits,
+        });
+
+        assert!(
+            v.indexing,
+            "an empty-atoms refresh must not clear a genuinely in-flight IndexAtoms batch"
+        );
+        assert_eq!(
+            v.indexing_atoms,
+            vec!["glob:*.tsx".to_string()],
+            "the real batch's tracked atoms must survive untouched"
+        );
+        assert_eq!(
+            v.index_queue,
+            vec!["glob:*.tsx".to_string()],
+            "the real batch's queue must survive untouched"
+        );
+        match &v.sub {
+            Sub::Detail(state) => assert!(
+                state.rules.indexing,
+                "the open Detail's RulesState.indexing must survive too"
+            ),
+            _ => panic!("expected Sub::Detail"),
+        }
+        // The merge itself must still have happened.
+        assert_eq!(
+            v.inv.repos[0].rule_hits.get("file:Cargo.toml"),
+            Some(&true),
+            "the empty-atoms outcome must still merge its rule_hits"
+        );
+    }
+
+    /// Task 11 fix round 1's required regression: after a commit, reopening
+    /// Apply must show the FRESH matched set — no restart, no explicit
+    /// rescan. `commit()` (the real function, real tempdir/disk) recomputes
+    /// the written repo's signal; this feeds `accept_index` the same shape
+    /// `App::drain_jobs` will (empty atoms, path -> rule_hits), then Apply is
+    /// reopened straight off `v.inv.repos` to prove the merge landed.
+    #[test]
+    fn commit_refresh_via_accept_index_is_visible_when_apply_reopens_without_rescan() {
+        use crate::profile::config::{Detect, Profile};
+        use crate::profile::discover::RepoSignal;
+
+        let home = tempfile::tempdir().unwrap();
+        let repo_dir = home.path().join("app");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("Cargo.toml"), "[package]").unwrap();
+        let canon = std::fs::canonicalize(&repo_dir).unwrap();
+        let repo_path = canon.display().to_string();
+
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "rust".to_string(),
+            Profile {
+                plugins: vec!["ra@x".to_string()],
+                detect: Detect {
+                    marker_files: vec!["Cargo.toml".to_string()],
+                    ..Default::default()
+                },
+            },
+        );
+        let working = Profiles {
+            profiles,
+            ..Default::default()
+        };
+
+        // The in-memory inventory's cached signal is STALE — the preview
+        // would have shown "no match" (as if scanned before Cargo.toml
+        // existed).
+        let stale_repo = RepoSignal {
+            path: repo_path.clone(),
+            marker_files: vec![],
+            marker_globs: vec![],
+            package_json_deps: vec![],
+            languages: vec![],
+            rule_hits: [("file:Cargo.toml".to_string(), false)]
+                .into_iter()
+                .collect(),
+            override_names: None,
+        };
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![stale_repo],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, working.clone(), false, false);
+
+        // Reopening Apply now (before any refresh) shows the stale no-match.
+        let (_home2, _data2, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Char('w')), &c, &s);
+        assert!(
+            v.apply_state_for_test().unwrap().rows[0].matched.is_empty(),
+            "sanity: preview must start stale (no match)"
+        );
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s);
+
+        // Real commit() writes the repo and recomputes its signal fresh.
+        let cfg_path = home.path().join("profiles.json");
+        let settings_path = home.path().join("settings.json");
+        let rep = crate::profile::commit::commit(
+            &cfg_path,
+            &settings_path,
+            home.path(),
+            &working,
+            std::slice::from_ref(&canon),
+            &[(canon.clone(), vec![])],
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            rep.diverged, 1,
+            "sanity: fresh write-time detect did diverge"
+        );
+
+        // Exactly what App::drain_jobs would build from CommitReport.fresh_signals.
+        let hits: std::collections::BTreeMap<String, std::collections::BTreeMap<String, bool>> =
+            rep.fresh_signals
+                .iter()
+                .map(|sig| (sig.path.clone(), sig.rule_hits.clone()))
+                .collect();
+        v.accept_index(crate::tui::job::IndexOutcome {
+            atoms: vec![],
+            hits,
+        });
+
+        // Reopening Apply now — no rescan, no restart — must show the FRESH
+        // matched set.
+        v.on_key(KeyEvent::from(KeyCode::Char('w')), &c, &s);
+        let state = v.apply_state_for_test().unwrap();
+        assert_eq!(
+            state.rows[0].matched,
+            vec!["rust".to_string()],
+            "reopening Apply after a commit must reflect fresh truth, not the stale preview"
+        );
+    }
+
+    /// The IndexAtoms worker died (e.g. panicked) before producing an
+    /// `IndexOutcome` — `accept_index_failed` is the recovery path
+    /// `App::drain_jobs` calls on a disconnected receiver. The dead batch's
+    /// atoms must be requeued (not dropped) for an automatic retry, deduped
+    /// against whatever else queued while the dead batch was still in
+    /// flight, and both indexing flags must clear.
+    #[test]
+    fn accept_index_failed_requeues_the_dead_batch_deduped_and_clears_flags() {
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string(), "file:go.mod".to_string()];
+        // A different atom was queued (e.g. from a second rule commit) while
+        // this batch was still in flight — one atom overlaps the dead batch.
+        v.index_queue = vec![
+            "file:go.mod".to_string(),
+            "kw:Cargo.toml\u{2192}tokio".to_string(),
+        ];
+        if let Sub::Detail(state) = &mut v.sub {
+            state.rules.indexing = true;
+        }
+
+        v.accept_index_failed();
+
+        assert!(!v.indexing, "indexing must clear on worker death");
+        assert!(v.indexing_atoms.is_empty());
+        let mut got = v.index_queue.clone();
+        got.sort();
+        let mut want = vec![
+            "file:go.mod".to_string(),
+            "glob:*.tsx".to_string(),
+            "kw:Cargo.toml\u{2192}tokio".to_string(),
+        ];
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the dead batch is requeued for retry, deduped against what's already queued"
+        );
+        match &v.sub {
+            Sub::Detail(state) => assert!(
+                !state.rules.indexing,
+                "the open Detail's RulesState.indexing must clear too"
+            ),
+            _ => panic!("expected Sub::Detail"),
+        }
+    }
+
+    /// A rule committed while its atom's index job is still in flight, then
+    /// deleted and recommitted before that job lands, must be queued only
+    /// ONCE and must NOT spawn a second job — `RulesState` has no memory of
+    /// prior pushes, so `ProfileView` (not `RulesState`) owns the dedupe.
+    #[test]
+    fn dedupe_delete_then_recommit_queues_single_atom_instance() {
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![crate::profile::discover::RepoSignal {
+                path: "/nonexistent-fake/a".into(),
+                marker_files: vec![],
+                marker_globs: vec![],
+                package_json_deps: vec![],
+                languages: vec![],
+                rule_hits: Default::default(), // atom never indexed
+                override_names: None,
+            }],
+            suggested_profiles: vec![],
+        };
+        let working = working_with_empty_web_profile();
+        let mut v = ProfileView::new(inv, working, false, false);
+        v.switch_to_by_profile_for_test();
+        v.cursor = 1; // "web" (row 0 is Universal)
+
+        let (_h, _d, ctx) = test_support::ctx();
+        let snap = test_support::snap();
+
+        v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // open Detail
+        v.on_key(KeyEvent::from(KeyCode::Tab), &ctx, &snap); // focus -> Rules
+
+        // Commit "has any *.tsx".
+        v.on_key(KeyEvent::from(KeyCode::Char('a')), &ctx, &snap); // builder (kind-pick)
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap); // -> "has any"
+        v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // choose "has any"
+        for c in "*.tsx".chars() {
+            v.on_key(KeyEvent::from(KeyCode::Char(c)), &ctx, &snap);
+        }
+        let action1 = v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // commit
+        assert!(
+            matches!(&action1, Some(Action::IndexAtoms { atoms, .. })
+                if atoms == &vec!["glob:*.tsx".to_string()]),
+            "first commit must dispatch the atom, got {action1:?}"
+        );
+        assert!(v.indexing, "a job is now in flight");
+        assert!(v.index_queue.is_empty());
+
+        // Delete the rule (cursor followed the committed row).
+        v.on_key(KeyEvent::from(KeyCode::Char('d')), &ctx, &snap);
+
+        // Recommit the identical rule while the first job is still in flight.
+        v.on_key(KeyEvent::from(KeyCode::Char('a')), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Down), &ctx, &snap);
+        v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap);
+        for c in "*.tsx".chars() {
+            v.on_key(KeyEvent::from(KeyCode::Char(c)), &ctx, &snap);
+        }
+        let action2 = v.on_key(KeyEvent::from(KeyCode::Enter), &ctx, &snap); // recommit
+
+        assert!(
+            action2.is_none(),
+            "must NOT dispatch a second job while the first is still in flight, got {action2:?}"
+        );
+        assert_eq!(
+            v.index_queue,
+            vec!["glob:*.tsx".to_string()],
+            "the requeued atom must appear exactly once, not duplicated"
+        );
+    }
+
+    /// The by-plugin scan bar's "indexing …" tail names the single atom, or
+    /// reports the pattern count for a batch — the same singular/plural split
+    /// as the job's toast.
+    #[test]
+    fn scan_bar_shows_indexing_tail_while_indexing() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let inv = Inventory {
+            plugins: vec![],
+            repos: vec![],
+            suggested_profiles: vec![],
+        };
+        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+            .with_scan_roots(vec!["/workspace".into()]);
+        let snap = test_support::snap();
+        let now = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
+        let render = |v: &ProfileView| -> String {
+            let mut t = Terminal::new(TestBackend::new(90, 12)).unwrap();
+            t.draw(|f| v.render(f, f.area(), &snap, 0, now)).unwrap();
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        v.indexing = true;
+        v.indexing_atoms = vec!["glob:*.tsx".to_string()];
+        let text = render(&v);
+        assert!(
+            text.contains("indexing glob:*.tsx\u{2026}"),
+            "single-atom tail: {text}"
+        );
+
+        v.indexing_atoms = vec!["glob:*.tsx".into(), "file:go.mod".into()];
+        let text2 = render(&v);
+        assert!(
+            text2.contains("indexing 2 patterns\u{2026}"),
+            "batch tail: {text2}"
         );
     }
 }
