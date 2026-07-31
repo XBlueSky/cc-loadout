@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-07-31
+
+### Bug Fixes
+
+- honest pending cue while typing an unindexed rule
+- explain overlay survives a repo vanishing mid-scan
+- refresh in-memory inventory after commit
+- recover indexing flag when the IndexAtoms worker dies
+- clear uncovered_pending after rescan; correct stale doc comments
+- canonicalize repo path at scan time for path_prefix parity
+
+### Features
+
+- index preview + fresh-write divergence report
+- v1 scan-cache migration via banner + background rebuild
+- v2 index scan with budget reporting
+- detached background indexing for new rule atoms
+- index-backed rules tab with honest pending states
+- tri-state signal evaluator mirroring detect_one
+- index rule atoms + override names per repo
+- multi-glob single walk with a dirent budget
+- RepoSignal rule_hits/override_names + scan-cache v2 marker
+- rule atoms + index vocabulary for signal detect
+
+### Refactoring
+
+- explain overlay reads the index
+- drift from signals; retire RecomputeUncovered job
+
+### Testing
+
+- zero-walk regression net + profile docs
+
 ## [0.1.19] - 2026-07-30
 
 ### Bug Fixes
