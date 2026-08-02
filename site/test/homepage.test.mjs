@@ -29,3 +29,21 @@ test('homepage keeps page landmarks outside main and announces copy feedback', a
   assert.equal(copyButtons.length, 3);
   assert.ok(copyButtons.every((button) => /aria-live=["']polite["']/.test(button)));
 });
+
+test('compact brand placements use the app mark instead of the full logo sheet', async () => {
+  const html = await readFile(htmlUrl, 'utf8');
+  assert.equal(html.match(/src=["']\/brand-mark\.png["']/g)?.length, 2);
+});
+
+test('copy controls identify the command while retaining live feedback', async () => {
+  const html = await readFile(htmlUrl, 'utf8');
+  const copyButtons = html.match(/<button\b[^>]*data-copy-command[^>]*>/g) ?? [];
+  const labels = copyButtons.map((button) => button.match(/aria-label=["']([^"']+)["']/)?.[1]);
+
+  assert.deepEqual(labels, [
+    'Copy CLI engine install command',
+    'Copy Claude Code marketplace command',
+    'Copy Claude Code plugin install command',
+  ]);
+  assert.ok(copyButtons.every((button) => /aria-live=["']polite["']/.test(button)));
+});
