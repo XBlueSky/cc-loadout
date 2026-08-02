@@ -18,3 +18,11 @@ for (const lockfile of ['package-lock.json', 'site/package-lock.json']) {
     assert.doesNotMatch(contents, /npm\.synology\.inc/);
   });
 }
+
+test('README documents actionable Cloudflare Pages environment variables', async () => {
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  assert.match(
+    readme,
+    /- Environment variables \(Cloudflare Pages dashboard\):\n  - `NODE_VERSION=22`\n  - `SITE_URL=https:\/\/cc-loadout\.pages\.dev` \(replace with the canonical custom domain when one is connected\)/,
+  );
+});

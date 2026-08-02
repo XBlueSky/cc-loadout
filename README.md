@@ -271,8 +271,9 @@ Set up Cloudflare Pages once through its Git integration:
 - Root directory: repository root
 - Build command: `npm ci && npm ci --prefix site && npm run site:build`
 - Build output directory: `site/dist`
-- Node version: `22`
-- Environment variable: `SITE_URL=https://cc-loadout.pages.dev` (replace with the canonical custom domain when one is connected)
+- Environment variables (Cloudflare Pages dashboard):
+  - `NODE_VERSION=22`
+  - `SITE_URL=https://cc-loadout.pages.dev` (replace with the canonical custom domain when one is connected)
 
 GitHub Actions validates pull requests, and Cloudflare Pages owns deployment.
 Neither workflow commits generated manifests.
