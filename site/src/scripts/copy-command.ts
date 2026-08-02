@@ -18,6 +18,7 @@ document.querySelectorAll<HTMLButtonElement>('[data-copy-command]').forEach((but
       const selection = window.getSelection();
       selection?.removeAllRanges();
       selection?.addRange(range);
+      button.textContent = 'Copy failed — selected';
     }
   });
 });
