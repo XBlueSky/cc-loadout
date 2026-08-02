@@ -1063,6 +1063,41 @@ pre,
   }
 }
 
+html[data-motion='desktop'] [data-motion-scene] {
+  scroll-margin-top: 0;
+}
+
+html[data-motion='desktop'] .problem-scene,
+html[data-motion='desktop'] .profiles-scene {
+  padding-block: clamp(6.5rem, 10vw, 9rem);
+}
+
+html[data-motion='desktop'] .tui-scene {
+  padding-block: clamp(7rem, 12vw, 11rem);
+}
+
+html[data-motion='mobile'] .scene {
+  padding-block: clamp(4.5rem, 15vw, 6rem);
+}
+
+html[data-motion='reduced'] {
+  scroll-behavior: auto;
+}
+
+html[data-motion='reduced'] *,
+html[data-motion='reduced'] *::before,
+html[data-motion='reduced'] *::after {
+  opacity: 1 !important;
+  scroll-behavior: auto !important;
+  transform: none !important;
+}
+
+@media (min-width: 48rem) {
+  html[data-motion='reduced'] .brand-frame {
+    top: 25%;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;
@@ -1073,7 +1108,15 @@ pre,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    opacity: 1 !important;
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+    transform: none !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) and (min-width: 48rem) {
+  .brand-frame {
+    top: 25%;
   }
 }
