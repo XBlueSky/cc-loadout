@@ -7,6 +7,7 @@
     "node": ">=22"
   },
   "scripts": {
+    "brand:derive": "node scripts/derive-brand-mark.mjs",
     "dev": "npm run manifest:generate --prefix .. && astro dev",
     "prebuild": "npm run manifest:generate --prefix ..",
     "build": "astro build",
@@ -18,5 +19,8 @@
     "@fontsource/geist-mono": "^5.2.8",
     "astro": "^5.0.0",
     "gsap": "^3.13.0"
+  },
+  "devDependencies": {
+    "sharp": "0.34.5"
   }
 }
