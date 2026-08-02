@@ -17,6 +17,7 @@ test('homepage renders the approved product story and honest install flow', asyn
   assert.match(html, /Install the Claude Code plugin/);
   assert.match(html, /\/plugin marketplace add https:\/\/github\.com\/xbluesky\/cc-loadout/i);
   assert.match(html, /\/plugin install cc-loadout@cc-loadout/);
+  assert.match(html, /<source[^>]+media=["']\(prefers-reduced-motion: reduce\)["'][^>]+srcset=["']\/demo-still\.png["']/);
 });
 
 test('homepage keeps page landmarks outside main and announces copy feedback', async () => {
