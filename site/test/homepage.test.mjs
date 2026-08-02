@@ -47,3 +47,11 @@ test('copy controls identify the command while retaining live feedback', async (
   ]);
   assert.ok(copyButtons.every((button) => /aria-live=["']polite["']/.test(button)));
 });
+
+test('homepage loads progressive motion inside the document body', async () => {
+  const html = await readFile(htmlUrl, 'utf8');
+  const motionScript = html.match(/<script\b[^>]*type=["']module["'][^>]*src=["'][^"']+["'][^>]*><\/script>/);
+
+  assert.ok(motionScript, 'motion client bundle must be emitted');
+  assert.ok(html.indexOf(motionScript[0]) < html.indexOf('</body>'));
+});
