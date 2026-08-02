@@ -1,21 +1,11 @@
-import { copyFeedbackLabel } from './copy-label.mjs';
+import { bindCopyButton } from './copy-control.mjs';
 
 document.querySelectorAll<HTMLButtonElement>('[data-copy-command]').forEach((button) => {
-  button.addEventListener('click', async () => {
-    const command = button.dataset.copyCommand;
-    if (!command) return;
-    const actionLabel = button.getAttribute('aria-label') ?? 'Copy command';
-
-    try {
-      await navigator.clipboard.writeText(command);
-      button.textContent = 'Copied';
-      button.setAttribute('aria-label', copyFeedbackLabel(actionLabel, 'success'));
-      window.setTimeout(() => {
-        button.textContent = 'Copy';
-        button.setAttribute('aria-label', copyFeedbackLabel(actionLabel, 'idle'));
-      }, 1500);
-    } catch {
-      const code = button.previousElementSibling;
+  bindCopyButton(button, {
+    writeText: (command) => navigator.clipboard.writeText(command),
+    scheduleRestore: (restore) => window.setTimeout(restore, 1500),
+    selectAdjacentCode: (currentButton) => {
+      const code = currentButton.previousElementSibling;
       if (!(code instanceof HTMLElement)) return;
 
       const range = document.createRange();
@@ -23,8 +13,6 @@ document.querySelectorAll<HTMLButtonElement>('[data-copy-command]').forEach((but
       const selection = window.getSelection();
       selection?.removeAllRanges();
       selection?.addRange(range);
-      button.textContent = 'Copy failed — selected';
-      button.setAttribute('aria-label', copyFeedbackLabel(actionLabel, 'failure'));
-    }
+    },
   });
 });
