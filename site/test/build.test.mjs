@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
-import { access, readFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 
 const dist = new URL('../dist/', import.meta.url);
+const execFileAsync = promisify(execFile);
 
 test('static build publishes the page and the exact manifest', async () => {
   await access(new URL('index.html', dist));
@@ -25,4 +31,23 @@ test('static page includes product social metadata', async () => {
     assert.doesNotMatch(html, /property=["']og:image["']/);
     assert.doesNotMatch(html, /name=["']twitter:image["']/);
   }
+});
+
+test('custom site URL produces absolute canonical page metadata', async (context) => {
+  const output = await mkdtemp(join(tmpdir(), 'cc-loadout-site-'));
+  context.after(() => rm(output, { recursive: true, force: true }));
+
+  await execFileAsync(
+    process.execPath,
+    [fileURLToPath(new URL('../node_modules/astro/astro.js', import.meta.url)), 'build', '--outDir', output],
+    {
+      cwd: fileURLToPath(new URL('../', import.meta.url)),
+      env: { ...process.env, SITE_URL: 'https://custom.example.test' },
+    },
+  );
+
+  const html = await readFile(join(output, 'index.html'), 'utf8');
+  assert.match(html, /<link rel=["']canonical["'] href=["']https:\/\/custom\.example\.test\/["']/);
+  assert.match(html, /<meta property=["']og:url["'] content=["']https:\/\/custom\.example\.test\/["']/);
+  assert.doesNotMatch(html, /localhost/);
 });

@@ -38,3 +38,10 @@ Asset validation performed without modifying the file:
 - `git diff --check` — passed
 
 The generated `site/dist/manifest.json` is intentionally not staged; the build test confirms it deep-equals `.cc-marketspec/dist/manifest.json`.
+
+## Final-review fix round 1
+
+- Finding addressed: the page had an absolute social image but no canonical URL or `og:url`, leaving custom-domain publication incomplete.
+- RED: added a real isolated Astro build with `SITE_URL=https://custom.example.test`; `npm run site:build && node --test site/test/build.test.mjs` failed because the built page lacked `<link rel="canonical">`.
+- GREEN: derived the page URL from `Astro.url.pathname` and `Astro.site`, retaining `https://cc-loadout.pages.dev` when no site is configured, and emitted matching absolute canonical and `og:url` values. The same command then passed all 3 build-artifact tests, including exact custom-domain values and a guard against localhost output.
+- The existing social-image URL behavior and accepted `site/public/og.png` were left unchanged.
