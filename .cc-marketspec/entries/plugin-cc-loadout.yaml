@@ -1,0 +1,21 @@
+# yaml-language-server: $schema=../../node_modules/@xbluesky/cc-marketspec/schemas/entry.schema.json
+group: workflow
+tagline: Give every Claude Code repo the right plugins, account, and automation
+intro: >
+  Let Claude guide your setup, use the TUI to see and tune every loadout,
+  and rely on the Rust CLI to apply profiles, switch accounts, and schedule
+  recurring work safely.
+skills:
+  - name: acquire
+    trigger: Temporarily enable an on-demand plugin for the current Claude Code session, then release it automatically when the session ends.
+  - name: init
+    trigger: Set up or rebuild repository-aware plugin profiles with Claude guiding inventory, assignment, validation, and activation.
+  - name: release
+    trigger: Release an on-demand plugin early or recover a stale session hold without hand-editing Claude settings.
+  - name: schedule
+    trigger: Turn a recurring request into a validated headless Claude task with an account, schedule, prompt, repository, and optional profile.
+tips:
+  - Start with the Claude Code plugin so Claude can guide profile creation; open the TUI when you want to inspect or tune the result visually.
+  - Keep narrowly useful plugins on-demand so they consume no session budget until a task actually needs them.
+traps:
+  - The plugin guides cc-loadout but does not install the binary; install the CLI engine before running a bundled skill.
