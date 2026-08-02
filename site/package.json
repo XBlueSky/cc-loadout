@@ -8,6 +8,7 @@
   },
   "scripts": {
     "brand:derive": "node scripts/derive-brand-mark.mjs",
+    "demo:derive": "node scripts/derive-demo-still.mjs",
     "dev": "npm run manifest:generate --prefix .. && astro dev",
     "prebuild": "npm run manifest:generate --prefix ..",
     "build": "astro build && node scripts/publish-manifest.mjs",
