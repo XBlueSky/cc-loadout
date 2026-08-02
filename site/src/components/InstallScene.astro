@@ -1,0 +1,35 @@
+<section id="install" class="scene install-scene" data-motion-scene="install">
+  <div class="site-shell install-layout">
+    <div class="install-heading">
+      <p class="operational-label">Engine first. Guidance second.</p>
+      <h2>Ready the complete loadout.</h2>
+      <p>The plugin guides the workflow; the CLI performs the validated changes.</p>
+    </div>
+
+    <div class="install-steps">
+      <article class="install-step">
+        <h3>1 · Install the CLI engine</h3>
+        <div class="command-block">
+          <code>curl -sSL https://raw.githubusercontent.com/XBlueSky/cc-loadout/master/install.sh | bash</code>
+          <button type="button" data-copy-command="curl -sSL https://raw.githubusercontent.com/XBlueSky/cc-loadout/master/install.sh | bash" aria-label="Copy CLI installation command">Copy</button>
+        </div>
+      </article>
+
+      <article class="install-step">
+        <h3>2 · Install the Claude Code plugin</h3>
+        <div class="command-block">
+          <code>/plugin marketplace add https://github.com/XBlueSky/cc-loadout</code>
+          <button type="button" data-copy-command="/plugin marketplace add https://github.com/XBlueSky/cc-loadout" aria-label="Copy marketplace command">Copy</button>
+        </div>
+        <div class="command-block">
+          <code>/plugin install cc-loadout@cc-loadout</code>
+          <button type="button" data-copy-command="/plugin install cc-loadout@cc-loadout" aria-label="Copy plugin installation command">Copy</button>
+        </div>
+      </article>
+    </div>
+
+    <a class="install-cta" href="https://github.com/XBlueSky/cc-loadout#readme">Open the setup guide <span aria-hidden="true">↗</span></a>
+  </div>
+</section>
+
+<script src="../scripts/copy-command.ts"></script>

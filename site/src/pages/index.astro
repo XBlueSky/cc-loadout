@@ -1,10 +1,22 @@
 ---
 import Layout from '../layouts/Layout.astro';
+import HeroScene from '../components/HeroScene.astro';
+import InstallScene from '../components/InstallScene.astro';
+import ProblemScene from '../components/ProblemScene.astro';
+import ProfilesScene from '../components/ProfilesScene.astro';
+import SiteFooter from '../components/SiteFooter.astro';
+import SiteHeader from '../components/SiteHeader.astro';
+import TuiScene from '../components/TuiScene.astro';
 import { loadSiteData } from '../lib/manifest.mjs';
 
 const { plugin } = await loadSiteData();
 ---
 <Layout title="cc-loadout — One plugin. Every loadout." description={plugin.tagline}>
-  <h1>One plugin. Every loadout.</h1>
-  <p>{plugin.intro}</p>
+  <SiteHeader />
+  <HeroScene tagline={plugin.tagline} intro={plugin.intro} />
+  <ProblemScene />
+  <ProfilesScene />
+  <TuiScene />
+  <InstallScene />
+  <SiteFooter />
 </Layout>

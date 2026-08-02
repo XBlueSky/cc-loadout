@@ -1,0 +1,19 @@
+---
+interface Props {
+  tagline: string;
+  intro: string;
+}
+
+const { tagline, intro } = Astro.props;
+---
+<section id="hero" class="scene hero-scene site-shell" data-motion-scene="hero">
+  <p class="eyebrow">Claude Code loadout manager</p>
+  <h1>One plugin.<br /><span>Every loadout.</span></h1>
+  <p class="hero-copy">{tagline}</p>
+  <p class="hero-detail">{intro}</p>
+  <div class="hero-actions">
+    <a class="button button-primary" href="#install">Ready your loadout</a>
+    <a class="button button-secondary" href="https://github.com/XBlueSky/cc-loadout">View on GitHub</a>
+  </div>
+  <div class="brand-frame" aria-hidden="true"><img src="/logo.png" alt="" /></div>
+</section>
