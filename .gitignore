@@ -5,6 +5,7 @@
 
 # Superpowers / brainstorming intermediate artifacts — kept locally, not committed
 docs/superpowers/
+/.worktrees/
 *.plan.md
 plans/
 
