@@ -1,0 +1,32 @@
+name: Site
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  site:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm ci --prefix site
+      - run: npm run manifest:check
+      - run: npm run site:build
+      - run: npm run test:manifest
+      - run: npm run site:test
+      - name: Verify deploy output
+        run: test -f site/dist/index.html && test -f site/dist/manifest.json
