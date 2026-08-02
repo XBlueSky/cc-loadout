@@ -18,3 +18,13 @@ test('homepage renders the approved product story and honest install flow', asyn
   assert.match(html, /\/plugin marketplace add https:\/\/github\.com\/xbluesky\/cc-loadout/i);
   assert.match(html, /\/plugin install cc-loadout@cc-loadout/);
 });
+
+test('homepage keeps page landmarks outside main and announces copy feedback', async () => {
+  const html = await readFile(htmlUrl, 'utf8');
+  assert.match(html, /<header\b[\s\S]*?<\/header>\s*<main id=["']main["']>/);
+  assert.match(html, /<\/main>\s*<footer\b/);
+
+  const copyButtons = html.match(/<button\b[^>]*data-copy-command[^>]*>/g) ?? [];
+  assert.equal(copyButtons.length, 3);
+  assert.ok(copyButtons.every((button) => /aria-live=["']polite["']/.test(button)));
+});

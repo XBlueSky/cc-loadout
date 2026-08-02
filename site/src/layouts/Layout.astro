@@ -21,8 +21,10 @@ const { title, description } = Astro.props;
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to main content</a>
+    <slot name="header" />
     <main id="main">
       <slot />
     </main>
+    <slot name="footer" />
   </body>
 </html>

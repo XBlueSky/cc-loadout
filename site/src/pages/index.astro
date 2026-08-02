@@ -12,11 +12,11 @@ import { loadSiteData } from '../lib/manifest.mjs';
 const { plugin } = await loadSiteData();
 ---
 <Layout title="cc-loadout — One plugin. Every loadout." description={plugin.tagline}>
-  <SiteHeader />
+  <SiteHeader slot="header" />
   <HeroScene tagline={plugin.tagline} intro={plugin.intro} />
   <ProblemScene />
   <ProfilesScene />
   <TuiScene />
   <InstallScene />
-  <SiteFooter />
+  <SiteFooter slot="footer" />
 </Layout>
