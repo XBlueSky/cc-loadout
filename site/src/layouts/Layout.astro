@@ -1,4 +1,7 @@
 ---
+import '../styles/fonts.css';
+import '../styles/global.css';
+
 interface Props {
   title: string;
   description: string;
@@ -10,12 +13,14 @@ const { title, description } = Astro.props;
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
+    <meta name="theme-color" content="#171717" />
+    <link rel="icon" href="/logo.png" type="image/png" />
     <title>{title}</title>
   </head>
   <body>
-    <a href="#main">Skip to main content</a>
+    <a class="skip-link" href="#main">Skip to main content</a>
     <main id="main">
       <slot />
     </main>
