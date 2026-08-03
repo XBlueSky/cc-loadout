@@ -1,0 +1,20 @@
+{
+  "name": "cc-loadout-site-tooling",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "manifest:check": "cc-marketspec --check",
+    "manifest:generate": "cc-marketspec",
+    "test:manifest": "node --test tests/site-manifest.test.mjs",
+    "test:ci": "node --test tests/site-ci.test.mjs",
+    "site:build": "npm run build --prefix site",
+    "site:test": "npm run test --prefix site",
+    "site:verify": "npm run manifest:check && npm run site:build && npm run test:manifest && npm run site:test && npm run test:ci"
+  },
+  "devDependencies": {
+    "@xbluesky/cc-marketspec": "1.0.0"
+  }
+}

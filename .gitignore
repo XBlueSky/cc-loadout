@@ -2,9 +2,15 @@
 # install.sh seeds ~/.claude/profiles/profiles.json from the template; the
 # canonical config thereafter lives there, not in the repo working tree.
 /profiles.json
+/node_modules/
+/site/node_modules/
+/site/.astro/
+/site/dist/
 
 # Superpowers / brainstorming intermediate artifacts — kept locally, not committed
 docs/superpowers/
+/.superpowers/
+/.worktrees/
 *.plan.md
 plans/
 

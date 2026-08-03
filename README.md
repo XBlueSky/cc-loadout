@@ -274,6 +274,29 @@ To override detection, write profile names (one per line) to `.claude/profile`, 
 - These are Claude Code's **internal, undocumented** files and may change between releases. A switch verifies the result and fails loudly rather than silently leaving you on the wrong account.
 - `account use` swaps credentials only by default; pass `--launch` to relaunch Claude (`claude --continue`). A running Claude reads the login into memory at startup, so it won't pick up the new account until it is restarted.
 
+## Website
+
+```bash
+npm ci
+npm ci --prefix site
+npm run site:verify
+npm run dev --prefix site
+```
+
+Set up Cloudflare Pages once through its Git integration:
+
+- Repository: `XBlueSky/cc-loadout`
+- Production branch: `master`
+- Root directory: repository root
+- Build command: `npm ci && npm ci --prefix site && npm run site:build`
+- Build output directory: `site/dist`
+- Environment variables (Cloudflare Pages dashboard):
+  - `NODE_VERSION=22`
+  - `SITE_URL=https://cc-loadout.pages.dev` (replace with the canonical custom domain when one is connected)
+
+GitHub Actions validates pull requests, and Cloudflare Pages owns deployment.
+Neither workflow commits generated manifests.
+
 ## Development
 
 ```bash
