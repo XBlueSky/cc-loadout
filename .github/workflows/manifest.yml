@@ -1,0 +1,42 @@
+# Source-only workflow. The generated artifact is for same-pipeline transfer or
+# inspection, not a stable public endpoint. Deploy external consumer output with
+# the site to Pages, a CDN, or object storage.
+name: Marketplace data
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx --no-install cc-marketspec --check
+
+  generate:
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx --no-install cc-marketspec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cc-marketspec-manifest
+          path: .cc-marketspec/dist/manifest.json
+          if-no-files-found: error

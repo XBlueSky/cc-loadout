@@ -1,0 +1,8 @@
+# Marketplace-level presentation; native identity stays in .claude-plugin/marketplace.json.
+# yaml-language-server: $schema=../node_modules/@xbluesky/cc-marketspec/schemas/catalog.schema.json
+schemaVersion: "1.1"
+lang: en
+groups:
+  - id: workflow
+    label: Developer workflow
+    note: Tools that keep Claude Code focused, visible, and ready for each repository
