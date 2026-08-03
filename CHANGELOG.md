@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-08-03
+
+### Bug Fixes
+
+- document Cloudflare Pages Node version
+- add canonical site metadata
+- use representative reduced-motion demo
+- use public registry lockfiles
+- stabilize copy control announcements
+- clarify compact brand and copy controls
+- respect reduced motion for TUI demo
+- improve page landmarks and copy feedback
+- ignore generated Astro site artifacts
+
+### CI/CD
+
+- validate and build cc-loadout website
+
+### Documentation
+
+- add logo to readmes
+
+### Features
+
+- publish site metadata and manifest
+- add cinematic scroll storytelling
+- build cc-loadout product story
+- scaffold manifest-driven Astro site
+- add marketplace presentation data
+
+### Miscellaneous
+
+- ignore local node modules
+- ignore local worktrees
+
 ## [0.1.20] - 2026-07-31
 
 ### Bug Fixes
