@@ -1,5 +1,11 @@
 # cc-loadout
 
+<p align="center">
+  <a href="https://cc-loadout.pages.dev/">
+    <img src="site/public/logo.png" alt="cc-loadout 標誌" width="520">
+  </a>
+</p>
+
 > Claude Code loadout 管理器 —— 在多個 Claude 帳號間切換,並為每個 repo 組好、套上對的 plugin profile。
 
 [![CI](https://github.com/xbluesky/cc-loadout/actions/workflows/ci.yml/badge.svg)](https://github.com/xbluesky/cc-loadout/actions/workflows/ci.yml)
