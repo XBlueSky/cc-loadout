@@ -1,5 +1,11 @@
 # cc-loadout
 
+<p align="center">
+  <a href="https://cc-loadout.pages.dev/">
+    <img src="site/public/logo.png" alt="cc-loadout logo" width="520">
+  </a>
+</p>
+
 > Claude Code loadout manager — switch between Claude accounts, and build + apply the right plugin profile for each repo.
 
 [![CI](https://github.com/xbluesky/cc-loadout/actions/workflows/ci.yml/badge.svg)](https://github.com/xbluesky/cc-loadout/actions/workflows/ci.yml)
