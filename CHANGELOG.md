@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-08-04
+
+### Features
+
+- let scheduled tasks pick a model, force primes onto haiku
+
 ## [0.1.21] - 2026-08-03
 
 ### Bug Fixes
