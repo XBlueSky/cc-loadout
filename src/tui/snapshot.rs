@@ -34,6 +34,10 @@ pub struct TaskRow {
     pub account: String,
     pub times: Vec<String>,
     pub next_fire: Option<OffsetDateTime>,
+    /// The model this run will actually pass to `claude` — `None` ⇒ none pinned,
+    /// so the CLI picks. Resolved via `TaskDef::effective_model`, which is why a
+    /// prime shows `haiku` even when its entry pins nothing.
+    pub model: Option<String>,
     pub last_status: Option<String>,
 }
 
@@ -140,6 +144,7 @@ impl Snapshot {
             .into_iter()
             .map(|(id, d)| TaskRow {
                 next_fire: account::timing::next_fire(&d.times, now_local),
+                model: d.effective_model().map(str::to_string),
                 id,
                 kind: d.kind,
                 account: d.account,

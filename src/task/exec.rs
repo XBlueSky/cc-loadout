@@ -4,42 +4,52 @@ use std::time::Duration;
 
 use crate::account::prime::wait_with_timeout;
 
-/// Run `claude -p <prompt> --session-id <session_id>` in `cwd`. When `cfg_dir`
-/// is `Some`, run isolated under that CLAUDE_CONFIG_DIR; when `None`, inherit the
-/// live ~/.claude. Kills the child on timeout.
-///
-/// `skip_record` exports `CORTEX_SKIP_RECORD=1` to the child, telling cortex's
-/// SessionEnd hook not to record the session into the vault's Raw/ — used for
-/// probe pings whose transcripts carry no distill-worthy content. Real tasks
-/// pass `false` so their sessions stay recorded.
-pub fn run_claude(
-    claude_bin: &Path,
-    cfg_dir: Option<&Path>,
-    cwd: &Path,
-    prompt: &str,
-    session_id: &str,
-    timeout: Duration,
-    skip_record: bool,
-) -> Result<()> {
+/// Everything one headless `claude -p` invocation needs. A struct rather than a
+/// parameter list because the list had already reached the point where callers
+/// could silently swap two same-typed arguments.
+pub struct RunSpec<'a> {
+    /// `Some` ⇒ run isolated under this CLAUDE_CONFIG_DIR; `None` ⇒ inherit the
+    /// live ~/.claude.
+    pub cfg_dir: Option<&'a Path>,
+    pub cwd: &'a Path,
+    pub prompt: &'a str,
+    pub session_id: &'a str,
+    /// `Some` ⇒ pass `--model`; `None` ⇒ pass no flag and let the CLI resolve
+    /// its own default (settings.json / account default).
+    pub model: Option<&'a str>,
+    pub timeout: Duration,
+    /// Exports `CORTEX_SKIP_RECORD=1` to the child, telling cortex's SessionEnd
+    /// hook not to record the session into the vault's Raw/ — used for probe
+    /// pings whose transcripts carry no distill-worthy content. Real tasks pass
+    /// `false` so their sessions stay recorded.
+    pub skip_record: bool,
+}
+
+/// Run `claude -p <prompt> --session-id <id> [--model <m>]` in `spec.cwd`.
+/// Kills the child on timeout.
+pub fn run_claude(claude_bin: &Path, spec: &RunSpec<'_>) -> Result<()> {
     let mut child = crate::util::retry_etxtbsy(|| {
         let mut cmd = std::process::Command::new(claude_bin);
         cmd.arg("-p")
-            .arg(prompt)
+            .arg(spec.prompt)
             .arg("--session-id")
-            .arg(session_id)
-            .current_dir(cwd)
+            .arg(spec.session_id)
+            .current_dir(spec.cwd)
             .stdin(std::process::Stdio::null());
-        if let Some(dir) = cfg_dir {
+        if let Some(model) = spec.model {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(dir) = spec.cfg_dir {
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
-        if skip_record {
+        if spec.skip_record {
             cmd.env("CORTEX_SKIP_RECORD", "1");
         }
         cmd.spawn()
     })
     .context("running `claude -p`")?;
 
-    let status = wait_with_timeout(&mut child, timeout)?;
+    let status = wait_with_timeout(&mut child, spec.timeout)?;
     if !status.success() {
         bail!("`claude -p` failed (exit {:?})", status.code());
     }
@@ -51,6 +61,60 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
+
+    /// A spec with the given model, pointed at `cwd`; other fields are defaults
+    /// the model tests don't care about.
+    fn spec<'a>(cwd: &'a Path, model: Option<&'a str>) -> RunSpec<'a> {
+        RunSpec {
+            cfg_dir: None,
+            cwd,
+            prompt: "hi",
+            session_id: "55555555-5555-5555-5555-555555555555",
+            model,
+            timeout: Duration::from_secs(10),
+            skip_record: false,
+        }
+    }
+
+    /// Fake claude that dumps its whole argv, one word per line, into `argv-dump`.
+    fn fake_argv_dump_claude(dir: &Path) -> std::path::PathBuf {
+        let p = dir.join("claude");
+        std::fs::write(
+            &p,
+            "#!/bin/sh\n: > argv-dump\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> argv-dump; done\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_model_is_passed_through_as_a_model_flag() {
+        let bin = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let claude = fake_argv_dump_claude(bin.path());
+        run_claude(&claude, &spec(cwd.path(), Some("haiku"))).unwrap();
+        let argv = std::fs::read_to_string(cwd.path().join("argv-dump")).unwrap();
+        let words: Vec<&str> = argv.lines().collect();
+        let i = words
+            .iter()
+            .position(|w| *w == "--model")
+            .expect("--model must be passed");
+        assert_eq!(words.get(i + 1), Some(&"haiku"));
+    }
+
+    #[test]
+    fn no_model_leaves_the_flag_off_so_the_cli_picks() {
+        let bin = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let claude = fake_argv_dump_claude(bin.path());
+        run_claude(&claude, &spec(cwd.path(), None)).unwrap();
+        let argv = std::fs::read_to_string(cwd.path().join("argv-dump")).unwrap();
+        assert!(
+            !argv.lines().any(|w| w == "--model"),
+            "no model must mean no --model flag, not an empty one: {argv:?}"
+        );
+    }
 
     /// Fake claude: asserts CLAUDE_CONFIG_DIR + --session-id were passed, then
     /// writes a marker file named after the session id into the cwd.
@@ -89,12 +153,12 @@ mod tests {
         let claude = fake_env_dump_claude(bin.path());
         run_claude(
             &claude,
-            None,
-            cwd.path(),
-            "ping",
-            "33333333-3333-3333-3333-333333333333",
-            Duration::from_secs(10),
-            true, // skip_record: probe-style run
+            &RunSpec {
+                prompt: "ping",
+                session_id: "33333333-3333-3333-3333-333333333333",
+                skip_record: true, // probe-style run
+                ..spec(cwd.path(), None)
+            },
         )
         .unwrap();
         assert_eq!(
@@ -111,12 +175,12 @@ mod tests {
         let claude = fake_env_dump_claude(bin.path());
         run_claude(
             &claude,
-            None,
-            cwd.path(),
-            "real work",
-            "44444444-4444-4444-4444-444444444444",
-            Duration::from_secs(10),
-            false, // skip_record: real task, keep cortex recording
+            &RunSpec {
+                prompt: "real work",
+                session_id: "44444444-4444-4444-4444-444444444444",
+                skip_record: false, // real task, keep cortex recording
+                ..spec(cwd.path(), None)
+            },
         )
         .unwrap();
         assert_eq!(
@@ -133,12 +197,11 @@ mod tests {
         let claude = fake_claude(bin.path());
         run_claude(
             &claude,
-            None,
-            cwd.path(),
-            "hello",
-            "11111111-1111-1111-1111-111111111111",
-            Duration::from_secs(10),
-            false,
+            &RunSpec {
+                prompt: "hello",
+                session_id: "11111111-1111-1111-1111-111111111111",
+                ..spec(cwd.path(), None)
+            },
         )
         .unwrap();
         assert!(cwd
@@ -156,12 +219,12 @@ mod tests {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         let err = run_claude(
             &p,
-            None,
-            cwd.path(),
-            "x",
-            "22222222-2222-2222-2222-222222222222",
-            Duration::from_secs(5),
-            false,
+            &RunSpec {
+                prompt: "x",
+                session_id: "22222222-2222-2222-2222-222222222222",
+                timeout: Duration::from_secs(5),
+                ..spec(cwd.path(), None)
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("claude -p"));

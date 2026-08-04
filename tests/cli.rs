@@ -941,6 +941,122 @@ fn task_add_and_list() {
 }
 
 #[test]
+fn task_add_records_a_pinned_model_and_list_shows_it() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    let bin = tempfile::tempdir().unwrap();
+    let patched_path = fake_crontab_path(bin.path());
+
+    cmd(home, data)
+        .env("PATH", &patched_path)
+        .args([
+            "task",
+            "add",
+            "weekly",
+            "--account",
+            "work",
+            "--at",
+            "07:00",
+            "--prompt",
+            "/cortex:weekly",
+            "--cwd",
+            cwd_dir.path().to_str().unwrap(),
+            "--model",
+            "claude-sonnet-4-6",
+        ])
+        .assert()
+        .success();
+
+    // Plain `list` names the model the run will actually use; --json carries the
+    // pinned value.
+    cmd(home, data)
+        .args(["task", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model=claude-sonnet-4-6"));
+    cmd(home, data)
+        .args(["task", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"model\": \"claude-sonnet-4-6\""));
+}
+
+#[test]
+fn task_add_rejects_a_flag_like_model() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    let bin = tempfile::tempdir().unwrap();
+    let patched_path = fake_crontab_path(bin.path());
+
+    cmd(home, data)
+        .env("PATH", &patched_path)
+        .args([
+            "task",
+            "add",
+            "weekly",
+            "--account",
+            "work",
+            "--at",
+            "07:00",
+            "--prompt",
+            "/cortex:weekly",
+            "--cwd",
+            cwd_dir.path().to_str().unwrap(),
+            "--model",
+            "--dangerously-skip-permissions",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid model"));
+}
+
+#[test]
+fn task_list_shows_that_a_prime_runs_on_the_cheap_model() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let data = ddir.path();
+
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+    let bin = tempfile::tempdir().unwrap();
+    let patched_path = fake_crontab_path(bin.path());
+
+    cmd(home, data)
+        .env("PATH", &patched_path)
+        .args(["account", "schedule", "set", "work", "06:00"])
+        .assert()
+        .success();
+
+    cmd(home, data)
+        .args(["task", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("model=haiku"));
+}
+
+#[test]
 fn hook_session_start_exports_the_session_id() {
     let hdir = tempfile::tempdir().unwrap();
     let ddir = tempfile::tempdir().unwrap();

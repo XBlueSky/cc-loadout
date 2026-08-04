@@ -42,6 +42,12 @@ fn default_tasks_version() -> u32 {
     TASKS_VERSION
 }
 
+/// Model a prime ping runs on. A prime exists only to open the 5-hour usage
+/// window — its prompt is a throwaway "ok", so it has no business burning the
+/// account's default (currently the top tier). Forced for every `kind: prime`
+/// run unless that task pins an explicit `model`.
+pub const PING_MODEL: &str = "haiku";
+
 /// A prime fires a cheap ping to anchor a window; a task runs a real prompt and
 /// persists a resumable session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +71,11 @@ pub struct TaskDef {
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Model this run passes to `claude --model`. `None` ⇒ inherit whatever the
+    /// CLI resolves by itself (settings.json / account default), except for
+    /// primes, which fall back to [`PING_MODEL`]. See [`TaskDef::effective_model`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Session id of the most recent SUCCESSFUL run, for `task resume`. A failed
     /// run updates only `last_status`/`last_run` and leaves this pointing at the
     /// last good run (so you can still resume the last working session).
@@ -81,11 +92,32 @@ pub struct TaskDef {
 }
 
 impl TaskDef {
+    /// The `--model` this run should pass, if any:
+    ///
+    /// 1. an explicit, non-blank `model` — always wins, primes included;
+    /// 2. otherwise [`PING_MODEL`] for a prime, whose prompt is a throwaway ping;
+    /// 3. otherwise `None` — let the CLI resolve its own default.
+    pub fn effective_model(&self) -> Option<&str> {
+        match self.model.as_deref().map(str::trim) {
+            Some(m) if !m.is_empty() => Some(m),
+            _ if self.kind == Kind::Prime => Some(PING_MODEL),
+            _ => None,
+        }
+    }
+
     /// Static well-formedness: tasks need a prompt + cwd; primes need neither;
     /// every entry needs at least one time.
     pub fn validate(&self) -> Result<()> {
         if self.times.is_empty() {
             bail!("no times given");
+        }
+        // A model reaches `claude` as its own argv word, so anything that could
+        // be read as another flag — or as several words — is rejected here
+        // rather than silently changing what the scheduled run does.
+        if let Some(m) = self.model.as_deref().map(str::trim) {
+            if !m.is_empty() && (m.starts_with('-') || m.split_whitespace().count() > 1) {
+                bail!("invalid model '{m}': expected a single alias or model name (e.g. haiku, claude-sonnet-4-6)");
+            }
         }
         if self.kind == Kind::Task {
             if self.prompt.as_deref().unwrap_or("").trim().is_empty() {
@@ -177,6 +209,7 @@ mod tests {
             prompt: Some("/cortex:weekly".into()),
             cwd: Some(PathBuf::from("/workspace/cortex")),
             profile: Some("cortex".into()),
+            model: None,
             last_session_id: None,
             last_config_dir: None,
             last_run: None,
@@ -233,6 +266,7 @@ mod tests {
             prompt: None,
             cwd: None,
             profile: None,
+            model: None,
             last_session_id: None,
             last_config_dir: None,
             last_run: None,
@@ -246,5 +280,61 @@ mod tests {
         let mut e = task_entry();
         e.times.clear();
         assert!(e.validate().unwrap_err().to_string().contains("no times"));
+    }
+
+    #[test]
+    fn task_without_a_model_inherits_the_cli_default() {
+        assert_eq!(task_entry().effective_model(), None);
+    }
+
+    #[test]
+    fn prime_without_a_model_forces_the_cheap_ping_model() {
+        let mut e = task_entry();
+        e.kind = Kind::Prime;
+        assert_eq!(e.effective_model(), Some(PING_MODEL));
+    }
+
+    #[test]
+    fn explicit_model_wins_over_the_prime_default() {
+        let mut e = task_entry();
+        e.kind = Kind::Prime;
+        e.model = Some("opus".into());
+        assert_eq!(e.effective_model(), Some("opus"));
+    }
+
+    #[test]
+    fn blank_model_is_treated_as_unset() {
+        let mut e = task_entry();
+        e.model = Some("   ".into());
+        assert_eq!(e.effective_model(), None);
+    }
+
+    #[test]
+    fn validate_rejects_a_flag_like_model() {
+        let mut e = task_entry();
+        e.model = Some("--dangerously-skip-permissions".into());
+        assert!(e.validate().unwrap_err().to_string().contains("model"));
+    }
+
+    #[test]
+    fn validate_rejects_a_model_with_whitespace() {
+        let mut e = task_entry();
+        e.model = Some("claude sonnet".into());
+        assert!(e.validate().unwrap_err().to_string().contains("model"));
+    }
+
+    #[test]
+    fn model_roundtrips_through_tasks_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = tasks_path(dir.path());
+        let mut t = Tasks::default();
+        let mut e = task_entry();
+        e.model = Some("haiku".into());
+        t.tasks.insert("weekly".into(), e);
+        save(&p, &t).unwrap();
+        assert_eq!(
+            load(&p).unwrap().tasks["weekly"].model.as_deref(),
+            Some("haiku")
+        );
     }
 }

@@ -129,10 +129,14 @@ pub(crate) fn prime_with(
     // 2. Run `claude -p <prompt>` isolated to that config dir.
     // CORTEX_SKIP_RECORD: probe pings carry no distill-worthy content — tell
     // cortex's SessionEnd hook (inherits this env) not to record a Raw.
+    // --model: a ping only has to open the window, so it runs on the cheap model
+    // (same constant the scheduler forces on `kind: prime` runs).
     let mut child = crate::util::retry_etxtbsy(|| {
         std::process::Command::new(claude_bin)
             .arg("-p")
             .arg(prompt)
+            .arg("--model")
+            .arg(crate::task::config::PING_MODEL)
             .env("CLAUDE_CONFIG_DIR", &cfg_dir)
             .env("CORTEX_SKIP_RECORD", "1")
             .stdin(std::process::Stdio::null())
@@ -203,6 +207,59 @@ mod tests {
             &json!({"emailAddress": "a@b.com"}),
         )
         .unwrap();
+    }
+
+    /// Fake `claude` that appends its argv, one word per line, to `<dir>/argv-dump`
+    /// — an absolute path baked in at write time, because the child's cwd and its
+    /// ephemeral CLAUDE_CONFIG_DIR are both gone by the time the test looks.
+    fn fake_argv_dump_claude(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("claude");
+        let dump = dir.join("argv-dump");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n: > {dump}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {dump}; done\nexit 0\n",
+                dump = dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn a_manual_prime_ping_runs_on_the_cheap_model() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        fake_argv_dump_claude(bin.path());
+
+        let store = Store::new(data.path());
+        snapshot_account(&store, "work");
+        let mut st = store.load_state().unwrap();
+        st.accounts.insert("work".into(), Default::default());
+        st.active_alias = Some("other".into());
+        store.save_state(&st).unwrap();
+
+        let claude_live = paths::resolve(home.path(), None);
+        prime_with(
+            &bin.path().join("claude"),
+            &store,
+            &claude_live,
+            home.path(),
+            "work",
+            "ok",
+            1700,
+        )
+        .unwrap();
+
+        let argv = std::fs::read_to_string(bin.path().join("argv-dump")).unwrap();
+        let words: Vec<&str> = argv.lines().collect();
+        let i = words
+            .iter()
+            .position(|w| *w == "--model")
+            .expect("a prime ping must pin a model rather than burn the account default");
+        assert_eq!(words.get(i + 1), Some(&crate::task::config::PING_MODEL));
     }
 
     #[test]

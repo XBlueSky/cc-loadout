@@ -97,14 +97,19 @@ pub(crate) fn run_task_with(
 
     let result = exec::run_claude(
         claude_bin,
-        cfg_dir.as_deref(),
-        &cwd,
-        &prompt,
-        &session_id,
-        Duration::from_secs(TASK_TIMEOUT_SECS),
-        // Probe pings have no distill-worthy transcript — suppress the cortex
-        // Raw. Real tasks stay recorded.
-        def.kind == config::Kind::Prime,
+        &exec::RunSpec {
+            cfg_dir: cfg_dir.as_deref(),
+            cwd: &cwd,
+            prompt: &prompt,
+            session_id: &session_id,
+            // `None` here means "no --model flag" — the CLI then resolves its own
+            // default. Primes resolve to the cheap ping model instead.
+            model: def.effective_model(),
+            timeout: Duration::from_secs(TASK_TIMEOUT_SECS),
+            // Probe pings have no distill-worthy transcript — suppress the cortex
+            // Raw. Real tasks stay recorded.
+            skip_record: def.kind == config::Kind::Prime,
+        },
     );
 
     // Sync rotated credentials back to the snapshot (isolated path only).
@@ -186,6 +191,123 @@ mod tests {
         assert_eq!(run_location("work", None), RunLocation::Isolated);
     }
 
+    /// Run one task through `run_task_with` against a fake claude that dumps its
+    /// argv into `<cwd>/argv-dump`, and return those words. The account is never
+    /// the active one, so the run takes the isolated path.
+    fn argv_of_run(kind: crate::task::config::Kind, model: Option<&str>) -> Vec<String> {
+        use crate::account::creds;
+        use crate::account::store::{AccountMeta, Store};
+        use crate::task::config::{self, TaskDef};
+        use serde_json::json;
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+
+        let claude = bin.path().join("claude");
+        std::fs::write(
+            &claude,
+            "#!/bin/sh\n: > argv-dump\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> argv-dump; done\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = Store::new(data.path());
+        store.ensure_account_dir("work").unwrap();
+        creds::write_credentials(
+            &store.credentials_snapshot("work"),
+            &json!({"claudeAiOauth":{"accessToken":"A","refreshToken":"R"}}),
+        )
+        .unwrap();
+        let mut st = store.load_state().unwrap();
+        st.accounts.insert(
+            "work".into(),
+            AccountMeta {
+                email: "a@b".into(),
+                ..Default::default()
+            },
+        );
+        st.active_alias = Some("other".into()); // not active → isolated
+        store.save_state(&st).unwrap();
+
+        let tp = config::tasks_path(data.path());
+        let mut tasks = config::Tasks::default();
+        tasks.tasks.insert(
+            "t".into(),
+            TaskDef {
+                kind,
+                account: "work".into(),
+                times: vec!["07:00".into()],
+                prompt: Some("hi".into()),
+                cwd: Some(cwd.path().to_path_buf()),
+                profile: None,
+                model: model.map(str::to_string),
+                last_session_id: None,
+                last_config_dir: None,
+                last_run: None,
+                last_status: None,
+            },
+        );
+        config::save(&tp, &tasks).unwrap();
+
+        let live_plugins = home.path().join(".claude").join("plugins");
+        std::fs::create_dir_all(&live_plugins).unwrap();
+        run_task_with(
+            &claude,
+            &store,
+            data.path(),
+            home.path(),
+            &live_plugins,
+            "t",
+            1700,
+        )
+        .unwrap();
+
+        std::fs::read_to_string(cwd.path().join("argv-dump"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        let i = argv.iter().position(|w| w == flag)?;
+        argv.get(i + 1).map(String::as_str)
+    }
+
+    #[test]
+    fn a_scheduled_prime_is_forced_onto_the_cheap_ping_model() {
+        let argv = argv_of_run(crate::task::config::Kind::Prime, None);
+        assert_eq!(
+            flag_value(&argv, "--model"),
+            Some(crate::task::config::PING_MODEL),
+            "a prime must not burn the account default: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_task_without_a_model_passes_no_model_flag() {
+        let argv = argv_of_run(crate::task::config::Kind::Task, None);
+        assert!(
+            !argv.iter().any(|w| w == "--model"),
+            "an unpinned task must inherit the CLI default: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_task_model_reaches_claude() {
+        let argv = argv_of_run(crate::task::config::Kind::Task, Some("claude-sonnet-4-6"));
+        assert_eq!(flag_value(&argv, "--model"), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn a_pinned_prime_model_overrides_the_ping_default() {
+        let argv = argv_of_run(crate::task::config::Kind::Prime, Some("sonnet"));
+        assert_eq!(flag_value(&argv, "--model"), Some("sonnet"));
+    }
+
     #[test]
     fn task_runs_isolated_for_non_active_and_records_session() {
         use crate::account::creds;
@@ -237,6 +359,7 @@ mod tests {
                 prompt: Some("hi".into()),
                 cwd: Some(cwd.path().to_path_buf()),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -321,6 +444,7 @@ mod tests {
                 prompt: None,
                 cwd: None,
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -414,6 +538,7 @@ mod tests {
                 prompt: None,
                 cwd: None,
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -486,6 +611,7 @@ mod tests {
                 prompt: Some("hi".into()),
                 cwd: Some(cwd.path().to_path_buf()),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,

@@ -151,8 +151,8 @@ impl View for TasksView {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "  {:<20}{:<8}{:<14}{:<8}{:<18}{}",
-                    "id", "kind", "account", "next", "times", "status"
+                    "  {:<20}{:<8}{:<14}{:<8}{:<18}{:<14}{}",
+                    "id", "kind", "account", "next", "times", "model", "status"
                 ),
                 theme::dim(),
             ))),
@@ -174,12 +174,23 @@ impl View for TasksView {
                     row.times.join(" ")
                 };
                 let status_str = row.last_status.as_deref().unwrap_or("—");
+                // Full model names ("claude-sonnet-4-6") are wider than the
+                // column, so clip rather than let one row shove `status` right
+                // and break the alignment with the header.
+                let model_str = match row.model.as_deref() {
+                    Some(m) if m.chars().count() > 13 => {
+                        let head: String = m.chars().take(12).collect();
+                        format!("{head}…")
+                    }
+                    Some(m) => m.to_string(),
+                    None => "—".to_string(),
+                };
                 let spans = vec![Span::styled(
                     // The `kind` cell is `[xxxxx] ` = 8 chars, matching the
                     // header's `{:<8}` column so every column to its right
-                    // (account/next/times/status) lines up with its label.
+                    // (account/next/times/model/status) lines up with its label.
                     format!(
-                        "{:<20}[{kind_str:<5}] {:<14}{:<8}{:<18}{status_str}",
+                        "{:<20}[{kind_str:<5}] {:<14}{:<8}{:<18}{model_str:<14}{status_str}",
                         row.id, row.account, next_str, times_str,
                     ),
                     theme::text(),
@@ -248,6 +259,12 @@ mod tests {
             tasks: rows
                 .into_iter()
                 .map(|(id, kind)| TaskRow {
+                    model: match kind {
+                        crate::task::config::Kind::Prime => {
+                            Some(crate::task::config::PING_MODEL.into())
+                        }
+                        crate::task::config::Kind::Task => None,
+                    },
                     id: id.into(),
                     kind,
                     account: "work".into(),
@@ -305,6 +322,51 @@ mod tests {
             matches!(act, Some(Action::RemoveTask(ref id)) if id == "weekly"),
             "expected RemoveTask(\"weekly\"), got {act:?}"
         );
+    }
+
+    fn buffer_text(t: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        t.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn rendered(snap: &Snapshot) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 8)).unwrap();
+        let v = TasksView::new();
+        terminal
+            .draw(|f| {
+                v.render(
+                    f,
+                    f.area(),
+                    snap,
+                    0,
+                    OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                )
+            })
+            .unwrap();
+        buffer_text(&terminal)
+    }
+
+    #[test]
+    fn a_prime_row_names_the_cheap_model_it_is_forced_onto() {
+        let s = snap_with(vec![("work", crate::task::config::Kind::Prime)]);
+        let text = rendered(&s);
+        assert!(
+            text.contains(crate::task::config::PING_MODEL),
+            "prime row must show the model it runs on: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_task_row_names_its_model() {
+        let mut s = snap_with(vec![("weekly", crate::task::config::Kind::Task)]);
+        s.tasks[0].model = Some("sonnet".into());
+        let text = rendered(&s);
+        assert!(text.contains("sonnet"), "{text:?}");
     }
 
     #[test]
