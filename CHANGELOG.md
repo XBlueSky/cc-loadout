@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-08-04
+
+### Bug Fixes
+
+- bump scan cache version so caches from the old walk are rebuilt
+- find repos whose .git is a symlink or file, prune tooling trees
+
 ## [0.1.22] - 2026-08-04
 
 ### Features
