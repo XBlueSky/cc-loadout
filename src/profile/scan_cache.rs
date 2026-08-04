@@ -9,8 +9,17 @@ use std::path::{Path, PathBuf};
 use crate::profile::discover::RepoSignal;
 use crate::util::atomicfile;
 
-/// Cache format version; incremented when schema changes (fields added/removed).
-pub const SCAN_CACHE_VERSION: u32 = 2;
+/// Cache format version; incremented when the schema changes (fields
+/// added/removed) OR when the walk that produces the cache changes what it
+/// finds, since a cache written by an older walk is silently wrong rather than
+/// merely old and `roots` alone cannot tell the two apart. `App::new` rebuilds
+/// any cache below this version on a detached thread.
+///
+/// v3: repo enumeration learned to see a `.git` that is a symlink (a `repo`-tool
+/// checkout) or a `gitdir:` file (a worktree/submodule), and to prune `.repo`
+/// and build-output trees. Every v2 cache is missing those repos and carries the
+/// tooling clones.
+pub const SCAN_CACHE_VERSION: u32 = 3;
 
 /// The cached result of one `s`/Rescan: which roots were walked, what repos were
 /// found, and when (epoch seconds). Keyed on `roots` — a cache whose roots no

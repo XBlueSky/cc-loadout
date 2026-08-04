@@ -221,28 +221,9 @@ pub(crate) fn globs_exist(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if ft.is_dir() {
-                // Prune build output and dependency/cache trees: they can hold
-                // tens of thousands of files, and a non-matching glob would walk
-                // all of them on every detect (the profile-view perf hot path).
-                // Detection should classify a repo by its own source, never by
-                // generated artifacts, so this does not change real matches.
-                if matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | ".git"
-                        | "dist"
-                        | "build"
-                        | "target"
-                        | "vendor"
-                        | ".venv"
-                        | "venv"
-                        | "__pycache__"
-                        | ".next"
-                        | ".tox"
-                        | ".gradle"
-                        | ".mypy_cache"
-                        | ".pytest_cache"
-                ) {
+                // Shared with repo enumeration so the two walks can't drift; see
+                // `scan::is_pruned_dir` for why each name is on the list.
+                if crate::profile::scan::is_pruned_dir(&name) {
                     continue;
                 }
                 stack.push(entry.path());
