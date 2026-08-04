@@ -63,6 +63,13 @@ commands resolve their context.
 **Profile (optional)** — if the task needs specific plugins active (e.g. a cortex
 skill), pass `--profile <name>`. Skip if the default global loadout is sufficient.
 
+**Model (optional)** — `--model <alias-or-name>` (e.g. `haiku`, `sonnet`, `opus`,
+`claude-sonnet-4-6`). Omit it and the task inherits whatever the `claude` CLI resolves
+by itself, which is the account's default tier — so a daily task can quietly eat the
+most expensive model. Pin it when the job is mechanical enough for a cheaper tier, or
+when it genuinely needs the strongest one. Primes are always forced onto `haiku`
+unless they pin something else — a heartbeat has no reason to bill the top tier.
+
 ### 3. Create the task
 
 Choose a short kebab-case id that describes the job (e.g. `weekly`, `morning-digest`,
@@ -74,7 +81,8 @@ cc-loadout task add <id> \
   --at <HH:MM> \
   --prompt "<prompt text>" \
   --cwd <absolute-path> \
-  [--profile <profile-name>]
+  [--profile <profile-name>] \
+  [--model <alias-or-name>]
 ```
 
 Multiple fire times: repeat `--at`:
@@ -124,7 +132,8 @@ work, just a heartbeat — that is a **prime**, not a task. Use:
 cc-loadout account schedule set <alias> <HH:MM> [<HH:MM>...]
 ```
 A prime has no `--prompt`; it just opens and closes a lightweight session to refresh
-the window. Use `task add --prompt` only when there is real work to do.
+the window, and it runs on `haiku` so the heartbeat costs as little as possible. Use
+`task add --prompt` only when there is real work to do.
 
 ## Boundaries
 

@@ -183,6 +183,7 @@ mod tests {
                 prompt: Some("/cortex:weekly".into()),
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,

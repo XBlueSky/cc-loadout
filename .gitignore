@@ -18,6 +18,9 @@ plans/
 .DS_Store
 *.swp
 
+# serena's per-project cache (regenerated on demand by the MCP server)
+/.serena/
+
 # Rust build output
 /target
 

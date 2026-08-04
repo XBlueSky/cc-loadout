@@ -158,10 +158,14 @@ pub fn list(data_root: &Path, json: bool) -> Result<()> {
         let next = next_fire(&def.times, now)
             .map(|t| format!("{}", t))
             .unwrap_or_else(|| "—".to_string());
+        // Show the model the run will actually use — including the haiku a prime
+        // is forced onto — so `list` never leaves the reader guessing which tier
+        // a scheduled run bills against.
         println!(
-            "{id}  account={acc}  times={times}  next={next}",
+            "{id}  account={acc}  times={times}  model={model}  next={next}",
             acc = def.account,
             times = def.times.join(","),
+            model = def.effective_model().unwrap_or("(cli default)"),
         );
     }
     Ok(())
@@ -205,6 +209,7 @@ pub fn write_prime_schedule(
                 prompt: None,
                 cwd: None,
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -350,6 +355,7 @@ mod tests {
                 prompt: Some("hi".into()),
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -395,6 +401,7 @@ mod tests {
                 prompt: Some("hi".into()),
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -440,6 +447,7 @@ mod tests {
                 prompt: None,
                 cwd: None,
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -455,6 +463,7 @@ mod tests {
                 prompt: Some("hi".into()),
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -499,6 +508,7 @@ mod tests {
                 prompt: Some("hi".into()),
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -533,6 +543,7 @@ mod tests {
                 prompt: None,
                 cwd: None,
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -579,6 +590,7 @@ mod tests {
                 prompt: Some("hello".into()),
                 cwd: Some(std::path::PathBuf::from("/tmp")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -601,6 +613,7 @@ mod tests {
                 prompt: None,
                 cwd: None,
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -647,6 +660,7 @@ mod tests {
                 prompt: Some("hello".into()),
                 cwd: Some(std::path::PathBuf::from("/tmp")),
                 profile: None,
+                model: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,

@@ -48,6 +48,7 @@ mod tests {
             prompt: Some("hi".into()),
             cwd: Some(PathBuf::from("/c")),
             profile: None,
+            model: None,
             last_session_id: Some("dead-beef".into()),
             last_config_dir: Some(PathBuf::from("/data/accounts/work/run/cfg")),
             last_run: Some(1700),

@@ -90,6 +90,10 @@ enum TaskAction {
         cwd: Option<PathBuf>,
         #[arg(long)]
         profile: Option<String>,
+        /// Model this run uses (alias or full name, e.g. haiku, claude-sonnet-4-6).
+        /// Omit to inherit whatever the CLI resolves; primes default to haiku.
+        #[arg(long, allow_hyphen_values = true)]
+        model: Option<String>,
     },
     /// Remove a task
     Rm { id: String },
@@ -771,6 +775,7 @@ fn run() -> Result<()> {
                                 prompt: None,
                                 cwd: None,
                                 profile: None,
+                                model: None,
                                 last_session_id: None,
                                 last_config_dir: None,
                                 last_run: None,
@@ -867,6 +872,7 @@ fn run() -> Result<()> {
                             prompt,
                             cwd,
                             profile,
+                            model,
                         } => {
                             let parsed = crate::task::config::parse_times(&times.join(","))?;
                             let kind = if prompt.is_some() {
@@ -881,6 +887,7 @@ fn run() -> Result<()> {
                                 prompt,
                                 cwd,
                                 profile,
+                                model,
                                 last_session_id: None,
                                 last_config_dir: None,
                                 last_run: None,
