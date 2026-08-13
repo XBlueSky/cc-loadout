@@ -46,6 +46,17 @@ EOF
     rm -f "$err_file"
     exit 0
   fi
+  # On success $err_file still holds whatever the launcher wrote to its own
+  # stderr — on a first run, exactly one line ("downloading <asset> (v<pin>)")
+  # that exists so a human waiting on that download learns why the session is
+  # taking longer than usual. Discarding it unconditionally (as this used to)
+  # makes that line unreachable in the one case it was written for. `-s`
+  # keeps a warm start (nothing written, launcher returned instantly) silent
+  # on both streams — this must never become an unconditional `cat`. stdout
+  # stays untouched either way; this goes to stderr and nowhere else.
+  if [ -s "$err_file" ]; then
+    cat "$err_file" >&2
+  fi
   rm -f "$err_file"
 fi
 
