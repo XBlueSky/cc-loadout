@@ -972,7 +972,18 @@ fn run() -> Result<()> {
                 }
             }
             Command::Doctor { fix, prune_backups } => {
-                let report = doctor::run(&home, config_override.as_deref(), fix, prune_backups)?;
+                // Resolved here, not inside doctor, so the convergence step
+                // stays a pure function of its inputs. `current_exe()` follows
+                // symlinks, so invoking the launcher's ~/.local/bin symlink
+                // still reports the data-dir path its guard looks for.
+                let exe = std::env::current_exe().ok();
+                let report = doctor::run(
+                    &home,
+                    config_override.as_deref(),
+                    exe.as_deref(),
+                    fix,
+                    prune_backups,
+                )?;
                 doctor::print(&report, fix);
             }
         }, // Some(command) => match command

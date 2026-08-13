@@ -23,6 +23,17 @@ pub struct DoctorReport {
     pub legacy_hooks: usize,
     pub stale_backups: Vec<PathBuf>,
     pub pruned_backups: usize,
+    pub standalone_link: Option<StandaloneLink>,
+}
+
+/// A standalone `cc-loadout` on PATH that this run converged onto the
+/// plugin-managed binary (or, without `--fix`, would have).
+#[derive(Debug)]
+pub struct StandaloneLink {
+    pub path: PathBuf,
+    pub backup: PathBuf,
+    pub target: PathBuf,
+    pub converged: bool,
 }
 
 /// Timestamped registry backups left by cc-loadout versions before the
@@ -69,9 +80,85 @@ fn find_stale_backups(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Where `scripts/launcher.sh` keeps its pinned binaries. This MUST stay
+/// identical to that script's `$DATA` — deliberately not `$CLAUDE_PLUGIN_DATA`,
+/// which the launcher explains at length.
+pub fn data_dir(home: &Path) -> PathBuf {
+    match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home.join(".local").join("share"),
+    }
+    .join("cc-loadout")
+}
+
+/// Where the launcher maintains its PATH symlink. MUST stay identical to that
+/// script's `$LINK`.
+pub fn link_path(home: &Path) -> PathBuf {
+    match std::env::var_os("CC_LOADOUT_LINK_DIR") {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => home.join(".local").join("bin"),
+    }
+    .join("cc-loadout")
+}
+
+/// Converge a standalone install at the launcher's link path onto the
+/// plugin-managed binary.
+///
+/// The launcher deliberately refuses to touch a regular file there — moving a
+/// user's binary is not something a session-start hook should do unasked — so
+/// this is the deliberate, user-invoked half of that split. `hooks/hook.sh`
+/// prints the command that gets here.
+///
+/// `exe` is this process's own executable, and the guard below is why it is a
+/// parameter rather than a `current_exe()` call inside: acting only when `exe`
+/// lives under `data_dir` is what stops `./target/release/cc-loadout doctor
+/// --fix` from pointing the user's PATH at an uncommitted dev build, and stops
+/// the step firing at all for someone who has no plugin installed. Taking the
+/// paths explicitly also keeps this testable without mutating process-global
+/// env vars.
+fn converge_standalone(
+    data_dir: &Path,
+    link: &Path,
+    exe: &Path,
+    fix: bool,
+) -> Result<Option<StandaloneLink>> {
+    if !exe.starts_with(data_dir) {
+        return Ok(None);
+    }
+    // `symlink_metadata`, not `metadata`: the latter follows the link, so the
+    // launcher's own symlink would present as the regular file it points at and
+    // this step would "converge" a link that is already correct.
+    let md = match std::fs::symlink_metadata(link) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("inspecting {}", link.display())),
+    };
+    if !md.file_type().is_file() {
+        return Ok(None);
+    }
+    // A fixed suffix, never `.bak.<epoch>`: `find_stale_backups` builds the
+    // prefix `cc-loadout.bak.` and sweeps all-digit suffixes, so an epoch name
+    // here would be deleted by `--fix --prune-backups` — the tool erasing the
+    // binary it had just saved.
+    let backup = link.with_file_name("cc-loadout.standalone.bak");
+    if fix {
+        std::fs::rename(link, &backup)
+            .with_context(|| format!("backing up {} to {}", link.display(), backup.display()))?;
+        std::os::unix::fs::symlink(exe, link)
+            .with_context(|| format!("linking {} -> {}", link.display(), exe.display()))?;
+    }
+    Ok(Some(StandaloneLink {
+        path: link.to_path_buf(),
+        backup,
+        target: exe.to_path_buf(),
+        converged: fix,
+    }))
+}
+
 pub fn run(
     home: &Path,
     config_override: Option<&Path>,
+    exe: Option<&Path>,
     fix: bool,
     prune_backups: bool,
 ) -> Result<DoctorReport> {
@@ -142,6 +229,14 @@ pub fn run(
         }
     }
 
+    // Deliberately propagates rather than being swallowed: unlike the hook
+    // paths, `doctor` is the one place a diagnostic must not report health it
+    // never established. A `None` exe (current_exe() failed) is simply no
+    // information, so the step is skipped.
+    if let Some(exe) = exe {
+        report.standalone_link = converge_standalone(&data_dir(home), &link_path(home), exe, fix)?;
+    }
+
     Ok(report)
 }
 
@@ -205,7 +300,135 @@ pub fn print(report: &DoctorReport, fix: bool) {
             println!("  {}", p.display());
         }
     }
+    if let Some(sl) = &report.standalone_link {
+        if sl.converged {
+            println!("converged the standalone install on PATH:");
+            println!("  saved  {} -> {}", sl.path.display(), sl.backup.display());
+            println!("  linked {} -> {}", sl.path.display(), sl.target.display());
+        } else {
+            println!(
+                "standalone install at {} (--fix would save it to {} and link the plugin's {})",
+                sl.path.display(),
+                sl.backup.display(),
+                sl.target.display()
+            );
+        }
+    }
     if !fix {
         println!("\n(run with --fix to apply)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch_exec(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b"#!/bin/sh\nexit 0\n").unwrap();
+    }
+
+    #[test]
+    fn converge_backs_up_a_regular_file_and_links_the_pinned_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+
+        let out = converge_standalone(&data, &link, &exe, true)
+            .unwrap()
+            .expect("a regular file must be reported");
+        assert!(out.converged);
+        assert_eq!(out.backup.file_name().unwrap(), "cc-loadout.standalone.bak");
+        assert!(out.backup.exists(), "the original must be kept");
+        assert_eq!(std::fs::read_link(&link).unwrap(), exe);
+    }
+
+    #[test]
+    fn converge_reports_without_fix_but_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+
+        let out = converge_standalone(&data, &link, &exe, false)
+            .unwrap()
+            .unwrap();
+        assert!(!out.converged);
+        assert!(!out.backup.exists(), "without --fix nothing may be written");
+        assert!(
+            std::fs::read_link(&link).is_err(),
+            "must still be a regular file"
+        );
+    }
+
+    /// The guard that stops `./target/release/cc-loadout doctor --fix` from
+    /// pointing the user's PATH at an uncommitted dev build — and stops this
+    /// step firing at all for someone with no plugin installed.
+    #[test]
+    fn converge_is_a_noop_when_the_exe_is_outside_the_data_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        std::fs::create_dir_all(&data).unwrap();
+        let exe = tmp.path().join("target/release/cc-loadout");
+        touch_exec(&exe);
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+
+        assert!(converge_standalone(&data, &link, &exe, true)
+            .unwrap()
+            .is_none());
+        assert!(
+            std::fs::read_link(&link).is_err(),
+            "the file must be untouched"
+        );
+    }
+
+    #[test]
+    fn converge_leaves_an_existing_symlink_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+        let link = tmp.path().join("bin/cc-loadout");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&exe, &link).unwrap();
+
+        assert!(converge_standalone(&data, &link, &exe, true)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn converge_is_a_noop_when_nothing_is_installed_at_the_link_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+        let link = tmp.path().join("bin/cc-loadout");
+
+        assert!(converge_standalone(&data, &link, &exe, true)
+            .unwrap()
+            .is_none());
+    }
+
+    /// `--fix --prune-backups` sweeps `cc-loadout.bak.<digits>`. The backup this
+    /// step writes must not be swept, or the tool would delete the very binary
+    /// it just saved.
+    #[test]
+    fn the_standalone_backup_is_not_swept_by_prune_backups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("bin/cc-loadout");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::fs::write(link.with_file_name("cc-loadout.standalone.bak"), b"saved").unwrap();
+        std::fs::write(link.with_file_name("cc-loadout.bak.123"), b"stale").unwrap();
+
+        let found = find_stale_backups(&link).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_name().unwrap(), "cc-loadout.bak.123");
     }
 }
