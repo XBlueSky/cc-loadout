@@ -173,7 +173,8 @@ else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: nothing executable at the pinned path after download"
 fi
 # The temp download dir must not survive a successful install.
-leftovers="$(find "$scratch/data/cc-loadout/bin/9.9.9" -maxdepth 1 -name '.download.*' | wc -l | tr -d ' ')"
+leftovers="$(find "$scratch/data/cc-loadout/bin/9.9.9" -maxdepth 1 -name '.download.*' | wc -l | tr -d ' ')" \
+  && rc=0 || rc=$?
 assert_eq "$leftovers" "0" "no .download.* directory is left behind on success"
 rm -rf "$scratch" "$pr"
 
@@ -212,3 +213,93 @@ fi
 rm -rf "$scratch" "$pr"
 
 fi  # end mapped-target guard
+
+# --- PATH symlink reconciliation ------------------------------------------
+# Four states, and the two "leave alone" rows are the important ones: a
+# regular file is a standalone install and belongs to `doctor --fix`, and a
+# symlink pointing somewhere else belongs to whoever made it.
+resolve_link() { readlink "$1" 2>/dev/null || true; }
+
+# absent -> created
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/data" 9.9.9
+XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
+  sh "$pr/scripts/launcher.sh" --print-path >/dev/null 2>&1
+assert_eq "$(resolve_link "$scratch/bin/cc-loadout")" \
+  "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" \
+  "an absent link is created (and its dir with it)"
+rm -rf "$scratch" "$pr"
+
+# our own symlink at an older version -> repointed
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/data" 9.9.9
+mkdir -p "$scratch/bin"
+ln -s "$scratch/data/cc-loadout/bin/8.8.8/cc-loadout" "$scratch/bin/cc-loadout"
+XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
+  sh "$pr/scripts/launcher.sh" --print-path >/dev/null 2>&1
+assert_eq "$(resolve_link "$scratch/bin/cc-loadout")" \
+  "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" \
+  "our own symlink is repointed at the pin (even when dangling)"
+rm -rf "$scratch" "$pr"
+
+# a regular file -> untouched
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/data" 9.9.9
+mkdir -p "$scratch/bin"
+printf '#!/bin/sh\necho standalone\n' > "$scratch/bin/cc-loadout"
+chmod +x "$scratch/bin/cc-loadout"
+XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
+  sh "$pr/scripts/launcher.sh" --print-path >/dev/null 2>&1
+if [[ -f "$scratch/bin/cc-loadout" && ! -L "$scratch/bin/cc-loadout" \
+      && "$(cat "$scratch/bin/cc-loadout")" == *standalone* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a standalone regular file is left untouched"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: the launcher clobbered a standalone install"
+fi
+rm -rf "$scratch" "$pr"
+
+# a foreign symlink -> untouched
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/data" 9.9.9
+mkdir -p "$scratch/bin" "$scratch/elsewhere"
+printf '#!/bin/sh\necho elsewhere\n' > "$scratch/elsewhere/cc-loadout"
+chmod +x "$scratch/elsewhere/cc-loadout"
+ln -s "$scratch/elsewhere/cc-loadout" "$scratch/bin/cc-loadout"
+XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
+  sh "$pr/scripts/launcher.sh" --print-path >/dev/null 2>&1
+assert_eq "$(resolve_link "$scratch/bin/cc-loadout")" "$scratch/elsewhere/cc-loadout" \
+  "a symlink pointing outside our data dir is left untouched"
+rm -rf "$scratch" "$pr"
+
+# --- version GC -----------------------------------------------------------
+# Unpacked binaries are several MiB each; twenty releases would otherwise leave
+# a pile behind. Only strict N.N.N siblings may be swept.
+if [[ "$(launcher_target)" != unsupported ]]; then
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+make_release_fixture "$scratch/rel" 9.9.9
+place_fake_binary "$scratch/data" 8.8.8
+mkdir -p "$scratch/data/cc-loadout/bin/notaversion" "$scratch/data/cc-loadout/bin/9.9.9-rc1"
+CC_LOADOUT_RELEASE_BASE="file://$scratch/rel" XDG_DATA_HOME="$scratch/data" \
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --print-path >/dev/null 2>&1
+if [[ ! -e "$scratch/data/cc-loadout/bin/8.8.8" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: GC removed the superseded 8.8.8 dir"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: GC left the superseded 8.8.8 dir behind"
+fi
+if [[ -d "$scratch/data/cc-loadout/bin/notaversion" && -d "$scratch/data/cc-loadout/bin/9.9.9-rc1" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: GC left non-N.N.N directories alone"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: GC deleted a directory it does not own"
+fi
+if [[ -x "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: GC kept the pinned version"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: GC removed the pinned version"
+fi
+rm -rf "$scratch" "$pr"
+fi

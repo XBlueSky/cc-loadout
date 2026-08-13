@@ -96,8 +96,57 @@ download() {
   rm -rf "$tmp"
   trap - EXIT
 }
-gc_old_versions() { :; }
-reconcile_link() { :; }
+# Point $LINK at $BIN so the interactive TUI is reachable by name, but only
+# where doing so cannot destroy something we did not create. Idempotent: it
+# runs on every invocation, including when the binary was already present.
+#
+# The one refused state — a regular file — is a standalone install from
+# install.sh or `cargo`. Moving a user's file without consent is `doctor
+# --fix`'s job, invoked deliberately; see hooks/hook.sh for the hint that
+# gets them there.
+reconcile_link() {
+  if [ -L "$LINK" ]; then
+    cur=$(readlink "$LINK" 2>/dev/null || true)
+    case "$cur" in
+    "$DATA"/bin/*/cc-loadout)
+      # Ours, so a stale version (or a dangling link left by GC) is safe to
+      # repoint. -n matters: without it, ln follows an existing symlink to a
+      # directory and creates the link inside it.
+      [ "$cur" = "$BIN" ] || ln -sfn "$BIN" "$LINK" 2>/dev/null || true
+      ;;
+    *) : ;; # someone else's link — not ours to move
+    esac
+    return 0
+  fi
+  # -e is false for a broken symlink, but -L above already caught every
+  # symlink, so anything left here is a real entry: file, dir or device.
+  if [ -e "$LINK" ]; then
+    return 0
+  fi
+  mkdir -p "$LINK_DIR" 2>/dev/null || return 0
+  ln -sfn "$BIN" "$LINK" 2>/dev/null || true
+}
+
+# Keep only the pinned version. Unpacked binaries are several MiB each, so
+# without this every release leaves another copy behind forever.
+#
+# Removing a binary a concurrent session is still executing is safe on Unix —
+# the inode survives for the running process. A plugin downgrade re-downloads,
+# which is an acceptable price for a bounded directory.
+gc_old_versions() {
+  for d in "$DATA"/bin/*; do
+    [ -d "$d" ] || continue
+    name=${d##*/}
+    [ "$name" != "$VER" ] || continue
+    # Same two-step test as the pin validator, for the same reason: only
+    # sweep names we are certain this script created. `9.9.9-rc1`,
+    # `notaversion` and a stray `.download.XXXXXX` are all left alone.
+    case "$name" in
+    *[!0-9.]*) continue ;;
+    [0-9]*.[0-9]*.[0-9]*) rm -rf "$d" ;;
+    esac
+  done
+}
 
 print_path_only=0
 if [ "${1:-}" = "--print-path" ]; then
