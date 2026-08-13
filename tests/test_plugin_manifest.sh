@@ -145,3 +145,21 @@ else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh was not silent at session-end for a binary exiting 2 (exit=$hook_exit, out=$hook_out)"
 fi
 rm -rf "$hook_scratch"
+
+# The launcher resolves this pin to a GitHub Release tarball, so a stale pin
+# means a user installs a new plugin and silently runs the old binary.
+pin_file="$ROOT/.claude-plugin/cli-version"
+pin_ver="$(tr -d '[:space:]' < "$pin_file" 2>/dev/null || true)"
+if [[ -n "$cargo_ver" && "$cargo_ver" == "$pin_ver" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: cli-version pin matches Cargo.toml ($cargo_ver)"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: cli-version pin ($pin_ver) != Cargo.toml ($cargo_ver)"
+fi
+
+# sync-versions.sh is the only thing that keeps the three files in step; if it
+# reports drift here, the tree is already broken.
+if bash "$ROOT/scripts/sync-versions.sh" --check >/dev/null 2>&1; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: sync-versions.sh --check passes"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: sync-versions.sh --check reports drift"
+fi
