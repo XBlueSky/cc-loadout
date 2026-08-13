@@ -50,13 +50,23 @@ scratch="$(mktemp -d)"
 printf '#!/bin/sh\necho "dev build ran: $*"\n' > "$scratch/devbin"
 chmod +x "$scratch/devbin"
 pr="$(make_plugin_root 9.9.9)"
+# tests/run.sh sources this file under `set -euo pipefail`. A bare
+# `var=$(...)` assignment whose command substitution fails aborts the
+# sourcing script right there — silently, with no FAIL: line for the
+# assertion below it, no later assertions in this file, and no Total:
+# summary. Capturing the status explicitly with `&& rc=0 || rc=$?` keeps a
+# failure local to this assertion instead of truncating the whole suite, so
+# every bare `out=$(...)` in this file is guarded the same way even where the
+# assertion itself only checks output, not rc.
 out="$(CC_LOADOUT_BIN="$scratch/devbin" XDG_DATA_HOME="$scratch/data" \
-  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" hook session-start 2>&1)"
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" hook session-start 2>&1)" \
+  && rc=0 || rc=$?
 assert_contains "$out" "dev build ran: hook session-start" \
   "CC_LOADOUT_BIN short-circuits pin resolution"
 
 out="$(CC_LOADOUT_BIN="$scratch/devbin" XDG_DATA_HOME="$scratch/data" \
-  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --print-path 2>/dev/null)"
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --print-path 2>/dev/null)" \
+  && rc=0 || rc=$?
 assert_eq "$out" "$scratch/devbin" "--print-path honours CC_LOADOUT_BIN"
 rm -rf "$scratch" "$pr"
 
@@ -82,11 +92,13 @@ scratch="$(mktemp -d)"
 pr="$(make_plugin_root 9.9.9)"
 place_fake_binary "$scratch/data" 9.9.9
 out="$(XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
-  sh "$pr/scripts/launcher.sh" --print-path 2>/dev/null)"
+  sh "$pr/scripts/launcher.sh" --print-path 2>/dev/null)" \
+  && rc=0 || rc=$?
 assert_eq "$out" "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" \
   "--print-path resolves the pinned binary"
 out="$(XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
-  sh "$pr/scripts/launcher.sh" hook session-end 2>&1)"
+  sh "$pr/scripts/launcher.sh" hook session-end 2>&1)" \
+  && rc=0 || rc=$?
 assert_contains "$out" "args:hook session-end" "launcher execs with its arguments"
 rm -rf "$scratch" "$pr"
 
@@ -152,7 +164,8 @@ scratch="$(mktemp -d)"
 pr="$(make_plugin_root 9.9.9)"
 make_release_fixture "$scratch/rel" 9.9.9
 out="$(CC_LOADOUT_RELEASE_BASE="file://$scratch/rel" XDG_DATA_HOME="$scratch/data" \
-  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --version 2>&1)"
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --version 2>&1)" \
+  && rc=0 || rc=$?
 assert_contains "$out" "cc-loadout 9.9.9" "a first run downloads and execs the pinned binary"
 if [[ -x "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" ]]; then
   TEST_PASS=$((TEST_PASS+1)); echo "  ok: the download installed an executable at the pinned path"
