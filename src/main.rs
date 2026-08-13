@@ -980,6 +980,7 @@ fn run() -> Result<()> {
                 let report = doctor::run(
                     &home,
                     config_override.as_deref(),
+                    &data_root,
                     exe.as_deref(),
                     fix,
                     prune_backups,

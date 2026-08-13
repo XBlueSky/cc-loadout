@@ -80,25 +80,41 @@ fn find_stale_backups(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Where `scripts/launcher.sh` keeps its pinned binaries. This MUST stay
-/// identical to that script's `$DATA` — deliberately not `$CLAUDE_PLUGIN_DATA`,
-/// which the launcher explains at length.
-pub fn data_dir(home: &Path) -> PathBuf {
-    match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => home.join(".local").join("share"),
-    }
-    .join("cc-loadout")
-}
-
 /// Where the launcher maintains its PATH symlink. MUST stay identical to that
-/// script's `$LINK`.
+/// script's `$LINK`. (Its `$DATA` counterpart is not duplicated here: `run`'s
+/// caller already has that path as `data_root` from `resolve_env`, and takes
+/// it as a parameter below.)
 pub fn link_path(home: &Path) -> PathBuf {
     match std::env::var_os("CC_LOADOUT_LINK_DIR") {
         Some(v) if !v.is_empty() => PathBuf::from(v),
         _ => home.join(".local").join("bin"),
     }
     .join("cc-loadout")
+}
+
+/// Where this run's backup will go. Never clobbers a previous convergence's
+/// backup: if `cc-loadout.standalone.bak` is already occupied — a second
+/// regular file landed at `link` after an earlier `--fix` already converged
+/// one (a repeat `install.sh`, `cargo install --root`, or a hand-restored
+/// wrapper) — `std::fs::rename` would otherwise silently replace it, losing
+/// whatever the first convergence saved with no way back. The next free
+/// `cc-loadout.standalone.bak.<n>` is used instead; the numeral lives in the
+/// `.standalone.bak` stem, not after a `.bak.` of its own, so every candidate
+/// still fails `find_stale_backups`'s `cc-loadout.bak.` prefix test and none
+/// of them is ever swept by `--prune-backups`.
+fn standalone_backup_path(link: &Path) -> PathBuf {
+    let base = link.with_file_name("cc-loadout.standalone.bak");
+    if !base.exists() {
+        return base;
+    }
+    let mut n: u32 = 1;
+    loop {
+        let candidate = link.with_file_name(format!("cc-loadout.standalone.bak.{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Converge a standalone install at the launcher's link path onto the
@@ -111,18 +127,46 @@ pub fn link_path(home: &Path) -> PathBuf {
 ///
 /// `exe` is this process's own executable, and the guard below is why it is a
 /// parameter rather than a `current_exe()` call inside: acting only when `exe`
-/// lives under `data_dir` is what stops `./target/release/cc-loadout doctor
+/// lives under `data_root` is what stops `./target/release/cc-loadout doctor
 /// --fix` from pointing the user's PATH at an uncommitted dev build, and stops
 /// the step firing at all for someone who has no plugin installed. Taking the
 /// paths explicitly also keeps this testable without mutating process-global
 /// env vars.
 fn converge_standalone(
-    data_dir: &Path,
+    data_root: &Path,
     link: &Path,
     exe: &Path,
     fix: bool,
 ) -> Result<Option<StandaloneLink>> {
-    if !exe.starts_with(data_dir) {
+    // Canonicalize before comparing. `current_exe()` is fully resolved on
+    // Linux (it's `readlink("/proc/self/exe")`), but `data_root` is built
+    // from literal env vars, so a symlinked $HOME or `~/.local` (a dotfile
+    // manager, home on a second volume) would make the unresolved comparison
+    // false forever: `doctor --fix` would silently do nothing while
+    // `hooks/hook.sh` kept printing the hint that sends users to the very
+    // command that just no-opped. Canonicalization failing is not an error
+    // here — a path that does not exist yet is the ordinary case, not a
+    // problem — so it falls back to the literal path, exactly the comparison
+    // this guard used before either side could be resolved.
+    let exe_resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let data_resolved =
+        std::fs::canonicalize(data_root).unwrap_or_else(|_| data_root.to_path_buf());
+    if !exe_resolved.starts_with(&data_resolved) {
+        return Ok(None);
+    }
+    // `CC_LOADOUT_LINK_DIR` pointing inside the data dir is misconfiguration,
+    // not an installation to converge. Without this, `fix` below would rename
+    // the running pinned binary out from under itself and then symlink the
+    // name it just vacated right back onto it: a self-referencing dangling
+    // link. The launcher's next download would heal it, but there is no
+    // reason to let this step create that mess to begin with. Compared
+    // against the literal `data_root`, not `data_resolved`: `link` is built
+    // from the same un-resolved env vars `data_root` is, so comparing it
+    // against the canonicalized form would reintroduce the exact
+    // resolved-vs-literal mismatch the guard above exists to fix (and, on a
+    // macOS tmp dir where `/var` is itself a symlink, fail this comparison
+    // for every ordinary — non-misconfigured — install).
+    if link.starts_with(data_root) {
         return Ok(None);
     }
     // `symlink_metadata`, not `metadata`: the latter follows the link, so the
@@ -136,16 +180,37 @@ fn converge_standalone(
     if !md.file_type().is_file() {
         return Ok(None);
     }
-    // A fixed suffix, never `.bak.<epoch>`: `find_stale_backups` builds the
-    // prefix `cc-loadout.bak.` and sweeps all-digit suffixes, so an epoch name
-    // here would be deleted by `--fix --prune-backups` — the tool erasing the
-    // binary it had just saved.
-    let backup = link.with_file_name("cc-loadout.standalone.bak");
+    let backup = standalone_backup_path(link);
     if fix {
         std::fs::rename(link, &backup)
             .with_context(|| format!("backing up {} to {}", link.display(), backup.display()))?;
-        std::os::unix::fs::symlink(exe, link)
-            .with_context(|| format!("linking {} -> {}", link.display(), exe.display()))?;
+        if let Err(symlink_err) = std::os::unix::fs::symlink(exe, link) {
+            // The rename above already succeeded: `link` is now empty and the
+            // user's original binary is sitting at `backup` with nothing on
+            // PATH at all. Restore it rather than leaving the user with
+            // neither a standalone binary nor a working symlink — best
+            // effort, and if the rollback itself fails, say so instead of
+            // hiding it. Either way the error must name `backup`: it is the
+            // one fact that lets the user recover by hand.
+            return match std::fs::rename(&backup, link) {
+                Ok(()) => Err(symlink_err).with_context(|| {
+                    format!(
+                        "linking {} -> {}: restored the original from {}",
+                        link.display(),
+                        exe.display(),
+                        backup.display()
+                    )
+                }),
+                Err(rollback_err) => Err(symlink_err).with_context(|| {
+                    format!(
+                        "linking {} -> {}: the original is saved at {} but restoring it also failed: {rollback_err}",
+                        link.display(),
+                        exe.display(),
+                        backup.display()
+                    )
+                }),
+            };
+        }
     }
     Ok(Some(StandaloneLink {
         path: link.to_path_buf(),
@@ -158,6 +223,7 @@ fn converge_standalone(
 pub fn run(
     home: &Path,
     config_override: Option<&Path>,
+    data_root: &Path,
     exe: Option<&Path>,
     fix: bool,
     prune_backups: bool,
@@ -234,7 +300,7 @@ pub fn run(
     // never established. A `None` exe (current_exe() failed) is simply no
     // information, so the step is skipped.
     if let Some(exe) = exe {
-        report.standalone_link = converge_standalone(&data_dir(home), &link_path(home), exe, fix)?;
+        report.standalone_link = converge_standalone(data_root, &link_path(home), exe, fix)?;
     }
 
     Ok(report)
@@ -418,17 +484,144 @@ mod tests {
 
     /// `--fix --prune-backups` sweeps `cc-loadout.bak.<digits>`. The backup this
     /// step writes must not be swept, or the tool would delete the very binary
-    /// it just saved.
+    /// it just saved — including the numbered fallback name a second
+    /// convergence picks when the first backup is still there.
     #[test]
     fn the_standalone_backup_is_not_swept_by_prune_backups() {
         let tmp = tempfile::tempdir().unwrap();
         let link = tmp.path().join("bin/cc-loadout");
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         std::fs::write(link.with_file_name("cc-loadout.standalone.bak"), b"saved").unwrap();
+        std::fs::write(
+            link.with_file_name("cc-loadout.standalone.bak.1"),
+            b"saved2",
+        )
+        .unwrap();
         std::fs::write(link.with_file_name("cc-loadout.bak.123"), b"stale").unwrap();
 
         let found = find_stale_backups(&link).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].file_name().unwrap(), "cc-loadout.bak.123");
+    }
+
+    /// A second regular file landing at `link` after an earlier `--fix`
+    /// already converged one (a repeat `install.sh`, `cargo install --root`,
+    /// a hand-restored wrapper) must not clobber the first backup — that
+    /// backup may be the user's only remaining copy of a hand-written wrapper
+    /// that a reinstall cannot regenerate.
+    #[test]
+    fn converge_does_not_clobber_an_existing_standalone_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+
+        converge_standalone(&data, &link, &exe, true).unwrap();
+        let first_backup = link.with_file_name("cc-loadout.standalone.bak");
+        assert_eq!(
+            std::fs::read(&first_backup).unwrap(),
+            b"#!/bin/sh\nexit 0\n"
+        );
+
+        // Drop the symlink convergence 1 left behind and put a fresh regular
+        // file back at `link`, exactly as a repeat install would.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::write(&link, b"second standalone file").unwrap();
+
+        let out = converge_standalone(&data, &link, &exe, true)
+            .unwrap()
+            .expect("the second regular file must be reported too");
+        assert_ne!(
+            out.backup, first_backup,
+            "the second convergence must not reuse the first backup's name"
+        );
+        assert_eq!(
+            std::fs::read(&first_backup).unwrap(),
+            b"#!/bin/sh\nexit 0\n",
+            "the first backup must survive the second convergence untouched"
+        );
+        assert_eq!(
+            std::fs::read(&out.backup).unwrap(),
+            b"second standalone file"
+        );
+    }
+
+    /// If `rename` succeeds but the following `symlink` fails, the user must
+    /// not be left with neither a working `cc-loadout` on PATH nor a
+    /// recoverable original — and the error must name the one path that lets
+    /// them recover by hand. A symlink target long enough to blow past every
+    /// filesystem's symlink-content limit forces exactly that ordering
+    /// (`rename` doesn't touch this string at all; `symlink` fails writing
+    /// it) without needing any fault-injection machinery.
+    #[test]
+    fn converge_rolls_back_and_names_the_backup_when_symlinking_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join(format!("bin/9.9.9/{}", "a".repeat(8192)));
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+        let original = std::fs::read(&link).unwrap();
+
+        let err = converge_standalone(&data, &link, &exe, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cc-loadout.standalone.bak"),
+            "the recovery path must be named in the error: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            original,
+            "a failed convergence must restore the original file"
+        );
+        assert!(
+            !link.with_file_name("cc-loadout.standalone.bak").exists(),
+            "the backup must not be left behind once rolled back"
+        );
+    }
+
+    /// On Linux `current_exe()` is fully resolved (`readlink` of
+    /// `/proc/self/exe`) while `data_root` is built from literal env vars, so
+    /// a symlinked `$HOME` or `~/.local` (a dotfile manager, home on a second
+    /// volume) must still match once both sides are canonicalized. This is
+    /// the one case this repo's own macOS dev/test environment cannot catch
+    /// by accident, because macOS's `current_exe()` does not canonicalize.
+    #[test]
+    fn converge_matches_when_data_root_is_reached_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_data = tmp.path().join("real/data/cc-loadout");
+        let exe = real_data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+
+        // `data_root` as literally constructed from env vars: a symlink to
+        // the directory that actually holds the binary.
+        let data_via_symlink = tmp.path().join("home/.local/share/cc-loadout");
+        std::fs::create_dir_all(data_via_symlink.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_data, &data_via_symlink).unwrap();
+
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+
+        let out = converge_standalone(&data_via_symlink, &link, &exe, true)
+            .unwrap()
+            .expect("canonicalizing both sides must still match");
+        assert!(out.converged);
+    }
+
+    /// `CC_LOADOUT_LINK_DIR` pointing inside the data dir is misconfiguration:
+    /// without this guard, `--fix` would rename the running pinned binary out
+    /// from under itself and symlink the vacated name right back onto it.
+    #[test]
+    fn converge_is_a_noop_when_link_is_inside_the_data_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data/cc-loadout");
+        let exe = data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+        let link = data.join("bin/cc-loadout");
+        touch_exec(&link);
+
+        assert!(converge_standalone(&data, &link, &exe, true)
+            .unwrap()
+            .is_none());
     }
 }
