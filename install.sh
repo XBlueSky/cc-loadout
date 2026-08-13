@@ -12,7 +12,11 @@ set -e
 GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 REPO="${REPO:-xbluesky/cc-loadout}"
-RELEASES_BASE="https://github.com/${REPO}/releases"
+# Overridable the same way scripts/launcher.sh's CC_LOADOUT_RELEASE_BASE is,
+# so the test suite can redirect this at a local file:// fixture instead of
+# hitting the real network — see install_from_release's proto_args below,
+# which relaxes the HTTPS-only guard the same way and for the same reason.
+RELEASES_BASE="${CC_LOADOUT_RELEASE_BASE:-https://github.com/${REPO}/releases}"
 BINARY_NAME="cc-loadout"
 # Must match scripts/launcher.sh exactly, or the plugin and the installer will
 # each maintain their own copy and the hook will nag about the other one.
@@ -62,8 +66,22 @@ build_from_source() {
     return 1
   fi
   mkdir -p "$INSTALL_DIR"
-  cp "$bin" "${INSTALL_DIR}/${BINARY_NAME}"
-  chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+  # NOT `cp "$bin" "${INSTALL_DIR}/${BINARY_NAME}"`: cp onto an existing
+  # symlink follows it and overwrites the TARGET's contents rather than
+  # replacing the link entry. After this branch, INSTALL_DIR defaults to the
+  # same ~/.local/bin the plugin's launcher symlinks into
+  # $DATA_DIR/bin/<version>/cc-loadout — so a developer with the plugin
+  # active who runs this from a clone would have `cp` silently overwrite the
+  # checksum-verified pinned release binary with their uncommitted build,
+  # with nothing anywhere left to notice. Stage in a fresh temp file (mktemp
+  # guarantees it is a real file, never a symlink) and `mv -f` it into place
+  # instead — the same idiom install_from_release uses below, because `mv`
+  # replaces whatever directory entry is at the destination rather than
+  # dereferencing it.
+  local tmp_bin; tmp_bin="$(mktemp "${INSTALL_DIR}/.${BINARY_NAME}.XXXXXX")"
+  cp "$bin" "$tmp_bin"
+  chmod +x "$tmp_bin"
+  mv -f "$tmp_bin" "${INSTALL_DIR}/${BINARY_NAME}"
   BOOTSTRAP_BIN="${INSTALL_DIR}/${BINARY_NAME}"
   info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
   # Deliberately a real file, NOT $DATA_DIR/bin/<version>/: a dev build parked
@@ -95,6 +113,40 @@ latest_version() {
     | sed -n 's|.*/tag/v\(.*\)$|\1|p'
 }
 
+# Where this run's backup will go. Mirrors src/doctor.rs's
+# standalone_backup_path exactly, including the naming scheme, so the two
+# tools can never fight over a name: never clobbers a previous convergence's
+# backup. If cc-loadout.standalone.bak is already occupied — a second regular
+# file landed at $link after an earlier `doctor --fix` or `install.sh` run
+# already converged one — a bare `mv -f` onto that fixed name would silently
+# destroy the earlier backup with no way back. The next free
+# cc-loadout.standalone.bak.<n> is used instead; the numeral lives in the
+# `.standalone.bak` stem, not after a `.bak.` of its own, so every candidate
+# still fails doctor's `cc-loadout.bak.` prune-backups prefix test and none of
+# them is ever swept by `--prune-backups`.
+standalone_backup_path() {
+  local link="$1" dir base candidate n
+  dir="$(dirname "$link")"
+  base="${dir}/${BINARY_NAME}.standalone.bak"
+  # `[ -e ] || [ -L ]`: -e alone follows a symlink and reads false for a
+  # dangling one, which would make an occupied-but-dangling name look free and
+  # get silently overwritten below. Same reasoning as doctor.rs's
+  # symlink_metadata over exists().
+  if [ ! -e "$base" ] && [ ! -L "$base" ]; then
+    echo "$base"
+    return
+  fi
+  n=1
+  while :; do
+    candidate="${dir}/${BINARY_NAME}.standalone.bak.${n}"
+    if [ ! -e "$candidate" ] && [ ! -L "$candidate" ]; then
+      echo "$candidate"
+      return
+    fi
+    n=$((n + 1))
+  done
+}
+
 install_from_release() {
   step "Downloading cc-loadout from GitHub Releases..."
   command -v curl >/dev/null 2>&1 || err "curl not found"
@@ -114,10 +166,19 @@ install_from_release() {
   # shellcheck disable=SC2064  # expand $tmp now, not at trap time
   trap "rm -rf '$tmp'" EXIT
 
+  # HTTPS is enforced for the real release host and relaxed only when
+  # CC_LOADOUT_RELEASE_BASE is explicitly overridden, which the test suite
+  # does with file:// fixtures (curl's --proto =https rejects file:// outright).
+  # Keying on the override — not on the URL scheme — keeps the default path
+  # incapable of being downgraded by anything a redirect could say. Same
+  # reasoning as scripts/launcher.sh's identical guard.
+  local proto_args=(--proto '=https' --proto-redir '=https')
+  [ -z "${CC_LOADOUT_RELEASE_BASE:-}" ] || proto_args=()
+
   # -f so an HTTP error page is a failure instead of a "binary" written to disk.
-  curl -fsSL --proto '=https' --proto-redir '=https' -o "${tmp}/${asset}" "${base}/${asset}" \
+  curl -fsSL "${proto_args[@]}" -o "${tmp}/${asset}" "${base}/${asset}" \
     || err "download failed for ${asset} at v${version}"
-  curl -fsSL --proto '=https' --proto-redir '=https' -o "${tmp}/${sum}" "${base}/${sum}" \
+  curl -fsSL "${proto_args[@]}" -o "${tmp}/${sum}" "${base}/${sum}" \
     || err "download failed for ${sum} at v${version}"
 
   # Verify BEFORE extracting anything from the archive. The checksum ships
@@ -144,8 +205,9 @@ install_from_release() {
   # existing symlink-to-a-directory is replaced rather than followed into.
   local link="${LINK_DIR}/${BINARY_NAME}"
   if [ -e "$link" ] && [ ! -L "$link" ]; then
-    mv -f "$link" "${LINK_DIR}/${BINARY_NAME}.standalone.bak"
-    warn "moved the previous ${link} to ${BINARY_NAME}.standalone.bak"
+    local backup; backup="$(standalone_backup_path "$link")"
+    mv -f "$link" "$backup"
+    warn "moved the previous ${link} to $(basename "$backup")"
   fi
   ln -sfn "${vdir}/${BINARY_NAME}" "$link"
   info "Installed ${vdir}/${BINARY_NAME}"

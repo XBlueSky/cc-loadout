@@ -64,7 +64,7 @@ cc-loadout
 
 ### 作為 Claude Code plugin(推薦)
 
-cc-loadout 也以 Claude Code plugin 形式發佈,內附一個導引式的 profile 建立 skill。先把它加成 marketplace,再安裝:
+cc-loadout 以 Claude Code plugin 形式發佈,內附一個導引式的 profile 建立 skill。先把它加成 marketplace,再安裝:
 
 ```
 /plugin marketplace add https://github.com/xbluesky/cc-loadout
