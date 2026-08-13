@@ -103,14 +103,22 @@ pub fn link_path(home: &Path) -> PathBuf {
 /// still fails `find_stale_backups`'s `cc-loadout.bak.` prefix test and none
 /// of them is ever swept by `--prune-backups`.
 fn standalone_backup_path(link: &Path) -> PathBuf {
+    // `symlink_metadata`, not `exists()`: `exists()` follows symlinks, so a
+    // *dangling* `cc-loadout.standalone.bak` would read as free and the
+    // following `rename` would silently replace it. No user data is lost — a
+    // broken symlink holds none — but the whole point of this function is
+    // never mistaking an occupied name for a free one, and `symlink_metadata`
+    // is the probe that actually answers "is something here" rather than "is
+    // something reachable through here", the same reason the rest of this
+    // module uses it over `metadata`.
     let base = link.with_file_name("cc-loadout.standalone.bak");
-    if !base.exists() {
+    if std::fs::symlink_metadata(&base).is_err() {
         return base;
     }
     let mut n: u32 = 1;
     loop {
         let candidate = link.with_file_name(format!("cc-loadout.standalone.bak.{n}"));
-        if !candidate.exists() {
+        if std::fs::symlink_metadata(&candidate).is_err() {
             return candidate;
         }
         n += 1;
@@ -166,9 +174,35 @@ fn converge_standalone(
     // resolved-vs-literal mismatch the guard above exists to fix (and, on a
     // macOS tmp dir where `/var` is itself a symlink, fail this comparison
     // for every ordinary — non-misconfigured — install).
-    if link.starts_with(data_root) {
+    //
+    // `|| link == exe_resolved` closes the one case the literal prefix check
+    // above cannot see: `CC_LOADOUT_LINK_DIR` set (or aliased through some
+    // other symlink) directly to the *already-resolved* location of the
+    // running binary, bypassing `data_root`'s own symlink entirely. `link`
+    // itself is not canonicalized for this — that would reintroduce the same
+    // mixed comparison the prefix check's comment warns about — this only
+    // catches the case where the literal value the caller gave already *is*
+    // the resolved path, which needs no further resolving to compare.
+    if link.starts_with(data_root) || link == exe_resolved {
         return Ok(None);
     }
+    // Rebase the resolved exe back onto the literal `data_root` before it is
+    // ever written down anywhere. `scripts/launcher.sh`'s `reconcile_link`
+    // only recognizes a link spelled literally as `$DATA/bin/<pin>/cc-loadout`
+    // (`$DATA` being the SAME un-resolved env-var path `data_root` is) — if
+    // `data_root` is reached through a symlink, `exe`'s already-resolved
+    // spelling falls outside that pattern, and the launcher would treat the
+    // link this step just wrote as "someone else's" and never repoint it on
+    // the next version bump. The user would be silently stuck on the old
+    // pinned binary, and once `gc_old_versions` reclaims its now-unpinned
+    // directory the PATH entry goes fully dangling — with no hint printed
+    // either, since the link is no longer the foreign kind `hooks/hook.sh`
+    // looks for. `strip_prefix` cannot fail here: the guard above already
+    // established `exe_resolved.starts_with(&data_resolved)`.
+    let suffix = exe_resolved
+        .strip_prefix(&data_resolved)
+        .expect("checked exe_resolved.starts_with(&data_resolved) above");
+    let exe_for_link = data_root.join(suffix);
     // `symlink_metadata`, not `metadata`: the latter follows the link, so the
     // launcher's own symlink would present as the regular file it points at and
     // this step would "converge" a link that is already correct.
@@ -184,7 +218,7 @@ fn converge_standalone(
     if fix {
         std::fs::rename(link, &backup)
             .with_context(|| format!("backing up {} to {}", link.display(), backup.display()))?;
-        if let Err(symlink_err) = std::os::unix::fs::symlink(exe, link) {
+        if let Err(symlink_err) = std::os::unix::fs::symlink(&exe_for_link, link) {
             // The rename above already succeeded: `link` is now empty and the
             // user's original binary is sitting at `backup` with nothing on
             // PATH at all. Restore it rather than leaving the user with
@@ -197,7 +231,7 @@ fn converge_standalone(
                     format!(
                         "linking {} -> {}: restored the original from {}",
                         link.display(),
-                        exe.display(),
+                        exe_for_link.display(),
                         backup.display()
                     )
                 }),
@@ -205,7 +239,7 @@ fn converge_standalone(
                     format!(
                         "linking {} -> {}: the original is saved at {} but restoring it also failed: {rollback_err}",
                         link.display(),
-                        exe.display(),
+                        exe_for_link.display(),
                         backup.display()
                     )
                 }),
@@ -215,7 +249,7 @@ fn converge_standalone(
     Ok(Some(StandaloneLink {
         path: link.to_path_buf(),
         backup,
-        target: exe.to_path_buf(),
+        target: exe_for_link,
         converged: fix,
     }))
 }
@@ -504,6 +538,29 @@ mod tests {
         assert_eq!(found[0].file_name().unwrap(), "cc-loadout.bak.123");
     }
 
+    /// `exists()` follows symlinks, so a *dangling* `cc-loadout.standalone.bak`
+    /// would read as free and the following `rename` would silently replace
+    /// it. `standalone_backup_path` must use `symlink_metadata` instead, which
+    /// sees the dangling entry for what it is: something already there.
+    #[test]
+    fn standalone_backup_path_skips_a_dangling_symlink_by_that_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("bin/cc-loadout");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(
+            tmp.path().join("nowhere"),
+            link.with_file_name("cc-loadout.standalone.bak"),
+        )
+        .unwrap();
+
+        let picked = standalone_backup_path(&link);
+        assert_eq!(
+            picked.file_name().unwrap(),
+            "cc-loadout.standalone.bak.1",
+            "a dangling symlink must not be mistaken for a free slot"
+        );
+    }
+
     /// A second regular file landing at `link` after an earlier `--fix`
     /// already converged one (a repeat `install.sh`, `cargo install --root`,
     /// a hand-restored wrapper) must not clobber the first backup — that
@@ -565,9 +622,14 @@ mod tests {
         let original = std::fs::read(&link).unwrap();
 
         let err = converge_standalone(&data, &link, &exe, true).unwrap_err();
+        // Unique to the rollback-succeeded branch: `rename`'s own "backing up
+        // ... to ..." context also mentions `cc-loadout.standalone.bak`, so
+        // asserting on that substring alone would stay green even if a future
+        // refactor made `rename` the failing call instead of `symlink` — this
+        // wording only appears once the rollback itself has run.
         assert!(
-            format!("{err:#}").contains("cc-loadout.standalone.bak"),
-            "the recovery path must be named in the error: {err:#}"
+            format!("{err:#}").contains("restored the original from"),
+            "the recovery path must be named via the rollback branch specifically: {err:#}"
         );
         assert_eq!(
             std::fs::read(&link).unwrap(),
@@ -606,6 +668,76 @@ mod tests {
             .unwrap()
             .expect("canonicalizing both sides must still match");
         assert!(out.converged);
+    }
+
+    /// The launcher's `reconcile_link` (`scripts/launcher.sh:111`) only
+    /// repoints a link literally spelled `$DATA/bin/<pin>/cc-loadout` — the
+    /// SAME un-resolved `$DATA` `data_root` is built from. If the symlink this
+    /// step writes were spelled with the *resolved* exe path instead, the
+    /// launcher would see a foreign link on the next version bump, never
+    /// repoint it, and `gc_old_versions` would eventually delete the pinned
+    /// binary out from under a dangling PATH entry. Asserting only that the
+    /// link *resolves* to the right file (as the sibling test above does)
+    /// would pass even with that defect present — this pins the spelling.
+    #[test]
+    fn converge_spells_the_link_target_using_the_literal_data_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_data = tmp.path().join("real/data/cc-loadout");
+        let exe = real_data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+
+        let data_via_symlink = tmp.path().join("home/.local/share/cc-loadout");
+        std::fs::create_dir_all(data_via_symlink.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_data, &data_via_symlink).unwrap();
+
+        let link = tmp.path().join("bin/cc-loadout");
+        touch_exec(&link);
+
+        let out = converge_standalone(&data_via_symlink, &link, &exe, true)
+            .unwrap()
+            .expect("a regular file must be reported");
+
+        // The shape `reconcile_link` recognizes: literally under `data_root`
+        // (the symlinked spelling), never under `real_data` (the resolved
+        // one), even though both name the same file on disk.
+        let expected_target = data_via_symlink.join("bin/9.9.9/cc-loadout");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            expected_target,
+            "the link must be spelled under the literal data_root, not the resolved one"
+        );
+        assert_eq!(out.target, expected_target);
+    }
+
+    /// The literal prefix check above cannot see `CC_LOADOUT_LINK_DIR`
+    /// aliased directly onto the *already-resolved* location of the running
+    /// binary while `data_root` itself is still spelled through its own
+    /// symlink — `link` and `data_root` no longer share a literal prefix at
+    /// all. `link == exe_resolved` closes exactly that gap.
+    #[test]
+    fn converge_is_a_noop_when_link_is_the_resolved_exe_reached_by_a_different_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonicalize the tmp root itself first, so nothing below is
+        // affected by an ambient symlink in the test environment (e.g.
+        // macOS's `/var` -> `/private/var`) — the ONLY deliberate symlink
+        // here is `data_via_symlink`.
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let real_data = root.join("real/data/cc-loadout");
+        let exe = real_data.join("bin/9.9.9/cc-loadout");
+        touch_exec(&exe);
+
+        let data_via_symlink = root.join("home/.local/share/cc-loadout");
+        std::fs::create_dir_all(data_via_symlink.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_data, &data_via_symlink).unwrap();
+
+        // CC_LOADOUT_LINK_DIR set directly to the resolved location: bypasses
+        // `data_root`'s own symlink entirely, so it shares no literal prefix
+        // with `data_root` at all, and lands exactly on the running binary.
+        let link = exe.clone();
+
+        assert!(converge_standalone(&data_via_symlink, &link, &exe, true)
+            .unwrap()
+            .is_none());
     }
 
     /// `CC_LOADOUT_LINK_DIR` pointing inside the data dir is misconfiguration:
