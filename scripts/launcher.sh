@@ -16,8 +16,85 @@ set -eu
 # Filled in by later tasks; defined here so the resolution path below is
 # complete and testable on its own.
 download() {
-  echo "cc-loadout launcher: download not implemented" >&2
-  exit 1
+  case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) target=x86_64-unknown-linux-musl ;;
+  Linux-aarch64) target=aarch64-unknown-linux-musl ;;
+  Darwin-arm64) target=aarch64-apple-darwin ;;
+  Darwin-x86_64) target=x86_64-apple-darwin ;;
+  *)
+    echo "cc-loadout launcher: unsupported platform $(uname -s)/$(uname -m);" \
+      "build from source and set CC_LOADOUT_BIN" >&2
+    exit 1
+    ;;
+  esac
+  command -v curl >/dev/null 2>&1 || {
+    echo "cc-loadout launcher: curl is required to download the pinned binary" >&2
+    exit 1
+  }
+
+  asset="cc-loadout-$target.tar.gz"
+  # taiki-e/upload-rust-binary-action names the checksum `<bin>-<target>.sha256`
+  # (no .tar.gz); its content references the .tar.gz filename, so `-c` works
+  # from the download dir. release.yml reproduces that layout by hand.
+  #
+  # The checksum guards download integrity, not release authenticity — it ships
+  # next to the tarball. The trust root is the version pin plus HTTPS.
+  sum="cc-loadout-$target.sha256"
+
+  # HTTPS is enforced for the real release host and relaxed only when a base is
+  # explicitly overridden, which the test suite does with file:// fixtures.
+  # Keying on the override (not on the URL scheme) keeps the default path
+  # incapable of being downgraded by anything a redirect could say.
+  if [ -n "${CC_LOADOUT_RELEASE_BASE:-}" ]; then
+    base="$CC_LOADOUT_RELEASE_BASE/v$VER"
+    proto_args=""
+  else
+    base="https://github.com/XBlueSky/cc-loadout/releases/download/v$VER"
+    proto_args="--proto =https --proto-redir =https"
+  fi
+
+  mkdir -p "$DATA/bin/$VER"
+  # tmp dir inside the version dir: same filesystem, so the final mv is atomic
+  # even when two sessions race the first download.
+  tmp=$(mktemp -d "$DATA/bin/$VER/.download.XXXXXX")
+  trap 'rm -rf "$tmp"' EXIT
+
+  echo "cc-loadout launcher: downloading $asset (v$VER)" >&2
+  # Bounded on purpose: the SessionStart hook that calls this has a 90s harness
+  # timeout, and being SIGKILLed there would skip the trap above and orphan
+  # $tmp. Failing on our own terms keeps the cleanup reachable.
+  # shellcheck disable=SC2086  # $proto_args must word-split
+  if ! curl -fsSL $proto_args --connect-timeout 10 --max-time 30 \
+    -o "$tmp/$asset" "$base/$asset" >&2; then
+    echo "cc-loadout launcher: no asset for $target in release v$VER." \
+      "If v$VER was just published, retry shortly; otherwise build from source" \
+      "and set CC_LOADOUT_BIN" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2086  # $proto_args must word-split
+  if ! curl -fsSL $proto_args --connect-timeout 10 --max-time 30 \
+    -o "$tmp/$sum" "$base/$sum" >&2; then
+    echo "cc-loadout launcher: could not fetch $sum for v$VER; refusing to use" \
+      "an unverified download" >&2
+    exit 1
+  fi
+
+  # Verify BEFORE anything from the archive is trusted or executed.
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$tmp" && sha256sum -c "$sum") >&2
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$tmp" && shasum -a 256 -c "$sum") >&2
+  else
+    echo "cc-loadout launcher: neither sha256sum nor shasum found —" \
+      "cannot verify the download" >&2
+    exit 1
+  fi
+
+  tar -xzf "$tmp/$asset" -C "$tmp" cc-loadout
+  chmod +x "$tmp/cc-loadout"
+  mv -f "$tmp/cc-loadout" "$BIN"
+  rm -rf "$tmp"
+  trap - EXIT
 }
 gc_old_versions() { :; }
 reconcile_link() { :; }

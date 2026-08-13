@@ -122,3 +122,80 @@ else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: non-executable pinned binary was used (rc=$rc, out=$out)"
 fi
 rm -rf "$scratch" "$pr"
+
+# --- download fixtures -----------------------------------------------------
+# Builds the exact asset pair the release publishes: the bare binary at the
+# archive root, plus a `<bin>-<target>.sha256` whose body names the .tar.gz so
+# `sha256sum -c` works from the download dir.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
+
+make_release_fixture() {
+  local dir="$1" ver="$2" target stage
+  target="$(launcher_target)"
+  mkdir -p "$dir/v$ver"
+  stage="$(mktemp -d)"
+  printf '#!/bin/sh\necho "cc-loadout %s"\necho "args:$*"\n' "$ver" > "$stage/cc-loadout"
+  chmod +x "$stage/cc-loadout"
+  ( cd "$stage" && tar -czf "$dir/v$ver/cc-loadout-$target.tar.gz" cc-loadout )
+  ( cd "$dir/v$ver" && sha256_of "cc-loadout-$target.tar.gz" > "cc-loadout-$target.sha256" )
+  rm -rf "$stage"
+}
+
+if [[ "$(launcher_target)" == unsupported ]]; then
+  echo "  skip: download tests need a mapped target (this is $(uname -s)/$(uname -m))"
+else
+
+# --- a first run downloads, verifies and installs -------------------------
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+make_release_fixture "$scratch/rel" 9.9.9
+out="$(CC_LOADOUT_RELEASE_BASE="file://$scratch/rel" XDG_DATA_HOME="$scratch/data" \
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --version 2>&1)"
+assert_contains "$out" "cc-loadout 9.9.9" "a first run downloads and execs the pinned binary"
+if [[ -x "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: the download installed an executable at the pinned path"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: nothing executable at the pinned path after download"
+fi
+# The temp download dir must not survive a successful install.
+leftovers="$(find "$scratch/data/cc-loadout/bin/9.9.9" -maxdepth 1 -name '.download.*' | wc -l | tr -d ' ')"
+assert_eq "$leftovers" "0" "no .download.* directory is left behind on success"
+rm -rf "$scratch" "$pr"
+
+# --- a corrupt tarball fails verification and installs nothing ------------
+# The checksum is verified BEFORE anything from the archive is trusted, so a
+# mismatch must leave no binary at all rather than a quarantined one.
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+make_release_fixture "$scratch/rel" 9.9.9
+printf 'corrupted' >> "$scratch/rel/v9.9.9/cc-loadout-$(launcher_target).tar.gz"
+out="$(CC_LOADOUT_RELEASE_BASE="file://$scratch/rel" XDG_DATA_HOME="$scratch/data" \
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --print-path 2>&1)" \
+  && rc=0 || rc=$?
+if [[ $rc -ne 0 && ! -e "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a checksum mismatch installs nothing"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: checksum mismatch was tolerated (rc=$rc, out=$out)"
+fi
+rm -rf "$scratch" "$pr"
+
+# --- a missing asset explains the release window --------------------------
+# Merging the release PR bumps the pin minutes before release.yml finishes
+# uploading assets. Anyone installing in that window must be told to retry,
+# not left staring at a curl error.
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+mkdir -p "$scratch/rel/v9.9.9"
+out="$(CC_LOADOUT_RELEASE_BASE="file://$scratch/rel" XDG_DATA_HOME="$scratch/data" \
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --print-path 2>&1)" \
+  && rc=0 || rc=$?
+if [[ $rc -ne 0 && "$out" == *"retry shortly"* && "$out" == *"CC_LOADOUT_BIN"* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a missing asset names the retry and the escape hatch"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: missing-asset message unhelpful (rc=$rc, out=$out)"
+fi
+rm -rf "$scratch" "$pr"
+
+fi  # end mapped-target guard
