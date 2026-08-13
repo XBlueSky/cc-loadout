@@ -140,3 +140,24 @@ else
 fi
 
 rm -rf "$fakehome" "$fake_bin"
+
+# --- shared layout with scripts/launcher.sh --------------------------------
+
+# Binary mode must produce the same layout as scripts/launcher.sh: the binary
+# under the data dir at its own version, plus a symlink on PATH. Otherwise
+# every install.sh user with the plugin installed lands in hook.sh's
+# converge-hint path, and the migration nag becomes the normal experience.
+if grep -q 'XDG_DATA_HOME' "$ROOT/install.sh" && grep -q 'ln -sfn' "$ROOT/install.sh"; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: install.sh knows the data-dir + symlink layout"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: install.sh still installs a bare file on PATH"
+fi
+
+# Source mode must NOT write into the data dir: a dev build sitting at
+# $DATA/bin/<version>/ is indistinguishable from the released build of that
+# version, and every session would then silently run uncommitted code.
+if grep -q 'CC_LOADOUT_BIN' "$ROOT/install.sh"; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: install.sh points developers at CC_LOADOUT_BIN"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: install.sh does not mention the dev override"
+fi

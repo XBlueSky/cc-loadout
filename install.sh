@@ -14,6 +14,11 @@ INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 REPO="${REPO:-xbluesky/cc-loadout}"
 RELEASES_BASE="https://github.com/${REPO}/releases"
 BINARY_NAME="cc-loadout"
+# Must match scripts/launcher.sh exactly, or the plugin and the installer will
+# each maintain their own copy and the hook will nag about the other one.
+DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/cc-loadout"
+LINK_DIR="${CC_LOADOUT_LINK_DIR:-${INSTALL_DIR}}"
+BOOTSTRAP_BIN=""
 
 step() { echo -e "${GREEN}[+]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
@@ -59,7 +64,13 @@ build_from_source() {
   mkdir -p "$INSTALL_DIR"
   cp "$bin" "${INSTALL_DIR}/${BINARY_NAME}"
   chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+  BOOTSTRAP_BIN="${INSTALL_DIR}/${BINARY_NAME}"
   info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
+  # Deliberately a real file, NOT $DATA_DIR/bin/<version>/: a dev build parked
+  # there is indistinguishable from the released build of that version, and
+  # every session would silently run uncommitted code. Developers who want the
+  # plugin to use this build should say so explicitly.
+  info "To make the plugin use this build: export CC_LOADOUT_BIN=${INSTALL_DIR}/${BINARY_NAME}"
 }
 
 # Map this machine to one of the release asset targets. Anything else has to
@@ -122,11 +133,24 @@ install_from_release() {
   fi
 
   tar -xzf "${tmp}/${asset}" -C "$tmp" "${BINARY_NAME}" || err "could not extract ${BINARY_NAME} from ${asset}"
-  mkdir -p "$INSTALL_DIR"
+  local vdir="${DATA_DIR}/bin/${version}"
+  mkdir -p "$vdir" "$LINK_DIR"
   chmod +x "${tmp}/${BINARY_NAME}"
-  mv -f "${tmp}/${BINARY_NAME}" "${INSTALL_DIR}/${BINARY_NAME}"
+  mv -f "${tmp}/${BINARY_NAME}" "${vdir}/${BINARY_NAME}"
   rm -rf "$tmp"; trap - EXIT
-  info "Installed ${INSTALL_DIR}/${BINARY_NAME}"
+
+  # Same layout the plugin launcher maintains, so the two front doors converge
+  # on one binary instead of leaving two at different versions. -n so an
+  # existing symlink-to-a-directory is replaced rather than followed into.
+  local link="${LINK_DIR}/${BINARY_NAME}"
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    mv -f "$link" "${LINK_DIR}/${BINARY_NAME}.standalone.bak"
+    warn "moved the previous ${link} to ${BINARY_NAME}.standalone.bak"
+  fi
+  ln -sfn "${vdir}/${BINARY_NAME}" "$link"
+  info "Installed ${vdir}/${BINARY_NAME}"
+  info "Linked ${link}"
+  BOOTSTRAP_BIN="${vdir}/${BINARY_NAME}"
 }
 
 # Bootstrap now runs in BOTH modes, because the binary owns it: seeding
@@ -135,7 +159,10 @@ install_from_release() {
 # installed here at all — the bundled plugin ships them.
 bootstrap() {
   step "Running cc-loadout bootstrap..."
-  "${INSTALL_DIR}/${BINARY_NAME}" doctor --fix || warn "doctor reported an issue"
+  # The just-installed binary by absolute path, not by name: $INSTALL_DIR may
+  # not be on PATH yet (see main()'s warning), and in binary mode the real
+  # binary now lives under the data dir.
+  "${BOOTSTRAP_BIN}" doctor --fix || warn "doctor reported an issue"
 }
 
 main() {
@@ -161,7 +188,7 @@ main() {
   bootstrap
   echo ""
   step "Done. Try: ${BINARY_NAME} --help"
-  echo "$PATH" | grep -q "$INSTALL_DIR" || warn "add $INSTALL_DIR to PATH: export PATH=\"${INSTALL_DIR}:\${PATH}\""
+  echo "$PATH" | grep -q "$LINK_DIR" || warn "add $LINK_DIR to PATH: export PATH=\"${LINK_DIR}:\${PATH}\""
 }
 
 main "$@"

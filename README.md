@@ -64,6 +64,54 @@ Setup = empty the Unassigned bucket, then `w` to apply.
 
 ## Install
 
+### As a Claude Code plugin (recommended)
+
+cc-loadout ships as a Claude Code plugin bundling a guided profile-creation skill.
+Add it as a marketplace, then install:
+
+```
+/plugin marketplace add https://github.com/xbluesky/cc-loadout
+/plugin install cc-loadout@cc-loadout
+```
+
+That's it — installing the plugin provisions the CLI itself. At the next
+session start, its launcher downloads the pinned release build, verifies its
+checksum, and links it at `~/.local/bin/cc-loadout`, so the `cc-loadout`
+command and the bundled `/cc-loadout:init` skill are always the exact same
+build. Make sure `~/.local/bin` is on your `PATH` so the interactive TUI is
+reachable by name — the hook has no way to see your shell's `PATH` to warn
+you if it isn't.
+
+Then run `/cc-loadout:init` — or just ask Claude to "set up my cc-loadout
+profiles". The interactive `cc-loadout profile init` TUI is the no-agent
+alternative.
+
+Already installed with `install.sh` before this change? Your binary keeps
+working. The plugin will name it once, at the next session start (a
+"standalone install" notice), and hand you the exact `doctor --fix` command
+that converges the two onto one plugin-managed binary.
+
+### `install.sh` (the CLI without the plugin)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/xbluesky/cc-loadout/master/install.sh | bash
+```
+
+For anyone who wants the CLI on its own. It downloads a release, verifies its
+checksum, and links it at `~/.local/bin/cc-loadout` — the same
+data-dir-plus-symlink layout the plugin's launcher maintains, so the two front
+doors share one binary instead of each keeping a separate copy. It then runs
+`cc-loadout doctor --fix`, which seeds `~/.claude/profiles/profiles.json`
+(only if absent — your edits are safe), promotes managed plugins to
+`scope: user`, and clears any hook entries a much older version of `install.sh`
+wrote directly into `~/.claude/settings.json` (hooks now ship with the
+plugin). It is idempotent — re-run after a new release, or run
+`cc-loadout doctor` any time to check for drift. Make sure `~/.local/bin` is
+on your `PATH`. (Installing to somewhere else with `INSTALL_DIR=...`? The
+plugin's own symlink still lands at `~/.local/bin` unless
+`CC_LOADOUT_LINK_DIR` is also set, so both directories may end up holding a
+link — harmless, since both point at the same managed binary.)
+
 ### From source (requires a Rust toolchain)
 
 ```bash
@@ -72,43 +120,14 @@ cd ~/code/cc-loadout
 ./install.sh
 ```
 
-`install.sh`:
-
-- installs the release binary to `~/.local/bin/cc-loadout` — building it with
-  `cargo` from a clone, or downloading a pre-built one otherwise;
-- runs `cc-loadout doctor --fix`, which seeds `~/.claude/profiles/profiles.json`
-  (only if absent — your edits are safe) and promotes managed plugins to
-  `scope: user`.
-
-The SessionStart/SessionEnd hooks that keep plugin scope healthy ship with the
-plugin, so install it too (below). Older versions wrote those hooks into
-`~/.claude/settings.json`; `doctor --fix` removes them.
-
-It is idempotent — re-run after pulling a new version, or run `cc-loadout doctor`
-any time to see whether plugin scope has drifted.
-
-### Pre-built (once a release is published)
-
-```bash
-curl -sSL https://raw.githubusercontent.com/xbluesky/cc-loadout/master/install.sh | bash
-```
-
-Make sure `~/.local/bin` is on your `PATH`.
-
-### As a Claude Code plugin (guided setup)
-
-cc-loadout also ships as a Claude Code plugin bundling a guided profile-creation skill.
-Add it as a marketplace, then install:
-
-```
-/plugin marketplace add https://github.com/xbluesky/cc-loadout
-/plugin install cc-loadout@cc-loadout
-```
-
-Then run `/cc-loadout:init` — or just ask Claude to "set up my cc-loadout profiles".
-The skill drives the `cc-loadout` CLI, so install the binary too (above); the
-plugin's SessionStart hook will tell you if it is missing. The interactive
-`cc-loadout profile init` TUI is the no-agent alternative.
+Run from a clone, `install.sh` builds with `cargo` instead and installs a real
+file at `~/.local/bin/cc-loadout` — deliberately *not* the plugin's managed
+data dir, since a dev build parked there would be indistinguishable from a
+release and every session would silently run uncommitted code. To point the
+plugin at this build instead of downloading its own pinned release,
+`export CC_LOADOUT_BIN=~/.local/bin/cc-loadout`. (No toolchain found, or the
+build fails? It falls back to the downloaded layout above.) Make sure
+`~/.local/bin` is on your `PATH`.
 
 ## Usage
 
