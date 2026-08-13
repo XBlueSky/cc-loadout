@@ -13,8 +13,8 @@
 # session's context.
 set -eu
 
-# Filled in by later tasks; defined here so the resolution path below is
-# complete and testable on its own.
+# Fetches the pinned release, verifies its checksum before anything from the
+# archive is trusted, and installs the binary atomically.
 download() {
   case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target=x86_64-unknown-linux-musl ;;
@@ -143,7 +143,15 @@ gc_old_versions() {
     # `notaversion` and a stray `.download.XXXXXX` are all left alone.
     case "$name" in
     *[!0-9.]*) continue ;;
-    [0-9]*.[0-9]*.[0-9]*) rm -rf "$d" ;;
+    [0-9]*.[0-9]*.[0-9]*)
+      # Fail-soft, matching every other fallible op in reconcile_link: pruning
+      # is best-effort housekeeping, and under `set -eu` a bare failing rm
+      # here (read-only data dir, permission error, restrictive mount) would
+      # abort the whole launcher before reconcile_link runs and the binary
+      # execs. A stray leftover directory is an acceptable price; a session
+      # that fails to start is not.
+      rm -rf "$d" 2>/dev/null || true
+      ;;
     esac
   done
 }
