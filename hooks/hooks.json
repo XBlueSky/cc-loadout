@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/hook.sh session-start",
-            "timeout": 10
+            "timeout": 90
           }
         ]
       }

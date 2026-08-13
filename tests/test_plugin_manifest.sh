@@ -87,62 +87,127 @@ else
   TEST_PASS=$((TEST_PASS+1)); echo "  ok: no shim references the retired lib/ scripts"
 fi
 
-# Regression guard: this file also checks hook.sh *behaviour*, not just
-# manifest shape, because the binary-resolution lookup it validates has no
-# other test coverage. A non-executable cc-loadout on PATH must be treated
-# the same as no cc-loadout at all: `command -v` alone reports a match
-# without checking the executable bit, so a partial/broken install must not
-# silently swallow the one message that explains it.
-hook_scratch="$(mktemp -d)"
-mkdir -p "$hook_scratch/bin"
-printf '#!/bin/bash\necho ran\n' > "$hook_scratch/bin/cc-loadout"
-chmod 644 "$hook_scratch/bin/cc-loadout"
-hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
-hook_exit=$?
-if [[ "$hook_out" == *"cc-loadout: CLI not installed"* && $hook_exit -eq 0 ]]; then
-  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh treats a non-executable cc-loadout on PATH as missing"
+# SessionStart must be able to absorb a first-run download. The launcher bounds
+# its own curls well inside this, so the harness timeout is a backstop, not the
+# thing being relied on.
+if [[ "$(jq -r '.hooks.SessionStart[0].hooks[0].timeout' "$hkp" 2>/dev/null)" == "90" ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: SessionStart timeout leaves room for a first download"
 else
-  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a non-executable cc-loadout (exit=$hook_exit, out=$hook_out)"
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: SessionStart timeout is not 90"
 fi
-rm -rf "$hook_scratch"
 
-# Regression guard: `-x` alone returns true for a directory (the traversal
-# bit is set by default), so the ~/.local/bin fallback must also check `-f`
-# or a stray directory named cc-loadout is treated as usable.
+# --- hook.sh contract -------------------------------------------------------
+# stdout is injected into the session's context, so what the shim prints there
+# is user-facing and every path must still exit 0.
+#
+# tests/run.sh sources this file under `set -euo pipefail`. A bare
+# `hook_out="$(...)"` followed by a separate `hook_exit=$?` line is not enough
+# to guard that: bash *does* propagate the inner command's status onto the
+# assignment, so under `set -e` a non-zero status there aborts the script
+# right there — the `hook_exit=$?` line is never reached, no FAIL: line is
+# printed for it, and every assertion after it in this file silently vanishes
+# along with the Total: summary. hook.sh exits 0 on every path by design, so
+# that abort never fires today and the hazard is invisible; it must not be
+# reintroduced the moment that invariant is ever violated by mistake. Guarding
+# every site with `&& hook_exit=0 || hook_exit=$?` (the same convention
+# tests/test_launcher.sh uses for the launcher) keeps a failure local to its
+# own assertion and makes hook_exit an assertion of fact rather than a value
+# that happens to read 0 either way.
 hook_scratch="$(mktemp -d)"
-mkdir -p "$hook_scratch/.local/bin/cc-loadout"
-hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
-hook_exit=$?
-if [[ "$hook_out" == *"cc-loadout: CLI not installed"* && $hook_exit -eq 0 ]]; then
-  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh treats a directory at the fallback path as missing"
+mkdir -p "$hook_scratch/bin" "$hook_scratch/link"
+printf '#!/bin/sh\necho "ran:$*"\n' > "$hook_scratch/bin/stub"
+chmod +x "$hook_scratch/bin/stub"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  CC_LOADOUT_BIN="$hook_scratch/bin/stub" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  bash "$ROOT/hooks/hook.sh" session-start 2>/dev/null)" && hook_exit=0 || hook_exit=$?
+if [[ "$hook_out" == *"ran:hook session-start"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh runs the resolved binary with its event"
 else
-  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the install hint for a directory at \$HOME/.local/bin/cc-loadout (exit=$hook_exit, out=$hook_out)"
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not run the resolved binary (exit=$hook_exit, out=$hook_out)"
 fi
-rm -rf "$hook_scratch"
 
-# Regression guard: an installed binary too old to understand `hook` must not
-# fail silently. clap exits non-zero on an unrecognised subcommand; the old
-# `"$bin" hook "$event" || true` swallowed that unconditionally, so a plugin
-# update against a stale binary produced no signal at all (no session id, no
-# scope promotion, no legacy migration) with nothing to explain why. A stub
-# binary that exits 2 stands in for that stale binary here.
-hook_scratch="$(mktemp -d)"
-mkdir -p "$hook_scratch/bin"
-printf '#!/bin/bash\nexit 2\n' > "$hook_scratch/bin/cc-loadout"
-chmod +x "$hook_scratch/bin/cc-loadout"
-hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-start 2>&1)"
-hook_exit=$?
-if [[ "$hook_out" == *"cc-loadout: the installed CLI is too old"* && $hook_exit -eq 0 ]]; then
-  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh prints an upgrade hint at session-start when the binary rejects the hook subcommand"
-else
-  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh did not print the upgrade hint for a binary exiting 2 on session-start (exit=$hook_exit, out=$hook_out)"
-fi
-hook_out="$(echo '{}' | env -i HOME=/nonexistent PATH="$hook_scratch/bin:/usr/bin:/bin" bash "$ROOT/hooks/hook.sh" session-end 2>&1)"
-hook_exit=$?
+# A binary that fails must not break the session and must not narrate to stdout.
+printf '#!/bin/sh\necho "boom" >&2\nexit 2\n' > "$hook_scratch/bin/stub"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  CC_LOADOUT_BIN="$hook_scratch/bin/stub" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  bash "$ROOT/hooks/hook.sh" session-start 2>/dev/null)" && hook_exit=0 || hook_exit=$?
 if [[ -z "$hook_out" && $hook_exit -eq 0 ]]; then
-  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh stays silent at session-end for the same old binary"
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh exits 0 and stays off stdout when the binary fails"
 else
-  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh was not silent at session-end for a binary exiting 2 (exit=$hook_exit, out=$hook_out)"
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh misbehaved for a failing binary (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
+
+# Unresolvable at session-start: say so once, on stdout, and still exit 0.
+hook_scratch="$(mktemp -d)"
+mkdir -p "$hook_scratch/link"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  XDG_DATA_HOME="$hook_scratch/data" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  CC_LOADOUT_LAUNCHER_NO_DOWNLOAD=1 \
+  bash "$ROOT/hooks/hook.sh" session-start 2>/dev/null)" && hook_exit=0 || hook_exit=$?
+if [[ "$hook_out" == *"CC_LOADOUT_BIN"* && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: an unresolvable CLI prints a hint at session-start"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: no session-start hint for an unresolvable CLI (exit=$hook_exit, out=$hook_out)"
+fi
+
+# ...and stays silent at session-end, which is the moment the user can least
+# act on it — and never spends 30 seconds downloading.
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  XDG_DATA_HOME="$hook_scratch/data" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  bash "$ROOT/hooks/hook.sh" session-end 2>/dev/null)" && hook_exit=0 || hook_exit=$?
+if [[ -z "$hook_out" && $hook_exit -eq 0 ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: hook.sh is silent at session-end with no binary"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh was not silent at session-end (exit=$hook_exit, out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
+
+# A standalone install at a different version gets named once, with the exact
+# command that converges it — the full path, because that standalone binary's
+# own `doctor` may predate the fixing step.
+#
+# Deviation from the brief: its fixture put the resolvable binary at
+# "$hook_scratch/bin/stub", a path nothing in hook.sh's or the launcher's
+# resolution ever reads. With CC_LOADOUT_LAUNCHER_NO_DOWNLOAD=1 and no binary
+# at the real launcher-resolved path ($XDG_DATA_HOME/cc-loadout/bin/<pin>/),
+# resolution failed, hook.sh took its early "could not provision" exit, and
+# the standalone-install check below was never reached — confirmed by hand
+# (see task-5-report.md) that placing the fixture at the actual resolved path
+# makes the hint print correctly. Fixed here by using the real pin so
+# --print-path succeeds without a download.
+hook_scratch="$(mktemp -d)"
+pin="$(tr -d '[:space:]' < "$ROOT/.claude-plugin/cli-version")"
+mkdir -p "$hook_scratch/link" "$hook_scratch/data/cc-loadout/bin/$pin"
+printf '#!/bin/sh\necho "cc-loadout 0.0.1"\n' > "$hook_scratch/link/cc-loadout"
+chmod +x "$hook_scratch/link/cc-loadout"
+printf '#!/bin/sh\nexit 0\n' > "$hook_scratch/data/cc-loadout/bin/$pin/cc-loadout"
+chmod +x "$hook_scratch/data/cc-loadout/bin/$pin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  XDG_DATA_HOME="$hook_scratch/data" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  CC_LOADOUT_LAUNCHER_NO_DOWNLOAD=1 \
+  bash "$ROOT/hooks/hook.sh" session-start 2>/dev/null)" && hook_exit=0 || hook_exit=$?
+if [[ "$hook_out" == *"doctor --fix"* && "$hook_out" == *"0.0.1"* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a stale standalone install is named with its converge command"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: no converge hint for a stale standalone install (out=$hook_out)"
+fi
+
+# Our own symlink is not a standalone install — no nag. The cheap [ -L ] test
+# exists precisely so this case costs nothing. Pointed at the same resolvable
+# binary as above (rather than the brief's separate hardcoded "9.9.9" dir) so
+# the only variable that changes between this case and the one above is
+# symlink-ness, not whether resolution even succeeds.
+rm -f "$hook_scratch/link/cc-loadout"
+ln -s "$hook_scratch/data/cc-loadout/bin/$pin/cc-loadout" "$hook_scratch/link/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  XDG_DATA_HOME="$hook_scratch/data" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  CC_LOADOUT_LAUNCHER_NO_DOWNLOAD=1 \
+  bash "$ROOT/hooks/hook.sh" session-start 2>/dev/null)" && hook_exit=0 || hook_exit=$?
+if [[ "$hook_out" != *"doctor --fix"* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: our own symlink is not mistaken for a standalone install"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: hook.sh nagged about its own symlink (out=$hook_out)"
 fi
 rm -rf "$hook_scratch"
 
