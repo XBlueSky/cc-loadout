@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-08-14
+
+### Bug Fixes
+
+- normalize the data dir, order reconcile before GC, harden the launcher's failure surface
+- install.sh must not follow a symlink onto the pinned release binary
+- spell the converged symlink through the literal data root
+- address doctor --fix convergence review findings
+- surface the launcher's stderr on a successful SessionStart
+- make GC's rm -rf fail-soft and refresh a stale launcher comment
+- guard bare command substitutions in the launcher test suite
+
+### Documentation
+
+- correct plugin-managed-CLI claims across READMEs, CONTRIBUTING, SECURITY and skills
+
+### Features
+
+- install into the plugin's data dir layout
+- converge a standalone install in doctor --fix
+- resolve the CLI through the launcher in the hook shim
+- maintain the PATH symlink and prune superseded versions
+- download and verify the pinned binary in the launcher
+- add the plugin launcher's binary resolution
+- pin the CLI version for the plugin launcher
+
 ## [0.1.23] - 2026-08-04
 
 ### Bug Fixes
