@@ -9,11 +9,25 @@ stub_registry() {
 }
 
 REAL_BINARY="${ROOT}/target/release/cc-loadout"
-if [[ ! -x "$REAL_BINARY" ]]; then
-  echo "  SKIP: target/release/cc-loadout not found — run 'cargo build --release' first"
-  TEST_PASS=$((TEST_PASS+1))
-  # shellcheck disable=SC2317
-  return 0 2>/dev/null || true
+# CI's shell-tests job (.github/workflows/ci.yml) runs this suite with no
+# native release build at all — the only `cargo build --release` in CI
+# targets a musl/aarch64 triple in a separate job, writing
+# target/<triple>/release/, never target/release/. This used to bump
+# TEST_PASS and `return` before a single assertion in this file ran: a skip
+# is not a pass, and doing it that way silently skipped every assertion below
+# (not just the ones that actually need a real binary) while still reporting
+# green. HAVE_REAL_BINARY instead gates only the two blocks further down that
+# truly cannot run without one — both stub `cargo build` to produce no
+# binary, so without a real one already at $REAL_BINARY they fall through to
+# install_from_release() and hit the real network. Everything else in this
+# file (mode detection, the unknown-flag guard, the layout greps, and the
+# file://-fixture-driven install_from_release coverage) needs only bash,
+# curl, tar and a shasum tool, and now runs unconditionally, in CI included.
+HAVE_REAL_BINARY=0
+if [[ -x "$REAL_BINARY" ]]; then
+  HAVE_REAL_BINARY=1
+else
+  echo "  SKIP: target/release/cc-loadout not found (run 'cargo build --release' first) — the bootstrap and build_from_source-symlink blocks below need it to stay off the network, and are skipped, not passed"
 fi
 
 # --- mode detection -------------------------------------------------------
@@ -71,6 +85,14 @@ fi
 rm -rf "$s"
 
 # --- bootstrap ------------------------------------------------------------
+# Needs $REAL_BINARY: the stubbed cargo below produces the target/release/
+# directory but no binary in it, so build_from_source()'s own `[ -f "$bin" ]`
+# check only passes if a real build already sits there from before this test
+# ran. Without one, it falls through to install_from_release() and reaches
+# the actual GitHub network — exactly the "ran a full install against a
+# developer's real environment" failure mode this suite's other isolation
+# comments describe, just via the network path instead of $HOME.
+if [[ $HAVE_REAL_BINARY -eq 1 ]]; then
 fake_bin="$(mktemp -d)"
 cat > "$fake_bin/cargo" <<STUBEOF
 #!/bin/bash
@@ -140,6 +162,9 @@ else
 fi
 
 rm -rf "$fakehome" "$fake_bin"
+else
+  echo "  SKIP: bootstrap block needs \$REAL_BINARY (see HAVE_REAL_BINARY above)"
+fi
 
 # --- shared layout with scripts/launcher.sh --------------------------------
 
@@ -177,6 +202,13 @@ fi
 # its own $fake_bin/$fakehome were already torn down, so this uses a fresh
 # pair and restores $PATH afterward rather than depending on whatever cargo
 # this machine happens to have.
+#
+# Needs $REAL_BINARY for the same reason the bootstrap block does: the
+# stubbed cargo makes build_from_source() believe the build succeeded, but
+# only a real binary already at $REAL_BINARY makes its `[ -f "$bin" ]` check
+# actually pass. Without one this falls through to install_from_release()
+# and the real network, same as the bootstrap block above.
+if [[ $HAVE_REAL_BINARY -eq 1 ]]; then
 fake_bin2="$(mktemp -d)"
 cat > "$fake_bin2/cargo" <<STUBEOF
 #!/bin/bash
@@ -217,6 +249,9 @@ fi
 
 export PATH="$saved_path"
 rm -rf "$fakehome2" "$fake_bin2" "$pinned_dir"
+else
+  echo "  SKIP: build_from_source-symlink block needs \$REAL_BINARY (see HAVE_REAL_BINARY above)"
+fi
 
 # --- install_from_release fixture coverage (file:// override, no network) --
 # scripts/launcher.sh's tests redirect downloads at a local file:// fixture

@@ -87,6 +87,47 @@ for bad in "" "not-a-version" "1.2" "../../etc" "1/../../evil.0.0"; do
   rm -rf "$scratch" "$pr"
 done
 
+# --- XDG_DATA_HOME normalization (M1) --------------------------------------
+# scripts/launcher.sh concatenates "${XDG_DATA_HOME:-...}/cc-loadout" — a
+# naive string join — while src/main.rs's resolve_env() builds the same path
+# with PathBuf::join, which silently suppresses a doubled separator. A
+# trailing slash on the input used to make the two sides spell the same file
+# two different ways (".../data//cc-loadout" here, ".../data/cc-loadout"
+# there); that divergence is exactly what let a symlink doctor --fix wrote go
+# unrecognized by reconcile_link's pattern match below and never get
+# repointed. place_fake_binary always writes the single-slash spelling, so
+# this fails loudly (wrong --print-path output, or no link created) if
+# normalization regresses.
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/data" 9.9.9
+out="$(XDG_DATA_HOME="$scratch/data/" CC_LOADOUT_LINK_DIR="$scratch/bin" \
+  sh "$pr/scripts/launcher.sh" --print-path 2>/dev/null)" && rc=0 || rc=$?
+assert_eq "$out" "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" \
+  "a trailing slash on XDG_DATA_HOME still resolves to the single-slash path"
+assert_eq "$(readlink "$scratch/bin/cc-loadout" 2>/dev/null || true)" \
+  "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" \
+  "...and the PATH link is created there too, not at a doubled-slash path"
+rm -rf "$scratch" "$pr"
+
+# A relative XDG_DATA_HOME is invalid per the XDG Base Directory spec and must
+# be ignored, falling back to $HOME/.local/share — not resolved against
+# whatever cwd this script happens to run from (the hook's cwd, doctor's cwd,
+# and install.sh's cwd are three different directories in practice). Invoked
+# from a DIFFERENT cwd than $HOME so a regression that resolved the relative
+# value against the launcher's own cwd instead of falling back would look for
+# the binary somewhere this test never populates, and fail loudly rather than
+# silently passing by accident.
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/home/.local/share" 9.9.9
+out="$(cd "$scratch" && HOME="$scratch/home" XDG_DATA_HOME="relative/data" \
+  CC_LOADOUT_LINK_DIR="$scratch/bin" sh "$pr/scripts/launcher.sh" --print-path 2>/dev/null)" \
+  && rc=0 || rc=$?
+assert_eq "$out" "$scratch/home/.local/share/cc-loadout/bin/9.9.9/cc-loadout" \
+  "a relative XDG_DATA_HOME is ignored in favour of \$HOME/.local/share"
+rm -rf "$scratch" "$pr"
+
 # --- an existing pinned binary is resolved and exec'd ----------------------
 scratch="$(mktemp -d)"
 pr="$(make_plugin_root 9.9.9)"
@@ -193,6 +234,14 @@ if [[ $rc -ne 0 && ! -e "$scratch/data/cc-loadout/bin/9.9.9/cc-loadout" ]]; then
 else
   TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: checksum mismatch was tolerated (rc=$rc, out=$out)"
 fi
+# A mismatch used to surface only sha256sum's/shasum's own raw "FAILED" line
+# (still shown above it) with no cc-loadout-prefixed message at all — the one
+# failure path in download() without one, and the security-relevant one.
+if [[ "$out" == *"cc-loadout launcher:"*"checksum verification FAILED"* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a checksum mismatch says verification failed and nothing was installed"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: no explicit checksum-failure message (out=$out)"
+fi
 rm -rf "$scratch" "$pr"
 
 # --- a missing asset explains the release window --------------------------
@@ -273,6 +322,28 @@ XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
   sh "$pr/scripts/launcher.sh" --print-path >/dev/null 2>&1
 assert_eq "$(resolve_link "$scratch/bin/cc-loadout")" "$scratch/elsewhere/cc-loadout" \
   "a symlink pointing outside our data dir is left untouched"
+rm -rf "$scratch" "$pr"
+
+# a DANGLING foreign symlink -> still left alone, but named on stderr (M3)
+# The one state the "foreign symlink" case above does not cover: if that
+# foreign target no longer exists, hooks/hook.sh's own `[ -L ]` check sees a
+# symlink and takes its "ours, skip" branch too, so its standalone-install
+# hint never fires either. Nothing anywhere would ever say 'cc-loadout' on
+# PATH is broken. reconcile_link must still refuse to touch it (not ours to
+# move) but now names it once on stderr instead of staying completely silent.
+scratch="$(mktemp -d)"
+pr="$(make_plugin_root 9.9.9)"
+place_fake_binary "$scratch/data" 9.9.9
+mkdir -p "$scratch/bin"
+ln -s "$scratch/nowhere/cc-loadout" "$scratch/bin/cc-loadout"
+out="$(XDG_DATA_HOME="$scratch/data" CC_LOADOUT_LINK_DIR="$scratch/bin" \
+  sh "$pr/scripts/launcher.sh" --print-path 2>&1)" && rc=0 || rc=$?
+if [[ "$(resolve_link "$scratch/bin/cc-loadout")" == "$scratch/nowhere/cc-loadout" \
+      && "$out" == *"cc-loadout launcher:"*"$scratch/bin/cc-loadout"*"broken symlink"* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a dangling foreign symlink is left alone but named on stderr"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: dangling foreign symlink not handled correctly (out=$out)"
+fi
 rm -rf "$scratch" "$pr"
 
 # --- version GC -----------------------------------------------------------

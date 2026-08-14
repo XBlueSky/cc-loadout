@@ -211,6 +211,30 @@ else
 fi
 rm -rf "$hook_scratch"
 
+# A regular file whose reported version happens to EQUAL the pin must still
+# be named (fix-wave item F). Version equality does not imply build equality
+# — a hand-built 0.1.23 is not the released 0.1.23 — so gating the hint on
+# `have != pin` (the old behaviour) left exactly this case silently
+# unflagged: the skills and the hook would keep driving two different
+# binaries with no warning at all. This is the regression that fix closes.
+hook_scratch="$(mktemp -d)"
+pin="$(tr -d '[:space:]' < "$ROOT/.claude-plugin/cli-version")"
+mkdir -p "$hook_scratch/link" "$hook_scratch/data/cc-loadout/bin/$pin"
+printf '#!/bin/sh\necho "cc-loadout %s"\n' "$pin" > "$hook_scratch/link/cc-loadout"
+chmod +x "$hook_scratch/link/cc-loadout"
+printf '#!/bin/sh\nexit 0\n' > "$hook_scratch/data/cc-loadout/bin/$pin/cc-loadout"
+chmod +x "$hook_scratch/data/cc-loadout/bin/$pin/cc-loadout"
+hook_out="$(echo '{}' | env -i HOME="$hook_scratch" PATH=/usr/bin:/bin \
+  XDG_DATA_HOME="$hook_scratch/data" CC_LOADOUT_LINK_DIR="$hook_scratch/link" \
+  CC_LOADOUT_LAUNCHER_NO_DOWNLOAD=1 \
+  bash "$ROOT/hooks/hook.sh" session-start 2>/dev/null)" && hook_exit=0 || hook_exit=$?
+if [[ "$hook_out" == *"doctor --fix"* ]]; then
+  TEST_PASS=$((TEST_PASS+1)); echo "  ok: a regular file matching the pin's version is still named (build != version)"
+else
+  TEST_FAIL=$((TEST_FAIL+1)); echo "  FAIL: a version-matching regular file was not named (out=$hook_out)"
+fi
+rm -rf "$hook_scratch"
+
 # The launcher resolves this pin to a GitHub Release tarball, so a stale pin
 # means a user installs a new plugin and silently runs the old binary.
 pin_file="$ROOT/.claude-plugin/cli-version"

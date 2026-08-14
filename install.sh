@@ -18,10 +18,42 @@ REPO="${REPO:-xbluesky/cc-loadout}"
 # which relaxes the HTTPS-only guard the same way and for the same reason.
 RELEASES_BASE="${CC_LOADOUT_RELEASE_BASE:-https://github.com/${REPO}/releases}"
 BINARY_NAME="cc-loadout"
+
+# Normalizes a directory-valued env var before it is concatenated into a
+# path. Kept identical in spirit to scripts/launcher.sh's own copy of this
+# function (sh and bash can't literally share code across two separate
+# files) — see that script's comment for the full reasoning, and its Rust
+# counterparts in src/main.rs's resolve_env() and src/doctor.rs's
+# link_path(). Touch one, touch all four. Two problems, one fix:
+#   1. A trailing slash. "${XDG_DATA_HOME:-x}/cc-loadout" is a naive string
+#      join, so a trailing slash on the input doubles the separator here —
+#      "/x/" becomes "/x//cc-loadout" — while Rust's PathBuf::join silently
+#      suppresses the second separator and gets "/x/cc-loadout" from the very
+#      same input. Two spellings of one file break every exact-string
+#      comparison built on them, including src/doctor.rs's converge_standalone,
+#      whose written spelling must match what scripts/launcher.sh's
+#      reconcile_link recognizes as "ours".
+#   2. A relative value. The XDG Base Directory spec says a relative path in
+#      these variables is invalid and must be ignored — otherwise it resolves
+#      against whatever this process's cwd happens to be, and install.sh,
+#      scripts/launcher.sh and doctor.rs each run with a different one.
+# Prints the normalized value, or nothing if it should be treated as unset.
+normalize_dir_var() {
+  local v="$1"
+  case "$v" in
+  /*) ;;
+  *) v="" ;;
+  esac
+  while [ -n "$v" ] && [ "${v%/}" != "$v" ]; do v="${v%/}"; done
+  printf '%s' "$v"
+}
+
 # Must match scripts/launcher.sh exactly, or the plugin and the installer will
 # each maintain their own copy and the hook will nag about the other one.
-DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/cc-loadout"
-LINK_DIR="${CC_LOADOUT_LINK_DIR:-${INSTALL_DIR}}"
+_xdg_data_home="$(normalize_dir_var "${XDG_DATA_HOME:-}")"
+DATA_DIR="${_xdg_data_home:-${HOME}/.local/share}/cc-loadout"
+_link_dir_env="$(normalize_dir_var "${CC_LOADOUT_LINK_DIR:-}")"
+LINK_DIR="${_link_dir_env:-${INSTALL_DIR}}"
 BOOTSTRAP_BIN=""
 
 step() { echo -e "${GREEN}[+]${NC} $1"; }
@@ -109,7 +141,14 @@ detect_target() {
 # Resolve the newest tag by following the /releases/latest redirect, so this
 # needs neither jq nor an API token.
 latest_version() {
-  curl -sSL -o /dev/null -w '%{url_effective}' "${RELEASES_BASE}/latest" \
+  # Same HTTPS-only guard as install_from_release below, relaxed only for the
+  # same override (the test suite has no reason to point this at a file://
+  # fixture today — every fixture-based test sets VERSION= explicitly — but
+  # this function reaches the network unconditionally otherwise, and had no
+  # --proto enforcement at all before this fix-wave item).
+  local proto_args=(--proto '=https' --proto-redir '=https')
+  [ -z "${CC_LOADOUT_RELEASE_BASE:-}" ] || proto_args=()
+  curl -sSL "${proto_args[@]}" -o /dev/null -w '%{url_effective}' "${RELEASES_BASE}/latest" \
     | sed -n 's|.*/tag/v\(.*\)$|\1|p'
 }
 
@@ -154,6 +193,24 @@ install_from_release() {
   local target; target="$(detect_target)"
   local version="${VERSION:-$(latest_version)}"
   [ -n "$version" ] || err "could not determine the latest version (set VERSION=...)"
+  # Same two-step case scripts/launcher.sh uses for its own pin, and
+  # load-bearing for the identical reason ("$VER is interpolated into a
+  # filesystem path below" — here: vdir, mkdir -p, mv -f, and the symlink
+  # target). The first pattern alone accepts `1/../../evil.0.0` (glob `*`
+  # spans slashes), which would resolve outside DATA_DIR; the second pattern
+  # rejects every character that is not a digit or a dot, closing that
+  # without needing to enumerate traversal shapes. Not exploitable today —
+  # latest_version() derives from an HTTPS redirect off github.com, and
+  # VERSION= is user-set — but this is the only place remote-derived data
+  # reaches a filesystem path unchecked, and the check costs nothing.
+  case "$version" in
+  [0-9]*.[0-9]*.[0-9]*)
+    case "$version" in
+    *[!0-9.]*) err "refusing to use malformed version '${version}' (expected N.N.N)" ;;
+    esac
+    ;;
+  *) err "refusing to use malformed version '${version}' (expected N.N.N)" ;;
+  esac
   info "Version: ${version} (${target})"
 
   local asset="${BINARY_NAME}-${target}.tar.gz"

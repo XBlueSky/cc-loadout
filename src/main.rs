@@ -13,7 +13,7 @@ mod util;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::account::paths::{self, ClaudePaths};
@@ -275,8 +275,20 @@ fn resolve_env() -> Result<(PathBuf, Option<PathBuf>, PathBuf)> {
     let config_override = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
+    // The XDG Base Directory spec requires a relative value here to be
+    // ignored, falling back to the default — not resolved against whatever
+    // this process's cwd happens to be. Without this, a relative
+    // XDG_DATA_HOME resolves to a different directory in every binary that
+    // reads it: hooks/hook.sh's cwd, `doctor`'s cwd, install.sh's cwd are
+    // all different in practice. See scripts/launcher.sh's normalize_dir_var
+    // for the shell-side twin of this check (which also strips a trailing
+    // slash — moot here, since PathBuf::join already suppresses a doubled
+    // separator on this side; see that comment for why the two sides still
+    // must agree on the rest).
     let data_root = match std::env::var_os("XDG_DATA_HOME") {
-        Some(x) if !x.is_empty() => PathBuf::from(x).join("cc-loadout"),
+        Some(x) if !x.is_empty() && Path::new(&x).is_absolute() => {
+            PathBuf::from(x).join("cc-loadout")
+        }
         _ => home.join(".local").join("share").join("cc-loadout"),
     };
     Ok((home, config_override, data_root))

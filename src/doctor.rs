@@ -85,8 +85,16 @@ fn find_stale_backups(path: &Path) -> Result<Vec<PathBuf>> {
 /// caller already has that path as `data_root` from `resolve_env`, and takes
 /// it as a parameter below.)
 pub fn link_path(home: &Path) -> PathBuf {
+    // A relative CC_LOADOUT_LINK_DIR must be ignored, for the same reason as
+    // resolve_env()'s XDG_DATA_HOME handling in src/main.rs: the XDG Base
+    // Directory spec treats a relative value here as invalid, and honouring
+    // it anyway would resolve against whatever process's cwd happens to be
+    // running `doctor`, the launcher, or the hook — three different
+    // directories in practice. See scripts/launcher.sh's normalize_dir_var
+    // for the shell-side twin (which also strips a trailing slash — moot
+    // here, since PathBuf::join already suppresses a doubled separator).
     match std::env::var_os("CC_LOADOUT_LINK_DIR") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
+        Some(v) if !v.is_empty() && Path::new(&v).is_absolute() => PathBuf::from(v),
         _ => home.join(".local").join("bin"),
     }
     .join("cc-loadout")
