@@ -33,6 +33,7 @@ cargo fmt --check                                       # formatting
 cargo clippy --all-targets --all-features -- -D warnings  # lint (warnings are errors)
 cargo test                                              # unit + integration (tests/cli.rs)
 cargo audit                                             # dependency advisories (.cargo/audit.toml)
+scripts/sync-versions.sh --check                        # plugin version files match Cargo.toml
 ./tests/run.sh                                          # bash installer/registry tests (needs bash, jq, git)
 ```
 

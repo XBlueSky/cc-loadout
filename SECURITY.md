@@ -28,8 +28,10 @@ version** receives security fixes; older versions are not patched.
 | Latest `0.1.x` release | ✅ |
 | Anything older | ❌ |
 
-If you are on an older build, upgrade first (`git pull && ./install.sh`, or
-re-run the published installer) before reporting.
+If you are on an older build, upgrade first before reporting. For the CLI on
+its own: `git pull && ./install.sh`, or re-run the published installer. For
+the plugin: update it in Claude Code, which pulls a new version pin and
+therefore a new binary.
 
 ## Reporting a vulnerability
 

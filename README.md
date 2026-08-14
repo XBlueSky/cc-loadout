@@ -77,8 +77,10 @@ Add it as a marketplace, then install:
 That's it — installing the plugin provisions the CLI itself. At the next
 session start, its launcher downloads the pinned release build, verifies its
 checksum, and links it at `~/.local/bin/cc-loadout`, so the `cc-loadout`
-command and the bundled `/cc-loadout:init` skill are always the exact same
-build. Make sure `~/.local/bin` is on your `PATH` so the interactive TUI is
+command and the bundled `/cc-loadout:init` skill run the same build — unless
+a pre-existing standalone install already occupies that path (see below), in
+which case the command keeps running that build until you converge them.
+Make sure `~/.local/bin` is on your `PATH` so the interactive TUI is
 reachable by name — the hook has no way to see your shell's `PATH` to warn
 you if it isn't.
 
@@ -87,9 +89,11 @@ profiles". The interactive `cc-loadout profile init` TUI is the no-agent
 alternative.
 
 Already installed with `install.sh` before this change? Your binary keeps
-working. The plugin will name it once, at the next session start (a
-"standalone install" notice), and hand you the exact `doctor --fix` command
-that converges the two onto one plugin-managed binary.
+working, and the `cc-loadout` command keeps running it instead of the
+plugin's build until you converge them. From the next session start on, the
+plugin names it — every session, not just once — with a "standalone install"
+notice, and hands you the exact `doctor --fix` command that converges the
+two onto one plugin-managed binary.
 
 ### `install.sh` (the CLI without the plugin)
 
@@ -110,7 +114,10 @@ plugin). It is idempotent — re-run after a new release, or run
 on your `PATH`. (Installing to somewhere else with `INSTALL_DIR=...`? The
 plugin's own symlink still lands at `~/.local/bin` unless
 `CC_LOADOUT_LINK_DIR` is also set, so both directories may end up holding a
-link — harmless, since both point at the same managed binary.)
+link — into the same managed data dir, but not necessarily the same
+version: `install.sh` links the *latest* release, while the plugin's
+launcher links the version pinned in `.claude-plugin/cli-version`, so the
+two agree only once the pin catches up to latest.)
 
 ### From source (requires a Rust toolchain)
 

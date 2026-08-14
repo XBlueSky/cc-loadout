@@ -73,16 +73,18 @@ cc-loadout 以 Claude Code plugin 形式發佈,內附一個導引式的 profile 
 
 就這樣——裝上 plugin,CLI 本身也會一併準備好。下次 session 一啟動,它的 launcher 就會
 下載釘住的 release 版本、驗證 checksum,再把它連結到 `~/.local/bin/cc-loadout`,所以
-`cc-loadout` 指令跟內附的 `/cc-loadout:init` skill 永遠是同一個版本,不會各自為政。記得
-確認 `~/.local/bin` 在你的 `PATH` 上,互動式 TUI 才能用這個名字找到它——hook 沒辦法看到
-你 shell 的 `PATH`,沒辦法替你主動抓出這件事。
+`cc-loadout` 指令跟內附的 `/cc-loadout:init` skill 會是同一個版本——除非該路徑上已經有
+一份先前的 standalone 安裝佔著(見下段),那樣的話指令會繼續跑那一份,直到你把兩邊收斂
+為止。記得確認 `~/.local/bin` 在你的 `PATH` 上,互動式 TUI 才能用這個名字找到它——hook
+沒辦法看到你 shell 的 `PATH`,沒辦法替你主動抓出這件事。
 
 接著執行 `/cc-loadout:init`——或直接叫 Claude「幫我設定 cc-loadout profiles」。互動式的
 `cc-loadout profile init` TUI 是不靠 agent 的替代做法。
 
-在這次改動之前就用 `install.sh` 裝過的人:你的執行檔照樣能用,不受影響。plugin 只會在
-下次 session 啟動時提醒你一次(一句「standalone install」的訊息),並附上能讓兩邊收斂成
-同一個、由 plugin 管理的執行檔的那一句 `doctor --fix` 指令。
+在這次改動之前就用 `install.sh` 裝過的人:你的執行檔照樣能用,`cc-loadout` 指令也會
+繼續跑那一份,而不是 plugin 的版本,直到你把兩邊收斂為止。從下次 session 啟動起,plugin
+每次啟動都會提醒你——不是只提醒一次——印出一句「standalone install」的訊息,並附上能讓
+兩邊收斂成同一個、由 plugin 管理的執行檔的那一句 `doctor --fix` 指令。
 
 ### `install.sh`(只要 CLI,不裝 plugin)
 
@@ -99,8 +101,10 @@ curl -sSL https://raw.githubusercontent.com/xbluesky/cc-loadout/master/install.s
 `install.sh` 自己裝)。它是冪等的——拉新版本後重跑即可,或隨時執行 `cc-loadout doctor`
 檢查是否飄移。確認 `~/.local/bin` 在你的 `PATH` 上。(想裝到別的地方?用
 `INSTALL_DIR=...` 就好——但除非同時設定 `CC_LOADOUT_LINK_DIR`,plugin 自己的 symlink
-還是會落在 `~/.local/bin`,於是兩個目錄底下都可能各有一份連結,這無妨,反正兩邊指向
-同一個受管理的執行檔。)
+還是會落在 `~/.local/bin`,於是兩個目錄底下都可能各有一份連結——都指向同一個受管理的
+資料目錄,但版本不一定相同:`install.sh` 連的是*最新*的 release,plugin 的 launcher
+連的則是釘在 `.claude-plugin/cli-version` 裡的那個版本,要等 pin 追上最新版,兩邊才會
+一致。)
 
 ### 從原始碼(需要 Rust toolchain)
 
