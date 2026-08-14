@@ -25,8 +25,10 @@ just the plugins of the profiles it matches. That takes two CLI calls —
 
 ## Prerequisite
 
-The `cc-loadout` CLI must be installed (`cc-loadout --version`). If it is missing,
-tell the user to install it (see the cc-loadout README) and stop.
+The `cc-loadout` CLI must be installed (`cc-loadout --version`). If it's missing,
+that's normally the SessionStart hook not having run yet or having failed — have
+the user start a fresh session first; `install.sh` (see the cc-loadout README) is
+the fix only for someone using the CLI without the plugin.
 
 ## Steps
 

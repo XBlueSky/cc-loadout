@@ -1532,3 +1532,27 @@ fn doctor_promotes_cc_loadouts_own_registry_key_even_though_no_profiles_json_nam
         "the self key must be promoted even though profiles.json never names it"
     );
 }
+
+/// The binary under test lives in `target/`, never in the plugin data dir, so
+/// the convergence step must be inert here. This is the guard doing its job:
+/// running a dev build's `doctor --fix` must not repoint the developer's PATH.
+#[test]
+fn doctor_fix_does_not_touch_a_standalone_install_from_a_dev_build() {
+    let home = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let link_dir = home.path().join(".local/bin");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let link = link_dir.join("cc-loadout");
+    std::fs::write(&link, b"#!/bin/sh\nexit 0\n").unwrap();
+
+    cmd(home.path(), data.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("standalone").not());
+
+    assert!(
+        std::fs::read_link(&link).is_err(),
+        "a dev build must never relink the user's PATH entry"
+    );
+}

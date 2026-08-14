@@ -62,6 +62,50 @@ cc-loadout
 
 ## 安裝(Install)
 
+### 作為 Claude Code plugin(推薦)
+
+cc-loadout 以 Claude Code plugin 形式發佈,內附一個導引式的 profile 建立 skill。先把它加成 marketplace,再安裝:
+
+```
+/plugin marketplace add https://github.com/xbluesky/cc-loadout
+/plugin install cc-loadout@cc-loadout
+```
+
+就這樣——裝上 plugin,CLI 本身也會一併準備好。下次 session 一啟動,它的 launcher 就會
+下載釘住的 release 版本、驗證 checksum,再把它連結到 `~/.local/bin/cc-loadout`,所以
+`cc-loadout` 指令跟內附的 `/cc-loadout:init` skill 會是同一個版本——除非該路徑上已經有
+一份先前的 standalone 安裝佔著(見下段),那樣的話指令會繼續跑那一份,直到你把兩邊收斂
+為止。記得確認 `~/.local/bin` 在你的 `PATH` 上,互動式 TUI 才能用這個名字找到它——hook
+沒辦法看到你 shell 的 `PATH`,沒辦法替你主動抓出這件事。
+
+接著執行 `/cc-loadout:init`——或直接叫 Claude「幫我設定 cc-loadout profiles」。互動式的
+`cc-loadout profile init` TUI 是不靠 agent 的替代做法。
+
+在這次改動之前就用 `install.sh` 裝過的人:你的執行檔照樣能用,`cc-loadout` 指令也會
+繼續跑那一份,而不是 plugin 的版本,直到你把兩邊收斂為止。從下次 session 啟動起,plugin
+每次啟動都會提醒你——不是只提醒一次——印出一句「standalone install」的訊息,並附上能讓
+兩邊收斂成同一個、由 plugin 管理的執行檔的那一句 `doctor --fix` 指令。
+
+### `install.sh`(只要 CLI,不裝 plugin)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/xbluesky/cc-loadout/master/install.sh | bash
+```
+
+給只想要 CLI、不想裝 plugin 的人用。它會下載一份 release、驗證 checksum,並連結到
+`~/.local/bin/cc-loadout`——跟 plugin 的 launcher 維護的是同一套「資料目錄 + symlink」
+佈局,所以兩邊最終共用同一個執行檔,不會各自留下一份。接著它會執行
+`cc-loadout doctor --fix`:種一份 `~/.claude/profiles/profiles.json`(只在不存在時——你的
+修改是安全的)、把受管理的 plugin 提升到 `scope: user`,並清掉很早期版本的 `install.sh`
+直接寫進 `~/.claude/settings.json` 的 hook 項目(hook 現在隨 plugin 一起發佈,不再需要
+`install.sh` 自己裝)。它是冪等的——拉新版本後重跑即可,或隨時執行 `cc-loadout doctor`
+檢查是否飄移。確認 `~/.local/bin` 在你的 `PATH` 上。(想裝到別的地方?用
+`INSTALL_DIR=...` 就好——但除非同時設定 `CC_LOADOUT_LINK_DIR`,plugin 自己的 symlink
+還是會落在 `~/.local/bin`,於是兩個目錄底下都可能各有一份連結——都指向同一個受管理的
+資料目錄,但版本不一定相同:`install.sh` 連的是*最新*的 release,plugin 的 launcher
+連的則是釘在 `.claude-plugin/cli-version` 裡的那個版本,要等 pin 追上最新版,兩邊才會
+一致。)
+
 ### 從原始碼(需要 Rust toolchain)
 
 ```bash
@@ -70,40 +114,12 @@ cd ~/code/cc-loadout
 ./install.sh
 ```
 
-`install.sh` 會:
-
-- 把 release 執行檔安裝到 `~/.local/bin/cc-loadout`——如果是從 clone 安裝就用 `cargo`
-  建置,否則就下載預先建好的版本;
-- 執行 `cc-loadout doctor --fix`,它會種一份 `~/.claude/profiles/profiles.json`
-  (只在不存在時 —— 你的修改是安全的),並把受管理的 plugin 提升到 `scope: user`。
-
-維持 plugin scope 健康的 SessionStart/SessionEnd hook 現在隨 plugin 一起發佈,所以也要
-把 plugin 裝起來(見下)。舊版本會把這些 hook 寫進 `~/.claude/settings.json`;
-`doctor --fix` 會把它們移除。
-
-它是冪等的 —— 拉新版本後重跑即可,或隨時執行 `cc-loadout doctor` 來檢查 plugin scope 是否飄移。
-
-### 預先建好的版本(等發佈了 release 之後)
-
-```bash
-curl -sSL https://raw.githubusercontent.com/xbluesky/cc-loadout/master/install.sh | bash
-```
-
-確認 `~/.local/bin` 在你的 `PATH` 上。
-
-### 作為 Claude Code plugin(導引式設定)
-
-cc-loadout 也以 Claude Code plugin 形式發佈,內附一個導引式的 profile 建立 skill。先把它加成 marketplace,再安裝:
-
-```
-/plugin marketplace add https://github.com/xbluesky/cc-loadout
-/plugin install cc-loadout@cc-loadout
-```
-
-然後執行 `/cc-loadout:init` —— 或直接叫 Claude「set up my cc-loadout profiles」。這個
-skill 會驅動 `cc-loadout` CLI,所以也要把執行檔裝起來(見上);如果找不到執行檔,
-plugin 的 SessionStart hook 會提醒你。互動式的 `cc-loadout profile init` TUI 是不靠
-agent 的替代做法。
+在 clone 裡執行時,`install.sh` 改用 `cargo` 建置,並把一個貨真價實的檔案裝到
+`~/.local/bin/cc-loadout`——刻意不放進 plugin 管理的資料目錄:擺在那裡的一份開發用 build,
+會跟同版號的正式 release 長得一模一樣,每個 session 都會在你不知情的狀況下,悄悄跑你
+還沒 commit 的程式碼。想讓 plugin 改用這份 build,而不是自己下載釘住的 release,就
+`export CC_LOADOUT_BIN=~/.local/bin/cc-loadout`。(找不到 toolchain,或建置失敗?會自動
+退回上面那套下載佈局。)確認 `~/.local/bin` 在你的 `PATH` 上。
 
 ## 用法(Usage)
 

@@ -18,8 +18,10 @@ or the on-demand state file yourself — the CLI does both.
 
 ## Prerequisite
 
-The `cc-loadout` CLI must be installed (`cc-loadout --version`). If it is
-missing, tell the user to install it and stop.
+The `cc-loadout` CLI must be installed (`cc-loadout --version`). If it's
+missing, that's normally the SessionStart hook not having run yet or having
+failed — have the user start a fresh session first; `install.sh` is the fix
+only for someone using the CLI without the plugin.
 
 ## Steps
 
@@ -41,8 +43,8 @@ missing, tell the user to install it and stop.
    cc-loadout profile on-demand acquire <key>
    ```
    If this fails with a `CC_LOADOUT_SESSION_ID not set` error, tell the user
-   the cc-loadout SessionStart hook hasn't run in this session (likely not
-   installed — point them at `install.sh`) and stop.
+   the cc-loadout SessionStart hook hasn't run in this session yet —
+   starting a fresh session is the first thing to try — and stop.
 
 3. **Tell the user to reload.** The plugin is now enabled in
    `.claude/settings.local.json`, but Claude Code doesn't pick up newly

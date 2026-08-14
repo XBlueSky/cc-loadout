@@ -6,9 +6,9 @@ cd "$ROOT"
 
 total_pass=0
 total_fail=0
-# The bash suite now covers only the installer and the plugin manifest; hook and
-# registry behaviour moved into `cargo test` when lib/ was retired.
-for f in tests/test_install.sh tests/test_plugin_manifest.sh; do
+# The bash suite covers the installer, the plugin manifest and the plugin's
+# binary launcher; hook and registry behaviour live in `cargo test`.
+for f in tests/test_install.sh tests/test_plugin_manifest.sh tests/test_launcher.sh; do
   [[ -f "$f" ]] || continue
   echo "=== $f ==="
   TEST_PASS=0; TEST_FAIL=0

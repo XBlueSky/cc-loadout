@@ -54,6 +54,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      # Cheap and first: if the version files disagree, the launcher's pin is
+      # wrong and every other shell test is reasoning about a broken tree.
+      - run: scripts/sync-versions.sh --check
       - run: ./tests/run.sh
 
   # Advisory-only, matching the previous CI: a new upstream advisory should be
