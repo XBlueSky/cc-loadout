@@ -21,7 +21,10 @@ pub struct RunSpec<'a> {
     /// Exports `CORTEX_SKIP_RECORD=1` to the child, telling cortex's SessionEnd
     /// hook not to record the session into the vault's Raw/ — used for probe
     /// pings whose transcripts carry no distill-worthy content. Real tasks pass
-    /// `false` so their sessions stay recorded.
+    /// `false`, which instead exports `CORTEX_FORCE_RECORD=1`: cortex now drops
+    /// headless (`entrypoint: sdk-cli`) sessions by default to keep stray eval
+    /// harnesses out of the vault, and a scheduled task is the one headless
+    /// caller whose work IS worth recording.
     pub skip_record: bool,
 }
 
@@ -44,6 +47,8 @@ pub fn run_claude(claude_bin: &Path, spec: &RunSpec<'_>) -> Result<()> {
         }
         if spec.skip_record {
             cmd.env("CORTEX_SKIP_RECORD", "1");
+        } else {
+            cmd.env("CORTEX_FORCE_RECORD", "1");
         }
         cmd.spawn()
     })
@@ -134,12 +139,14 @@ mod tests {
         p
     }
 
-    /// Fake claude that dumps `${CORTEX_SKIP_RECORD:-}` into `env-dump` in cwd.
+    /// Fake claude that dumps `${CORTEX_SKIP_RECORD:-}` into `env-dump` and
+    /// `${CORTEX_FORCE_RECORD:-}` into `force-dump`, both in cwd.
     fn fake_env_dump_claude(dir: &Path) -> std::path::PathBuf {
         let p = dir.join("claude");
         std::fs::write(
             &p,
-            "#!/bin/sh\nprintf '%s' \"${CORTEX_SKIP_RECORD:-}\" > env-dump\nexit 0\n",
+            "#!/bin/sh\nprintf '%s' \"${CORTEX_SKIP_RECORD:-}\" > env-dump\n\
+             printf '%s' \"${CORTEX_FORCE_RECORD:-}\" > force-dump\nexit 0\n",
         )
         .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -166,6 +173,11 @@ mod tests {
             "1",
             "skip_record=true must export CORTEX_SKIP_RECORD=1 to the child"
         );
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("force-dump")).unwrap(),
+            "",
+            "skip_record=true must not also force recording"
+        );
     }
 
     #[test]
@@ -187,6 +199,12 @@ mod tests {
             std::fs::read_to_string(cwd.path().join("env-dump")).unwrap(),
             "",
             "skip_record=false must not export CORTEX_SKIP_RECORD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.path().join("force-dump")).unwrap(),
+            "1",
+            "skip_record=false must export CORTEX_FORCE_RECORD=1 so cortex's \
+             headless guard does not drop a real scheduled task"
         );
     }
 
