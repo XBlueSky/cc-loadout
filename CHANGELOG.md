@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-08-28
+
+### Bug Fixes
+
+- drop enabledPlugins keys that leave the managed set
+
 ## [0.1.24] - 2026-08-14
 
 ### Bug Fixes
