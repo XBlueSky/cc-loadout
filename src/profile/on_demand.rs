@@ -49,6 +49,17 @@ pub fn load_state(root: &Path) -> Result<OnDemandState> {
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", p.display()))
 }
 
+/// Keys with at least one live session holder in `root`. `apply` consults this
+/// so cleaning up a plugin that moved out of the managed set never yanks one an
+/// `acquire` is currently holding open.
+pub fn held_keys(root: &Path) -> Result<std::collections::BTreeSet<String>> {
+    Ok(load_state(root)?
+        .into_iter()
+        .filter(|(_, e)| !e.holders.is_empty())
+        .map(|(k, _)| k)
+        .collect())
+}
+
 fn save_state(root: &Path, state: &OnDemandState) -> Result<()> {
     let body = serde_json::to_vec_pretty(state)?;
     crate::util::atomicfile::write_atomic(&state_path(root), &body, 0o644)
@@ -457,5 +468,19 @@ mod tests {
             err.to_string().contains("CC_LOADOUT_SESSION_ID"),
             "error must name CC_LOADOUT_SESSION_ID so the user knows what to fix: {err}"
         );
+    }
+
+    #[test]
+    fn held_keys_lists_only_keys_with_live_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(held_keys(dir.path()).unwrap().is_empty());
+
+        acquire(dir.path(), "sess-1", "pixijs@x").unwrap();
+        acquire(dir.path(), "sess-1", "gsap@x").unwrap();
+        release(dir.path(), "sess-1", "gsap@x", false).unwrap();
+
+        let held = held_keys(dir.path()).unwrap();
+        assert!(held.contains("pixijs@x"), "still acquired");
+        assert!(!held.contains("gsap@x"), "released -> no live holder");
     }
 }

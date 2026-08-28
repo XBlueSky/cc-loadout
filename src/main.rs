@@ -141,6 +141,19 @@ enum ProfileAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove named enabledPlugins keys from settings.local.json (cleanup for
+    /// keys left behind before cc-loadout tracked what it manages)
+    Prune {
+        /// Plugin keys to remove, e.g. serena@claude-plugins-official
+        keys: Vec<String>,
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long)]
+        all: bool,
+        /// Report what would be removed without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Print currently-applied profiles
     Status {
         path: Option<PathBuf>,
@@ -521,6 +534,12 @@ fn run() -> Result<()> {
                         json,
                         false,
                     )?,
+                    ProfileAction::Prune {
+                        keys,
+                        path,
+                        all,
+                        dry_run,
+                    } => profile::prune(&load_cfg()?, &keys, path, all, dry_run)?,
                     ProfileAction::Force { names } => {
                         let cwd = std::env::current_dir()?;
                         profile::force(&cwd, &names, &load_cfg()?)?;

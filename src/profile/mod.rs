@@ -11,6 +11,7 @@ pub mod draft;
 pub mod drift;
 pub mod init;
 pub mod json;
+pub mod managed;
 pub mod on_demand;
 pub mod plugins;
 pub mod registry;
@@ -125,6 +126,43 @@ fn run_apply_all(cfg: &Profiles, repos: &[PathBuf], dry_run: bool) -> Result<()>
 
     println!(
         "\nSummary: {changed} of {} repos {verb}; {uncovered} match no profile.",
+        repos.len()
+    );
+    Ok(())
+}
+
+/// Remove named `enabledPlugins` keys from one repo or every repo under
+/// `scan_roots` — the one-shot cleanup for keys fossilised before the
+/// managed-key tombstone existed. See [`apply::prune`] for why this only ever
+/// removes keys named explicitly on the command line.
+pub fn prune(
+    cfg: &Profiles,
+    keys: &[String],
+    path: Option<PathBuf>,
+    all: bool,
+    dry_run: bool,
+) -> Result<()> {
+    if keys.is_empty() {
+        bail!("prune requires at least one plugin key");
+    }
+    let repos = repos_to_process(cfg, path, all)?;
+    let verb = if dry_run { "would drop" } else { "dropped" };
+    let mut touched = 0usize;
+
+    for repo in &repos {
+        let removed = apply::prune(repo, keys, dry_run)?;
+        if removed.is_empty() {
+            continue;
+        }
+        touched += 1;
+        println!("--- {} ---", repo.display());
+        for k in &removed {
+            println!("  {verb}: {k}");
+        }
+    }
+
+    println!(
+        "\nSummary: {touched} of {} repos {verb} at least one key.",
         repos.len()
     );
     Ok(())
