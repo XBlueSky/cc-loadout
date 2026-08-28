@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::account::paths::ClaudePaths;
 use crate::profile::config::Profiles;
+use crate::profile::managed;
 use crate::profile::plugins::{desired_plugins, managed_keys};
 
 fn target_path(root: &Path) -> std::path::PathBuf {
@@ -26,6 +27,7 @@ pub fn apply(root: &Path, cfg: &Profiles, matched: &[String]) -> Result<(Value, 
     let target = target_path(root);
     let desired: BTreeSet<String> = desired_plugins(cfg, matched).into_iter().collect();
     let keys = managed_keys(cfg);
+    let drop = orphans_to_drop(root, &keys)?;
 
     let mut before = Value::Object(Map::new());
     let mut after = Value::Object(Map::new());
@@ -43,8 +45,13 @@ pub fn apply(root: &Path, cfg: &Profiles, matched: &[String]) -> Result<(Value, 
             *enabled = Value::Object(Map::new());
         }
         let enabled_obj = enabled.as_object_mut().unwrap();
-        for key in keys {
-            enabled_obj.insert(key.clone(), Value::Bool(desired.contains(&key)));
+        // Clean up first: a key cc-loadout has stopped managing is dropped
+        // outright, so nothing is left behind for a future config to inherit.
+        for key in &drop {
+            enabled_obj.remove(key);
+        }
+        for key in &keys {
+            enabled_obj.insert(key.clone(), Value::Bool(desired.contains(key)));
         }
 
         after = settings
@@ -54,7 +61,25 @@ pub fn apply(root: &Path, cfg: &Profiles, matched: &[String]) -> Result<(Value, 
         Ok(())
     })?;
 
+    // Only after the settings write succeeded, so a failed apply never records
+    // ownership of keys it did not actually write. Still under `_lock`.
+    managed::save(root, &keys)?;
+
     Ok((before, after))
+}
+
+/// The managed-key tombstone lookup shared by [`apply`] and [`preview`] so the
+/// two can never disagree about what a run would clean up.
+///
+/// A repo with no record predates the tombstone: its history is unknown, so
+/// nothing may be removed and the run only seeds the record for next time.
+fn orphans_to_drop(root: &Path, now_managed: &[String]) -> Result<Vec<String>> {
+    let Some(previous) = managed::load(root)? else {
+        return Ok(Vec::new());
+    };
+    let now: BTreeSet<String> = now_managed.iter().cloned().collect();
+    let held = crate::profile::on_demand::held_keys(root)?;
+    Ok(managed::orphans(&previous, &now, &held))
 }
 
 /// Compute what [`apply`] WOULD write for `root`, without touching disk.
@@ -65,6 +90,7 @@ pub fn apply(root: &Path, cfg: &Profiles, matched: &[String]) -> Result<(Value, 
 pub fn preview(root: &Path, cfg: &Profiles, matched: &[String]) -> Result<(Value, Value)> {
     let desired: BTreeSet<String> = desired_plugins(cfg, matched).into_iter().collect();
     let keys = managed_keys(cfg);
+    let drop = orphans_to_drop(root, &keys)?;
     let target = target_path(root);
 
     // Mirror `jsonmerge::merge_object`'s load step rather than going through
@@ -90,11 +116,74 @@ pub fn preview(root: &Path, cfg: &Profiles, matched: &[String]) -> Result<(Value
     // `apply` resets a non-object `enabledPlugins` to `{}` before inserting; a
     // preview must do the same so a corrupt value doesn't skew the diff.
     let mut after_obj = before.as_object().cloned().unwrap_or_default();
-    for key in keys {
-        after_obj.insert(key.clone(), Value::Bool(desired.contains(&key)));
+    for key in &drop {
+        after_obj.remove(key);
+    }
+    for key in &keys {
+        after_obj.insert(key.clone(), Value::Bool(desired.contains(key)));
     }
 
     Ok((before, Value::Object(after_obj)))
+}
+
+/// Remove the named `enabledPlugins` keys from `<root>/.claude/settings.local.json`,
+/// returning the ones actually removed (sorted, deduped).
+///
+/// This is the one-shot cleanup for keys fossilised BEFORE the managed-key
+/// tombstone existed (see `managed.rs`). Deliberately dumb: it removes exactly
+/// the keys it is told to and never infers which keys "look" orphaned — the
+/// unmanaged half of `enabledPlugins` is also where a user's own hand-toggles
+/// live, and guessing there would break the very invariant `apply` protects.
+///
+/// `dry_run` reports the same list without touching the file. A repo with no
+/// settings file is skipped rather than created: `prune --all` walks every repo
+/// under `scan_roots` and must not leave a file behind in the ones that had none.
+pub fn prune(root: &Path, keys: &[String], dry_run: bool) -> Result<Vec<String>> {
+    let target = target_path(root);
+    if !target.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Cheap read first so the overwhelming majority of repos — the ones holding
+    // none of these keys — are neither locked nor rewritten.
+    let present: Vec<String> = {
+        let bytes =
+            std::fs::read(&target).with_context(|| format!("reading {}", target.display()))?;
+        let v: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", target.display()))?;
+        match v.get("enabledPlugins").and_then(|e| e.as_object()) {
+            Some(obj) => keys
+                .iter()
+                .filter(|k| obj.contains_key(k.as_str()))
+                .cloned()
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    if dry_run || present.is_empty() {
+        return Ok(present);
+    }
+
+    // Same lock `apply` and the on-demand acquire/release take: this is another
+    // full read-modify-write of the same file.
+    let _lock = crate::util::lock::acquire(&crate::profile::on_demand::lock_path(root))?;
+    let mut removed = BTreeSet::new();
+    crate::util::jsonmerge::merge_object(&target, 0o644, |settings| {
+        if let Some(enabled) = settings
+            .get_mut("enabledPlugins")
+            .and_then(|e| e.as_object_mut())
+        {
+            for k in keys {
+                if enabled.remove(k).is_some() {
+                    removed.insert(k.clone());
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(removed.into_iter().collect())
 }
 
 /// The global plugin settings file: `<config_dir>/settings.json`, where the
@@ -221,6 +310,30 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_toggled_key_survives_apply_even_once_a_tombstone_exists() {
+        // Guard for invariant #2 now that `apply` can delete: the tombstone is
+        // the ONLY licence to remove. A key cc-loadout never wrote — a user's
+        // own toggle sitting in the unmanaged half of enabledPlugins — must
+        // still be untouchable. Fails if `orphans` ever grows to consider the
+        // whole file rather than what the previous apply recorded.
+        let dir = tempfile::tempdir().unwrap();
+        apply(dir.path(), &cfg(), &["a".to_string()]).unwrap(); // seeds the record
+
+        crate::util::jsonmerge::merge_object(&target_path(dir.path()), 0o644, |s| {
+            s["enabledPlugins"]["myown@m"] = json!(true);
+            Ok(())
+        })
+        .unwrap();
+
+        let (_before, after) = apply(dir.path(), &cfg(), &["a".to_string()]).unwrap();
+        assert_eq!(
+            after["myown@m"],
+            json!(true),
+            "a key cc-loadout never managed must survive; got {after:?}"
+        );
+    }
+
+    #[test]
     fn apply_sets_managed_true_false_and_preserves_others() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join(".claude").join("settings.local.json");
@@ -240,6 +353,31 @@ mod tests {
         let on_disk: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
         assert_eq!(on_disk["theme"], json!("dark"));
+    }
+
+    #[test]
+    fn apply_removes_a_key_that_left_the_managed_set() {
+        // Regression: a plugin dropped from profiles.json (e.g. uninstalled)
+        // fell out of `managed_keys()`, so `apply`'s `for key in keys` loop
+        // stopped touching it and its last-written `true` was fossilised in
+        // every repo forever. `apply` must remember what it managed last time.
+        let dir = tempfile::tempdir().unwrap();
+
+        let old: Profiles =
+            serde_json::from_str(r#"{"universal": ["u@m", "gone@m"], "profiles": {}}"#).unwrap();
+        apply(dir.path(), &old, &[]).unwrap();
+        assert_eq!(
+            current_enabled(dir.path()).unwrap().unwrap()["gone@m"],
+            json!(true),
+            "sanity: the first apply enables gone@m"
+        );
+
+        // `gone@m` is no longer named anywhere in the config.
+        let (_before, after) = apply(dir.path(), &cfg(), &[]).unwrap();
+        assert!(
+            after.get("gone@m").is_none(),
+            "a key that left the managed set must be dropped, not fossilised; got {after:?}"
+        );
     }
 
     #[test]
@@ -325,6 +463,68 @@ mod tests {
                 String::from_utf8_lossy(body)
             );
         }
+    }
+
+    #[test]
+    fn prune_removes_only_the_named_keys_and_reports_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(
+            &target,
+            r#"{"theme":"dark","enabledPlugins":{"serena@m":true,"keep@m":true}}"#,
+        )
+        .unwrap();
+
+        let removed = prune(dir.path(), &["serena@m".to_string()], false).unwrap();
+        assert_eq!(removed, vec!["serena@m".to_string()]);
+
+        let on_disk: Value = serde_json::from_slice(&std::fs::read(&target).unwrap()).unwrap();
+        assert!(on_disk["enabledPlugins"].get("serena@m").is_none());
+        assert_eq!(on_disk["enabledPlugins"]["keep@m"], json!(true));
+        assert_eq!(on_disk["theme"], json!("dark"), "other settings preserved");
+    }
+
+    #[test]
+    fn prune_dry_run_reports_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let body = r#"{"enabledPlugins":{"serena@m":true}}"#;
+        std::fs::write(&target, body).unwrap();
+
+        let removed = prune(dir.path(), &["serena@m".to_string()], true).unwrap();
+        assert_eq!(removed, vec!["serena@m".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            body,
+            "a dry run must leave the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn prune_reports_nothing_for_a_key_that_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".claude").join("settings.local.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, r#"{"enabledPlugins":{"keep@m":true}}"#).unwrap();
+
+        let removed = prune(dir.path(), &["serena@m".to_string()], false).unwrap();
+        assert!(removed.is_empty(), "got {removed:?}");
+    }
+
+    #[test]
+    fn prune_never_creates_a_settings_file_in_a_repo_that_has_none() {
+        // `prune --all` walks a thousand repos; it must not leave a settings
+        // file behind in the ones that never had one.
+        let dir = tempfile::tempdir().unwrap();
+        let removed = prune(dir.path(), &["serena@m".to_string()], false).unwrap();
+        assert!(removed.is_empty());
+        assert!(!dir
+            .path()
+            .join(".claude")
+            .join("settings.local.json")
+            .exists());
     }
 
     #[test]
