@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-08-31
+
+### Features
+
+- prune redundant scope:local plugin records
+
 ## [0.1.25] - 2026-08-28
 
 ### Bug Fixes
