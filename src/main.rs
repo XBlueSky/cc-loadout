@@ -72,6 +72,9 @@ enum Command {
         /// Also delete stale timestamped registry backups (requires --fix)
         #[arg(long = "prune-backups")]
         prune_backups: bool,
+        /// Also delete redundant scope:local plugin records (requires --fix)
+        #[arg(long = "prune-records")]
+        prune_records: bool,
     },
 }
 
@@ -1002,7 +1005,11 @@ fn run() -> Result<()> {
                     HookAction::SessionEnd => hooks::session_end(&raw)?,
                 }
             }
-            Command::Doctor { fix, prune_backups } => {
+            Command::Doctor {
+                fix,
+                prune_backups,
+                prune_records,
+            } => {
                 // Resolved here, not inside doctor, so the convergence step
                 // stays a pure function of its inputs. `current_exe()` follows
                 // symlinks, so invoking the launcher's ~/.local/bin symlink
@@ -1015,6 +1022,7 @@ fn run() -> Result<()> {
                     exe.as_deref(),
                     fix,
                     prune_backups,
+                    prune_records,
                 )?;
                 doctor::print(&report, fix);
             }

@@ -221,6 +221,33 @@ pub fn write_prime_schedule(
     config::save(&path, &tasks)
 }
 
+/// The maintenance sweep as the TUI's schedule view edits it.
+pub fn load_maintenance(data_root: &Path) -> Result<crate::task::config::Maintenance> {
+    Ok(config::load(&config::tasks_path(data_root))?.maintenance)
+}
+
+/// Enable/disable the housekeeping sweep and set its fire times, then regenerate
+/// cron. `times` is free-form ("04:00" or "04:00, 16:00") and is validated before
+/// anything is written, so a typo never reaches the crontab. Disabling keeps the
+/// times so re-enabling restores the same schedule. Cron is installed before
+/// tasks.json is saved, for the same reason `write_prime_schedule` does it: a
+/// schedule must never be recorded as active when cron never received it.
+pub fn write_maintenance(
+    crontab_bin: &Path,
+    data_root: &Path,
+    home: &Path,
+    enabled: bool,
+    times: &str,
+) -> Result<()> {
+    let times = config::parse_times(times)?;
+    let path = config::tasks_path(data_root);
+    let mut tasks = config::load(&path)?;
+    tasks.maintenance.enabled = enabled;
+    tasks.maintenance.times = times;
+    apply_cron(crontab_bin, &tasks, data_root, home)?;
+    config::save(&path, &tasks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,5 +703,70 @@ mod tests {
             msg.contains("task, not a prime"),
             "error should say 'task, not a prime'; got: {msg}"
         );
+    }
+
+    #[test]
+    fn write_maintenance_installs_the_sweep_and_preserves_prime_tasks() {
+        let bin = tempfile::tempdir().unwrap();
+        let storef = bin.path().join("tab");
+        let crontab = fake_crontab(bin.path(), &storef);
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut map = BTreeMap::new();
+        map.insert("work".to_string(), vec!["08:00".to_string()]);
+        write_prime_schedule(&crontab, data.path(), home.path(), &map).unwrap();
+
+        write_maintenance(&crontab, data.path(), home.path(), true, "04:00").unwrap();
+
+        let tab = std::fs::read_to_string(&storef).unwrap();
+        assert!(
+            tab.contains("doctor --fix --prune-records"),
+            "sweep missing from cron:\n{tab}"
+        );
+        assert!(
+            tab.contains("task run work --quiet"),
+            "an existing prime schedule must survive:\n{tab}"
+        );
+        let persisted = config::load(&config::tasks_path(data.path())).unwrap();
+        assert!(persisted.maintenance.enabled);
+        assert_eq!(persisted.maintenance.times, vec!["04:00".to_string()]);
+    }
+
+    #[test]
+    fn disabling_maintenance_takes_the_sweep_out_of_cron() {
+        let bin = tempfile::tempdir().unwrap();
+        let storef = bin.path().join("tab");
+        let crontab = fake_crontab(bin.path(), &storef);
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        write_maintenance(&crontab, data.path(), home.path(), true, "04:00").unwrap();
+
+        write_maintenance(&crontab, data.path(), home.path(), false, "04:00").unwrap();
+
+        let tab = std::fs::read_to_string(&storef).unwrap();
+        assert!(
+            !tab.contains("doctor"),
+            "disabled sweep still in cron:\n{tab}"
+        );
+        let persisted = config::load(&config::tasks_path(data.path())).unwrap();
+        assert!(!persisted.maintenance.enabled);
+        assert_eq!(
+            persisted.maintenance.times,
+            vec!["04:00".to_string()],
+            "the time is remembered so re-enabling restores it"
+        );
+    }
+
+    #[test]
+    fn write_maintenance_rejects_a_malformed_time_without_touching_cron() {
+        let bin = tempfile::tempdir().unwrap();
+        let storef = bin.path().join("tab");
+        let crontab = fake_crontab(bin.path(), &storef);
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+
+        let err = write_maintenance(&crontab, data.path(), home.path(), true, "25:00").unwrap_err();
+        assert!(err.to_string().contains("invalid time"), "got: {err}");
+        assert!(!storef.exists(), "a rejected time must not reach cron");
     }
 }

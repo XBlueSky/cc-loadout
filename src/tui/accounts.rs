@@ -377,6 +377,7 @@ mod tests {
             tasks: Vec::new(),
             schedule_drift: false,
             scope_drift: Vec::new(),
+            maintenance: Default::default(),
         }
     }
 

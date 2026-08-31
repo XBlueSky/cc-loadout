@@ -275,6 +275,7 @@ mod tests {
                 .collect(),
             schedule_drift: false,
             scope_drift: Vec::new(),
+            maintenance: Default::default(),
         }
     }
 

@@ -137,6 +137,26 @@ pub struct Tasks {
     pub version: u32,
     #[serde(default)]
     pub tasks: BTreeMap<String, TaskDef>,
+    #[serde(default)]
+    pub maintenance: Maintenance,
+}
+
+/// The recurring housekeeping sweep. Unlike a [`TaskDef`] it runs no prompt and
+/// consumes no account: it re-invokes this binary's own `doctor --fix
+/// --prune-records`, so it needs neither a model, a session, nor a cwd. That is
+/// why it is a field of its own rather than a third [`Kind`] — a `TaskDef`
+/// requires an account, and a maintenance sweep has none to spend.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Maintenance {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Daily fire times, "HH:MM".
+    #[serde(default)]
+    pub times: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<String>,
 }
 
 impl Default for Tasks {
@@ -144,6 +164,7 @@ impl Default for Tasks {
         Tasks {
             version: TASKS_VERSION,
             tasks: BTreeMap::new(),
+            maintenance: Maintenance::default(),
         }
     }
 }

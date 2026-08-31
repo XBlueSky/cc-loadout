@@ -1556,3 +1556,75 @@ fn doctor_fix_does_not_touch_a_standalone_install_from_a_dev_build() {
         "a dev build must never relink the user's PATH entry"
     );
 }
+
+/// Seed a HOME with a profiles.json managing `u@m` and a registry where `u@m`
+/// has a user-scope record plus two redundant local ones (and an unmanaged
+/// `x@m` that must survive untouched).
+fn seed_redundant_records(home: &Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(home.join(".claude/profiles")).unwrap();
+    std::fs::write(
+        home.join(".claude/profiles/profiles.json"),
+        r#"{"universal":["u@m"],"on_demand":[],"profiles":{}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join(".claude/plugins")).unwrap();
+    let reg = home.join(".claude/plugins/installed_plugins.json");
+    std::fs::write(
+        &reg,
+        r#"{"version":2,"plugins":{
+            "u@m":[{"scope":"user"},
+                   {"scope":"local","projectPath":"/repo/one"},
+                   {"scope":"local","projectPath":"/repo/two"}],
+            "x@m":[{"scope":"user"},{"scope":"local","projectPath":"/repo/one"}]
+        }}"#,
+    )
+    .unwrap();
+    reg
+}
+
+#[test]
+fn doctor_reports_redundant_local_plugin_records_without_touching_them() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    let reg = seed_redundant_records(home);
+    let before = std::fs::read_to_string(&reg).unwrap();
+
+    cmd(home, data)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "2 redundant local plugin record(s) across 2 repo(s)",
+        ));
+
+    assert_eq!(
+        std::fs::read_to_string(&reg).unwrap(),
+        before,
+        "a read-only doctor must not rewrite the registry"
+    );
+}
+
+#[test]
+fn doctor_fix_prune_records_deletes_only_the_managed_redundant_records() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    let reg = seed_redundant_records(home);
+
+    cmd(home, data)
+        .args(["doctor", "--fix", "--prune-records"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "pruned 2 redundant local plugin record(s)",
+        ));
+
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&reg).unwrap()).unwrap();
+    assert_eq!(v["plugins"]["u@m"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["plugins"]["x@m"].as_array().unwrap().len(),
+        2,
+        "an unmanaged key is never pruned"
+    );
+}

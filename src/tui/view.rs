@@ -20,6 +20,11 @@ pub enum Action {
     RelaunchClaude,
     /// Write the working schedule to disk and update crontab.
     WriteSchedule(std::collections::BTreeMap<String, Vec<String>>),
+    /// Enable/disable the housekeeping sweep at `times`, and update crontab.
+    WriteMaintenance {
+        enabled: bool,
+        times: String,
+    },
     /// Run a task now (id), on the job thread.
     RunTask(String),
     /// Remove a task (id), on the job thread.
