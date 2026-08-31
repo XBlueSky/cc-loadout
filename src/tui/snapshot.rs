@@ -76,6 +76,19 @@ pub struct Snapshot {
     /// a malformed profiles.json or missing registry yields an empty vec so the
     /// hub still opens, matching how `schedule_drift` degrades.
     pub scope_drift: Vec<String>,
+    /// The housekeeping sweep and what it would currently reclaim.
+    pub maintenance: MaintenanceStatus,
+}
+
+/// The `doctor --fix --prune-records` sweep as the Schedule tab shows it: its own
+/// schedule, plus the redundant plugin records a run would delete right now. The
+/// count is what makes the toggle informative rather than blind.
+#[derive(Debug, Clone, Default)]
+pub struct MaintenanceStatus {
+    pub enabled: bool,
+    pub times: Vec<String>,
+    pub redundant_records: usize,
+    pub redundant_repos: usize,
 }
 
 impl Snapshot {
@@ -160,9 +173,26 @@ impl Snapshot {
             .and_then(|bin| crate::task::ops::schedule_drift(&bin, &ctx.data_root, &ctx.home))
             .unwrap_or(false);
 
-        let scope_drift = config::load(&ctx.cfg_path)
-            .map(|cfg| crate::profile::registry::keys_needing_promotion(&cfg, &ctx.registry_path))
+        // One load feeds both registry-derived readouts below.
+        let cfg_for_registry = config::load(&ctx.cfg_path).ok();
+        let scope_drift = cfg_for_registry
+            .as_ref()
+            .map(|cfg| crate::profile::registry::keys_needing_promotion(cfg, &ctx.registry_path))
             .unwrap_or_default();
+
+        // Best-effort like `schedule_drift`: an unreadable tasks.json leaves the
+        // sweep reported as off rather than keeping the hub from opening.
+        let saved = crate::task::ops::load_maintenance(&ctx.data_root).unwrap_or_default();
+        let prunable = cfg_for_registry
+            .as_ref()
+            .map(|cfg| crate::profile::registry::prunable_local_records(cfg, &ctx.registry_path))
+            .unwrap_or_default();
+        let maintenance = MaintenanceStatus {
+            enabled: saved.enabled,
+            times: saved.times,
+            redundant_records: prunable.removed,
+            redundant_repos: prunable.repos,
+        };
 
         Ok(Snapshot {
             accounts,
@@ -176,6 +206,7 @@ impl Snapshot {
             tasks,
             schedule_drift,
             scope_drift,
+            maintenance,
         })
     }
 }

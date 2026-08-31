@@ -109,6 +109,39 @@ impl ScheduleView {
     }
 }
 
+/// When the sweep has never been scheduled, enabling it picks a quiet hour
+/// rather than asking — the time is editable afterwards and remembered on disk.
+const DEFAULT_SWEEP_TIME: &str = "04:00";
+
+/// The sweep row: its state, its schedule, and what a run would reclaim now.
+fn sweep_line(m: &crate::tui::snapshot::MaintenanceStatus) -> Line<'static> {
+    let times = if m.times.is_empty() {
+        DEFAULT_SWEEP_TIME.to_string()
+    } else {
+        m.times.join(" ")
+    };
+    let (state, state_style) = if m.enabled {
+        ("on ", theme::accent())
+    } else {
+        ("off", theme::dim())
+    };
+    let reclaim = if m.redundant_records == 0 {
+        "nothing to reclaim".to_string()
+    } else {
+        format!(
+            "{} redundant plugin records in {} repos",
+            m.redundant_records, m.redundant_repos
+        )
+    };
+    Line::from(vec![
+        Span::styled("  sweep  ", theme::text()),
+        Span::styled(state, state_style),
+        Span::styled(format!("  {times}   "), theme::text()),
+        Span::styled(reclaim, theme::faint()),
+        Span::styled("   (s toggle)", theme::faint()),
+    ])
+}
+
 /// Hours (0-23) that have at least one scheduled time.
 fn hours_of(times: &[String]) -> BTreeSet<u8> {
     times
@@ -176,6 +209,7 @@ impl View for ScheduleView {
                 ("↑↓", "move"),
                 ("⏎", "edit hours"),
                 ("space", "clear"),
+                ("s", "sweep"),
                 ("w", "write"),
             ]
         }
@@ -251,6 +285,19 @@ impl View for ScheduleView {
                 None
             }
             KeyCode::Char('w') => Some(Action::WriteSchedule(self.working_schedule(snap))),
+            // The sweep is machine-wide housekeeping, not a per-account schedule,
+            // so it toggles from anywhere in the list rather than living in it.
+            KeyCode::Char('s') => {
+                let m = &snap.maintenance;
+                Some(Action::WriteMaintenance {
+                    enabled: !m.enabled,
+                    times: if m.times.is_empty() {
+                        DEFAULT_SWEEP_TIME.to_string()
+                    } else {
+                        m.times.join(" ")
+                    },
+                })
+            }
             _ => None,
         }
     }
@@ -360,10 +407,11 @@ impl View for ScheduleView {
             rows[4],
         );
 
-        // ---- grid detail for the focused account ----
+        // ---- grid detail for the focused account, then the machine-wide sweep ----
+        let mut detail: Vec<Line> = Vec::new();
         if let Some(alias) = aliases.get(self.cursor.min(aliases.len().saturating_sub(1))) {
             let times = self.times_for(alias, snap);
-            let mut detail = grid_lines(alias, &times, self.grid);
+            detail = grid_lines(alias, &times, self.grid);
             // Show when the scheduled prime last ran (did it actually fire?).
             if let Some(lp) = snap.last_primed(alias) {
                 let ago = format_duration_short((now_epoch - lp) * 1000)
@@ -374,8 +422,12 @@ impl View for ScheduleView {
                     Span::styled(format!("{ago} ago"), theme::text()),
                 ]));
             }
-            f.render_widget(Paragraph::new(detail), rows[5]);
         }
+        // Rendered unconditionally: the sweep is not an account's schedule, so it
+        // must stay visible (and toggleable) even with no accounts configured.
+        detail.push(Line::from(""));
+        detail.push(sweep_line(&snap.maintenance));
+        f.render_widget(Paragraph::new(detail), rows[5]);
     }
 }
 
@@ -421,6 +473,7 @@ mod tests {
             tasks: Vec::new(),
             schedule_drift: false,
             scope_drift: Vec::new(),
+            maintenance: Default::default(),
         }
     }
 
@@ -555,5 +608,52 @@ mod tests {
             text.contains("auto-prime"),
             "normal help shown when in sync; got: {text}"
         );
+    }
+
+    #[test]
+    fn sweep_row_shows_its_schedule_and_what_it_would_reclaim() {
+        let mut s = snap();
+        s.maintenance = crate::tui::snapshot::MaintenanceStatus {
+            enabled: true,
+            times: vec!["04:00".to_string()],
+            redundant_records: 600,
+            redundant_repos: 36,
+        };
+        let text = rendered(&s);
+        assert!(
+            text.contains("sweep") && text.contains("04:00") && text.contains("600"),
+            "the sweep row must state its schedule and what it would reclaim; got: {text}"
+        );
+    }
+
+    #[test]
+    fn s_toggles_the_sweep_on_with_a_default_time() {
+        let mut v = ScheduleView::new();
+        let (s, c) = (snap(), ctx());
+        match v.on_key(k(KeyCode::Char('s')), &c, &s) {
+            Some(Action::WriteMaintenance { enabled, times }) => {
+                assert!(enabled, "an off sweep toggles on");
+                assert_eq!(times, "04:00", "an unscheduled sweep gets a default time");
+            }
+            other => panic!("expected WriteMaintenance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn s_toggles_an_enabled_sweep_off_keeping_its_time() {
+        let mut v = ScheduleView::new();
+        let (mut s, c) = (snap(), ctx());
+        s.maintenance = crate::tui::snapshot::MaintenanceStatus {
+            enabled: true,
+            times: vec!["16:30".to_string()],
+            ..Default::default()
+        };
+        match v.on_key(k(KeyCode::Char('s')), &c, &s) {
+            Some(Action::WriteMaintenance { enabled, times }) => {
+                assert!(!enabled);
+                assert_eq!(times, "16:30", "disabling must not forget the time");
+            }
+            other => panic!("expected WriteMaintenance, got {other:?}"),
+        }
     }
 }

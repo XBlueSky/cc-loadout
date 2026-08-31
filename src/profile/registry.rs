@@ -153,6 +153,121 @@ pub fn probe_registry(registry_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a registry entry carries exactly this scope.
+fn has_scope(entry: &Value, scope: &str) -> bool {
+    entry.get("scope").and_then(Value::as_str) == Some(scope)
+}
+
+/// Outcome of one prune pass.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Redundant `scope: local` records deleted.
+    pub removed: usize,
+    /// Distinct repos those records were bound to.
+    pub repos: usize,
+}
+
+impl PruneReport {
+    /// True when the pass mutated the registry.
+    pub fn changed(&self) -> bool {
+        self.removed > 0
+    }
+}
+
+/// Delete the redundant `scope: local` records of every key in `keys`.
+pub fn prune_local_records(registry_path: &Path, keys: &[String]) -> Result<PruneReport> {
+    let mut report = PruneReport::default();
+    if keys.is_empty() {
+        return Ok(report);
+    }
+    let bytes = match std::fs::read(registry_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", registry_path.display())),
+    };
+    let mut root: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing {}", registry_path.display()))?;
+
+    {
+        let plugins = match root.get_mut("plugins").and_then(Value::as_object_mut) {
+            Some(p) => p,
+            None => return Ok(report),
+        };
+        let mut repos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for key in keys {
+            let entries = match plugins.get_mut(key).and_then(Value::as_array_mut) {
+                Some(e) if !e.is_empty() => e,
+                _ => continue,
+            };
+            // Without a user-scope twin the local record is the only thing that
+            // resolves this plugin; deleting it would break the repo it names.
+            if !entries.iter().any(|e| has_scope(e, "user")) {
+                continue;
+            }
+            entries.retain(|e| {
+                if !has_scope(e, "local") {
+                    return true;
+                }
+                report.removed += 1;
+                if let Some(p) = e.get("projectPath").and_then(Value::as_str) {
+                    repos.insert(p.to_string());
+                }
+                false
+            });
+        }
+        report.repos = repos.len();
+    }
+
+    if report.changed() {
+        // Backup is best-effort insurance; the write proceeds regardless if it fails.
+        let _ = std::fs::copy(registry_path, atomicfile::sidecar_backup(registry_path));
+        let out = serde_json::to_vec_pretty(&root)?;
+        atomicfile::write_atomic(registry_path, &out, 0o644)?;
+    }
+    Ok(report)
+}
+
+/// Prune the redundant local records of every key cc-loadout manages.
+pub fn prune_all(cfg: &Profiles, registry_path: &Path) -> Result<PruneReport> {
+    prune_local_records(registry_path, &promotable_keys(cfg))
+}
+
+/// Read-only counterpart of `prune_all`: what a prune pass would delete. Used by
+/// `doctor` without `--fix`. Infallible like `keys_needing_promotion` — a corrupt
+/// registry counts as nothing to prune, and `probe_registry` is what reports it.
+pub fn prunable_local_records(cfg: &Profiles, registry_path: &Path) -> PruneReport {
+    let mut report = PruneReport::default();
+    let root: Value = match std::fs::read(registry_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+    {
+        Some(v) => v,
+        None => return report,
+    };
+    let plugins = match root.get("plugins").and_then(Value::as_object) {
+        Some(p) => p,
+        None => return report,
+    };
+    let mut repos: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for key in promotable_keys(cfg) {
+        let entries = match plugins.get(&key).and_then(Value::as_array) {
+            Some(e) if !e.is_empty() => e,
+            _ => continue,
+        };
+        if !entries.iter().any(|e| has_scope(e, "user")) {
+            continue;
+        }
+        for e in entries.iter().filter(|e| has_scope(e, "local")) {
+            report.removed += 1;
+            if let Some(p) = e.get("projectPath").and_then(Value::as_str) {
+                repos.insert(p.to_string());
+            }
+        }
+    }
+    report.repos = repos.len();
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,5 +393,90 @@ mod tests {
         // A directory path will fail with a non-NotFound error when passed to std::fs::read.
         let result = promote_keys_to_user(dir.path(), &["a@m".to_string()]);
         assert!(result.is_err(), "should propagate the read error");
+    }
+
+    #[test]
+    fn prunes_a_local_record_when_a_user_scope_twin_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = write_registry(
+            dir.path(),
+            r#"{"version":2,"plugins":{"a@m":[
+                {"scope":"user","installPath":"/cache/a"},
+                {"scope":"local","projectPath":"/repo/one","installPath":"/cache/a"}
+            ]}}"#,
+        );
+        let report = prune_local_records(&reg, &["a@m".to_string()]).unwrap();
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.repos, 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&reg).unwrap()).unwrap();
+        let entries = v["plugins"]["a@m"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "only the user-scope record survives");
+        assert_eq!(entries[0]["scope"], "user");
+    }
+
+    #[test]
+    fn keeps_a_local_record_when_the_key_has_no_user_scope_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"version":2,"plugins":{"a@m":[
+                {"scope":"local","projectPath":"/repo/one","installPath":"/cache/a"}
+            ]}}"#;
+        let reg = write_registry(dir.path(), body);
+        let before = std::fs::read_to_string(&reg).unwrap();
+
+        let report = prune_local_records(&reg, &["a@m".to_string()]).unwrap();
+        assert_eq!(
+            report.removed, 0,
+            "without a user-scope twin the local record is the only way the plugin resolves"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&reg).unwrap(),
+            before,
+            "a registry with nothing to prune must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn prune_all_leaves_keys_cc_loadout_does_not_manage_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = write_registry(
+            dir.path(),
+            r#"{"version":2,"plugins":{
+                "u@m":[{"scope":"user"},{"scope":"local","projectPath":"/repo/one"}],
+                "x@m":[{"scope":"user"},{"scope":"local","projectPath":"/repo/one"}]
+            }}"#,
+        );
+        let cfg: Profiles =
+            serde_json::from_str(r#"{"universal":["u@m"],"on_demand":[],"profiles":{}}"#).unwrap();
+
+        let report = prune_all(&cfg, &reg).unwrap();
+        assert_eq!(report.removed, 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&reg).unwrap()).unwrap();
+        assert_eq!(v["plugins"]["u@m"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            v["plugins"]["x@m"].as_array().unwrap().len(),
+            2,
+            "an unmanaged key may have been installed locally on purpose"
+        );
+    }
+
+    #[test]
+    fn prunable_local_records_counts_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"version":2,"plugins":{"u@m":[
+                {"scope":"user"},
+                {"scope":"local","projectPath":"/repo/one"},
+                {"scope":"local","projectPath":"/repo/two"}
+            ]}}"#;
+        let reg = write_registry(dir.path(), body);
+        let before = std::fs::read_to_string(&reg).unwrap();
+        let cfg: Profiles =
+            serde_json::from_str(r#"{"universal":["u@m"],"on_demand":[],"profiles":{}}"#).unwrap();
+
+        let report = prunable_local_records(&cfg, &reg);
+        assert_eq!(report.removed, 2);
+        assert_eq!(report.repos, 2);
+        assert_eq!(std::fs::read_to_string(&reg).unwrap(), before);
     }
 }

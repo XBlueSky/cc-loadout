@@ -678,6 +678,50 @@ impl App {
                     },
                 ));
             }
+            Action::WriteMaintenance { enabled, times } => {
+                let data_root = self.ctx.data_root.clone();
+                let home = self.ctx.home.clone();
+                self.job = Some(crate::tui::job::spawn(
+                    if enabled {
+                        "enabling sweep"
+                    } else {
+                        "disabling sweep"
+                    },
+                    crate::now_epoch() * 1000,
+                    move || {
+                        let crontab = match crate::account::crontab::resolve_bin() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                return crate::tui::job::JobResult {
+                                    toast: format!("sweep NOT installed: {e}"),
+                                    needs_refresh: true,
+                                    ..Default::default()
+                                }
+                            }
+                        };
+                        match crate::task::ops::write_maintenance(
+                            &crontab, &data_root, &home, enabled, &times,
+                        ) {
+                            Ok(()) => crate::tui::job::JobResult {
+                                toast: if enabled {
+                                    format!("sweep enabled at {times}; crontab updated")
+                                } else {
+                                    "sweep disabled; crontab updated".to_string()
+                                },
+                                needs_refresh: true,
+                                ..Default::default()
+                            },
+                            // Same apply-cron-before-save contract as the schedule:
+                            // a failed crontab install means nothing was persisted.
+                            Err(e) => crate::tui::job::JobResult {
+                                toast: format!("sweep NOT installed: {e}"),
+                                needs_refresh: true,
+                                ..Default::default()
+                            },
+                        }
+                    },
+                ));
+            }
             Action::WriteSchedule(sched) => {
                 let data_root = self.ctx.data_root.clone();
                 let home = self.ctx.home.clone();

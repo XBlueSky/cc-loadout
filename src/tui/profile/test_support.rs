@@ -44,5 +44,6 @@ pub(crate) fn snap() -> crate::tui::snapshot::Snapshot {
         tasks: Vec::new(),
         schedule_drift: false,
         scope_drift: Vec::new(),
+        maintenance: Default::default(),
     }
 }

@@ -23,6 +23,11 @@ pub struct DoctorReport {
     pub legacy_hooks: usize,
     pub stale_backups: Vec<PathBuf>,
     pub pruned_backups: usize,
+    /// Redundant `scope: local` plugin records: what a prune found, or (with
+    /// `--fix --prune-records`) what it actually deleted.
+    pub redundant_records: crate::profile::registry::PruneReport,
+    /// Whether `redundant_records` describes a completed deletion.
+    pub pruned_records: bool,
     pub standalone_link: Option<StandaloneLink>,
 }
 
@@ -269,6 +274,7 @@ pub fn run(
     exe: Option<&Path>,
     fix: bool,
     prune_backups: bool,
+    prune_records: bool,
 ) -> Result<DoctorReport> {
     let mut report = DoctorReport::default();
 
@@ -309,6 +315,16 @@ pub fn run(
         } else {
             report.needs_promotion =
                 crate::profile::registry::keys_needing_promotion(&cfg, &registry);
+        }
+        // Strictly after promotion: promoting collapses a key's entries to a
+        // single user-scope record, so a key repaired above has nothing left to
+        // prune. Pruning first would find no user-scope twin and skip it.
+        if fix && prune_records {
+            report.redundant_records = crate::profile::registry::prune_all(&cfg, &registry)?;
+            report.pruned_records = true;
+        } else {
+            report.redundant_records =
+                crate::profile::registry::prunable_local_records(&cfg, &registry);
         }
     }
 
@@ -376,6 +392,21 @@ pub fn print(report: &DoctorReport, fix: bool) {
         println!("needs scope: user ({}):", report.needs_promotion.len());
         for k in &report.needs_promotion {
             println!("  {k}");
+        }
+    }
+    let redundant = &report.redundant_records;
+    if redundant.removed > 0 {
+        let counts = format!(
+            "{} redundant local plugin record(s) across {} repo(s)",
+            redundant.removed, redundant.repos
+        );
+        if report.pruned_records {
+            println!("pruned {counts}");
+        } else if fix {
+            // Only --fix was given: --prune-records is the missing ingredient.
+            println!("{counts} (pass --prune-records to delete)");
+        } else {
+            println!("{counts} (run with --fix --prune-records to delete)");
         }
     }
     if report.legacy_hooks > 0 {
