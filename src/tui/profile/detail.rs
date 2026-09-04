@@ -408,7 +408,7 @@ mod tests {
 
     /// Helper to navigate to the "rust" profile row and open Detail.
     fn open_detail_on_rust(inv: Inventory, working: Profiles) -> super::super::ProfileView {
-        let mut view = super::super::ProfileView::new(inv, working, false, false);
+        let mut view = super::super::ProfileView::new(inv, working);
         // Default is ByPlugin; switch to ByProfile so Enter opens Detail.
         view.switch_to_by_profile_for_test();
         // cursor starts at 0 (Universal); move to 1 (rust).

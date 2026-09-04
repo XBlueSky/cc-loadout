@@ -1,6 +1,5 @@
 //! Profile subsystem: per-repo plugin profile detection and settings.local.json apply.
 
-pub mod ai;
 pub mod apply;
 pub mod author;
 pub mod commit;

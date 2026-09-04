@@ -39,11 +39,6 @@ pub enum Action {
         repos: Vec<std::path::PathBuf>,
         expected: Vec<(std::path::PathBuf, Vec<String>)>,
     },
-    /// Ask Claude to draft the plugin→profile assignment for these scanned inputs.
-    DraftWithClaude {
-        inv: crate::profile::discover::Inventory,
-        scan_roots: Vec<String>,
-    },
     /// Walk `roots` for git repos on the job thread (a depth-6 filesystem scan
     /// that must never block the UI); the result is handed back via `accept_scan`.
     /// `working` is carried so the job can also compute the uncovered-repos drift
@@ -88,9 +83,6 @@ pub trait View {
         now_ms: i64,
         now_local: OffsetDateTime,
     );
-    /// Receive an AI-generated draft config produced by a background job.
-    /// Default: ignore (only the Profile view consumes it).
-    fn accept_draft(&mut self, _draft: crate::profile::config::Profiles) {}
     /// Receive a completed background repo scan (from `Action::Rescan`).
     /// Default: ignore (only the Profile view consumes it).
     fn accept_scan(&mut self, _outcome: crate::tui::job::ScanOutcome) {}
