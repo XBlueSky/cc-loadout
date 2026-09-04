@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-09-04
+
+### Bug Fixes
+
+- stop promising "⏎ open" on the empty Unassigned row
+
+### Features
+
+- open Universal and On-demand from the profile board
+
+### Refactoring
+
+- remove the in-TUI AI draft
+
 ## [0.1.27] - 2026-09-04
 
 ### Bug Fixes
