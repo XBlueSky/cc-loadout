@@ -496,13 +496,22 @@ impl View for ProfileView {
                     if self.on_demand_help {
                         return vec![("esc", "close")];
                     }
-                    let mut hints = vec![
-                        ("↑↓", "select"),
-                        ("⏎", "open"),
-                        ("s", "scan"),
-                        ("w", "apply"),
-                    ];
-                    if self.row_labels().get(self.cursor).map(String::as_str) == Some("On-demand") {
+                    let labels = self.row_labels();
+                    let row = labels.get(self.cursor).map(String::as_str);
+                    // Every row opens something EXCEPT Unassigned with an empty
+                    // triage queue — that row already renders "(none)", so there
+                    // is nothing to open and the hint would be a promise the
+                    // Enter handler cannot keep.
+                    let opens = row != Some("Unassigned")
+                        || !crate::profile::draft::unassigned_keys(&self.inv, &self.working)
+                            .is_empty();
+                    let mut hints = vec![("↑↓", "select")];
+                    if opens {
+                        hints.push(("⏎", "open"));
+                    }
+                    hints.push(("s", "scan"));
+                    hints.push(("w", "apply"));
+                    if row == Some("On-demand") {
                         hints.push(("?", "what is on-demand?"));
                     }
                     hints
@@ -1676,6 +1685,43 @@ mod tests {
             !w.profiles["rust"].plugins.contains(&"serena@x".to_string()),
             "serena@x must be dropped from the rust profile"
         );
+    }
+
+    #[test]
+    fn the_open_hint_disappears_when_the_unassigned_row_has_nothing_to_open() {
+        // The Unassigned row already renders "(none)" when the triage queue is
+        // empty, so there is no screen worth opening — but the footer still
+        // said "⏎ open", and Enter did nothing. Withdraw the promise instead
+        // of inventing an empty sub-view.
+        let mut v = view_with_two_unassigned();
+        v.working.universal.push("serena@x".to_string());
+        v.working.universal.push("eslint@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = v
+            .row_labels()
+            .iter()
+            .position(|l| l == "Unassigned")
+            .unwrap();
+        assert!(
+            !v.footer_hints().iter().any(|(k, _)| *k == "⏎"),
+            "no ⏎ hint when the Unassigned row has nothing to triage: {:?}",
+            v.footer_hints()
+        );
+    }
+
+    #[test]
+    fn the_open_hint_stays_on_rows_that_do_open_something() {
+        // Guards the fix from over-reaching: the hint must only vanish on the
+        // one dead row, not on every row.
+        let mut v = view_with_two_unassigned(); // serena@x + eslint@x unassigned
+        v.switch_to_by_profile_for_test();
+        for (idx, label) in v.row_labels().iter().enumerate() {
+            v.cursor = idx;
+            assert!(
+                v.footer_hints().iter().any(|(k, _)| *k == "⏎"),
+                "row {label:?} opens a sub-view, so it must keep the ⏎ hint"
+            );
+        }
     }
 
     #[test]
