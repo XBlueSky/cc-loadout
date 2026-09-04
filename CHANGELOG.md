@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-09-04
+
+### Bug Fixes
+
+- close the on-demand plugin leak at global scope
+
 ## [0.1.26] - 2026-08-31
 
 ### Features
