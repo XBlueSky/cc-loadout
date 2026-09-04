@@ -88,7 +88,6 @@ fn rescan_job(
         crate::tui::job::JobResult {
             toast: rescan_toast(repos.len(), budget_hits),
             needs_refresh: false,
-            draft: None,
             scan: Some(crate::tui::job::ScanOutcome {
                 roots,
                 repos,
@@ -129,7 +128,6 @@ impl App {
         // Stage B: build ONLY the plugin inventory at startup — no repo scan.
         // Scanning is an explicit, user-triggered action (`s`) in the Profile
         // view, so the board never opens having silently walked the filesystem.
-        let claude_available = crate::util::claude_on_path();
         let inv = crate::profile::discover::build_inventory_no_scan(&ctx.registry_path);
         let cfg_existed = ctx.cfg_path.exists();
         // Load an existing config; a missing/unreadable file yields an empty
@@ -212,7 +210,7 @@ impl App {
                 // constructor itself never touches disk — then seed the cached
                 // repos and uncovered drift via builders that do NO filesystem
                 // I/O either.
-                crate::tui::profile::ProfileView::new(inv, working, claude_available, !cfg_existed)
+                crate::tui::profile::ProfileView::new(inv, working)
                     .with_scan_roots(scan_roots)
                     .with_scanned_at(scanned_at)
                     .with_scan_repos(cached_repos)
@@ -323,7 +321,6 @@ impl App {
             Done {
                 toast: String,
                 refresh: bool,
-                draft: Option<Box<crate::profile::config::Profiles>>,
                 scan: Box<Option<crate::tui::job::ScanOutcome>>,
                 uncovered: Option<Vec<String>>,
                 index: Option<crate::tui::job::IndexOutcome>,
@@ -342,7 +339,6 @@ impl App {
                     Ok(result) => ActivePoll::Done {
                         toast: result.toast,
                         refresh: result.needs_refresh,
-                        draft: result.draft.map(Box::new),
                         scan: Box::new(result.scan),
                         uncovered: result.uncovered,
                         index: result.index,
@@ -358,7 +354,6 @@ impl App {
             ActivePoll::Done {
                 toast,
                 refresh,
-                draft,
                 scan,
                 uncovered,
                 index,
@@ -368,9 +363,6 @@ impl App {
                 // them to it explicitly — never to whatever tab happens to be
                 // active — or a result landing while the user is on another tab
                 // (or a detached/startup job) would be silently dropped.
-                if let Some(p) = draft {
-                    self.tabs[crate::tui::TAB_PROFILE].accept_draft(*p);
-                }
                 if let Some(o) = *scan {
                     self.tabs[crate::tui::TAB_PROFILE].accept_scan(o);
                 }
@@ -399,7 +391,6 @@ impl App {
         // self.detached while calling self.set_toast later.
         let mut still_pending: Vec<crate::tui::job::Detached> = Vec::new();
         let mut completed_toasts: Vec<String> = Vec::new();
-        let mut completed_drafts: Vec<crate::profile::config::Profiles> = Vec::new();
         let mut completed_scans: Vec<crate::tui::job::ScanOutcome> = Vec::new();
         let mut completed_uncovered: Vec<Vec<String>> = Vec::new();
         let mut completed_index: Vec<crate::tui::job::IndexOutcome> = Vec::new();
@@ -416,9 +407,6 @@ impl App {
                 Ok(result) => {
                     if result.needs_refresh {
                         refresh_needed = true;
-                    }
-                    if let Some(p) = result.draft {
-                        completed_drafts.push(p);
                     }
                     if let Some(o) = result.scan {
                         completed_scans.push(o);
@@ -442,12 +430,9 @@ impl App {
             }
         }
         self.detached = still_pending;
-        // Route drafts/scans/uncovered/index from detached jobs to the Profile
+        // Route scans/uncovered/index from detached jobs to the Profile
         // view (their only consumer), not the active tab — a detached job
         // commonly completes while the user has tabbed away.
-        for p in completed_drafts {
-            self.tabs[crate::tui::TAB_PROFILE].accept_draft(p);
-        }
         for o in completed_scans {
             self.tabs[crate::tui::TAB_PROFILE].accept_scan(o);
         }
@@ -510,7 +495,6 @@ impl App {
                                 None => format!("switched to '{}'", out.to),
                             },
                             needs_refresh: true,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -518,7 +502,6 @@ impl App {
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("switch failed: {e}"),
                             needs_refresh: false,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -541,7 +524,6 @@ impl App {
                             crate::tui::job::JobResult {
                                 toast: format!("primed '{alias}'"),
                                 needs_refresh: true,
-                                draft: None,
                                 scan: None,
                                 uncovered: None,
                                 index: None,
@@ -551,7 +533,6 @@ impl App {
                             crate::tui::job::JobResult {
                                 toast: format!("'{alias}' is active — prime skipped"),
                                 needs_refresh: false,
-                                draft: None,
                                 scan: None,
                                 uncovered: None,
                                 index: None,
@@ -560,7 +541,6 @@ impl App {
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("prime failed: {e}"),
                             needs_refresh: false,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -577,7 +557,6 @@ impl App {
                         Ok(()) => crate::tui::job::JobResult {
                             toast: format!("removed '{alias}'"),
                             needs_refresh: true,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -585,7 +564,6 @@ impl App {
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("remove failed: {e}"),
                             needs_refresh: false,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -661,7 +639,6 @@ impl App {
                             crate::tui::job::JobResult {
                                 toast,
                                 needs_refresh: true,
-                                draft: None,
                                 scan: None,
                                 uncovered: None,
                                 index,
@@ -670,7 +647,6 @@ impl App {
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("commit failed: {e}"),
                             needs_refresh: false,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -758,9 +734,6 @@ impl App {
                         }
                     },
                 ));
-            }
-            Action::DraftWithClaude { inv, scan_roots } => {
-                self.spawn_draft_job(inv, scan_roots, crate::util::which("claude"));
             }
             Action::Rescan { roots, working } => {
                 let data_root = self.ctx.data_root.clone();
@@ -865,7 +838,6 @@ impl App {
                         Ok(out) => crate::tui::job::JobResult {
                             toast: format!("task '{id}' → {out:?}"),
                             needs_refresh: true,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -873,7 +845,6 @@ impl App {
                         Err(e) => crate::tui::job::JobResult {
                             toast: format!("task '{id}' failed: {e}"),
                             needs_refresh: false,
-                            draft: None,
                             scan: None,
                             uncovered: None,
                             index: None,
@@ -915,71 +886,6 @@ impl App {
             }
         }
         Ok(())
-    }
-
-    /// Shared implementation for `Action::DraftWithClaude`. Accepts an explicit
-    /// `claude_bin` so that unit tests can inject `None` without touching `PATH`.
-    pub(crate) fn spawn_draft_job(
-        &mut self,
-        inv: crate::profile::discover::Inventory,
-        scan_roots: Vec<String>,
-        claude_bin: Option<std::path::PathBuf>,
-    ) {
-        let bin = match claude_bin {
-            Some(b) => b,
-            None => {
-                self.set_toast("claude not found — using scan draft".to_string());
-                return;
-            }
-        };
-        // If we have no repo context yet, the depth-6 scan happens on the job
-        // thread (below) rather than freezing the UI before the spinner shows.
-        let label = if inv.repos.is_empty() && !scan_roots.is_empty() {
-            "scanning + asking Claude…"
-        } else {
-            "asking Claude…"
-        };
-        self.job = Some(crate::tui::job::spawn(
-            label,
-            crate::now_epoch() * 1000,
-            move || {
-                let mut inv = inv;
-                if inv.repos.is_empty() && !scan_roots.is_empty() {
-                    // No loaded profiles config is available on this path (the
-                    // draft flow runs before any profile assignment exists), so
-                    // index against the marker/glob defaults only.
-                    let vocab = crate::profile::signal_detect::vocabulary(
-                        &crate::profile::config::Profiles::default(),
-                    );
-                    inv.repos = crate::profile::discover::scan_repo_signals(&scan_roots, 6, &vocab);
-                    inv.suggested_profiles = crate::profile::discover::suggest_profiles(&inv.repos);
-                }
-                match crate::profile::ai::draft_with_claude(
-                    &inv,
-                    scan_roots,
-                    &bin,
-                    crate::profile::ai::DEFAULT_MODEL,
-                    60,
-                ) {
-                    Ok(cfg) => crate::tui::job::JobResult {
-                        toast: "Claude drafted your profiles — review, then w to apply".to_string(),
-                        needs_refresh: false,
-                        draft: Some(cfg),
-                        scan: None,
-                        uncovered: None,
-                        index: None,
-                    },
-                    Err(e) => crate::tui::job::JobResult {
-                        toast: format!("Claude draft failed: {e}"),
-                        needs_refresh: false,
-                        draft: None,
-                        scan: None,
-                        uncovered: None,
-                        index: None,
-                    },
-                }
-            },
-        ));
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -2420,7 +2326,6 @@ mod tests {
             crate::tui::job::JobResult {
                 toast: "done".into(),
                 needs_refresh: false,
-                draft: None,
                 scan: None,
                 uncovered: None,
                 index: None,
@@ -2465,38 +2370,6 @@ mod tests {
         assert!(
             app.should_quit,
             "'q' on the board must quit (board does not claim 'q')"
-        );
-    }
-
-    #[test]
-    fn draft_action_with_no_claude_toasts_and_does_not_spawn() {
-        // Verify the no-claude guard: when spawn_draft_job is called with
-        // claude_bin = None it must set a toast and leave app.job as None.
-        // (We inject None directly to avoid any PATH manipulation — hermetic
-        //  and safe under #![deny(unsafe_code)].)
-        let (_h, _d, ctx) = empty_ctx();
-        let mut app = App::new(ctx, 0).unwrap();
-
-        // Build a minimal Inventory (no plugins, no repos, no suggestions).
-        let inv = crate::profile::discover::Inventory {
-            plugins: vec![],
-            repos: vec![],
-            suggested_profiles: vec![],
-        };
-        // Call the factored helper with None to simulate "claude not on PATH".
-        app.spawn_draft_job(inv, vec![], None);
-
-        assert!(
-            app.job.is_none(),
-            "no job must be spawned when claude_bin is None"
-        );
-        assert!(
-            app.toast
-                .as_deref()
-                .unwrap_or("")
-                .contains("claude not found"),
-            "toast must mention 'claude not found', got: {:?}",
-            app.toast
         );
     }
 
@@ -2626,7 +2499,6 @@ mod tests {
         app.job = Some(crate::tui::job::spawn("x", started, || JobResult {
             toast: "done".into(),
             needs_refresh: false,
-            draft: None,
             scan: None,
             uncovered: None,
             index: None,
@@ -2765,7 +2637,6 @@ mod tests {
         app.job = Some(crate::tui::job::spawn("bg-work", 0, || JobResult {
             toast: "bg-done".into(),
             needs_refresh: false,
-            draft: None,
             scan: None,
             uncovered: None,
             index: None,

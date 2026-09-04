@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn apply_lists_repos_with_plugins_and_emits_commit() {
         let (inv, working, _repo_dir) = make_inv_and_working();
-        let mut v = ProfileView::new(inv, working, false, false);
+        let mut v = ProfileView::new(inv, working);
         let (_home, _data, c) = test_support::ctx();
         let s = test_support::snap();
 
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn apply_unchecked_repo_excluded_from_commit() {
         let (inv, working, _repo_dir) = make_inv_and_working();
-        let mut v = ProfileView::new(inv, working, false, false);
+        let mut v = ProfileView::new(inv, working);
         let (_home, _data, c) = test_support::ctx();
         let s = test_support::snap();
 
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn apply_esc_returns_to_board_no_action() {
         let (inv, working, _repo_dir) = make_inv_and_working();
-        let mut v = ProfileView::new(inv, working, false, false);
+        let mut v = ProfileView::new(inv, working);
         let (_home, _data, c) = test_support::ctx();
         let s = test_support::snap();
 

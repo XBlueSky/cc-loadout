@@ -34,18 +34,10 @@ pub fn render(view: &ProfileView, snap: &Snapshot, f: &mut Frame, area: Rect) {
     let stale: BTreeSet<&str> = d.stale.iter().map(String::as_str).collect();
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Line index of the selected row. The AI-offer and drift header push a
-    // variable number of leading lines, so the row index (`view.cursor`) is not
-    // the line index the scroller needs.
+    // Line index of the selected row. The drift header pushes a variable
+    // number of leading lines, so the row index (`view.cursor`) is not the
+    // line index the scroller needs.
     let mut cursor_line = 0usize;
-
-    // ── AI consent offer (first-run, claude available) ────────────────────
-    if view.ai_offer {
-        lines.push(Line::from(Span::styled(
-            "Let Claude draft your profiles?  [y] yes  [n] no  (uses your account)",
-            theme::accent_soft(),
-        )));
-    }
 
     // ── Drift header (only when there is something to review) ────────────
     if d.review_count() > 0 {
@@ -260,9 +252,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        // claude_available=false, offer=false → no AI-offer line (which
-        // contains a literal '?') can pollute the buffer.
-        let view = super::ProfileView::new(inv, Profiles::default(), false, false);
+        let view = super::ProfileView::new(inv, Profiles::default());
         let snap = crate::tui::profile::test_support::snap();
 
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -304,7 +294,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let view = super::ProfileView::new(inv, Profiles::default(), false, false)
+        let view = super::ProfileView::new(inv, Profiles::default())
             .with_uncovered(vec!["/workspace/a".into()])
             .with_uncovered_pending(true);
         let snap = crate::tui::profile::test_support::snap();

@@ -39,7 +39,6 @@ pub struct IndexOutcome {
 pub struct JobResult {
     pub toast: String,
     pub needs_refresh: bool,
-    pub draft: Option<crate::profile::config::Profiles>,
     /// Set by a background repo scan; delivered to the active view's `accept_scan`.
     pub scan: Option<ScanOutcome>,
     /// Forward scaffolding: no current job sets this (a `Rescan`'s uncovered
@@ -115,7 +114,6 @@ mod tests {
         let job = spawn("test", 0, || JobResult {
             toast: "done".into(),
             needs_refresh: true,
-            draft: None,
             scan: None,
             uncovered: None,
             index: None,

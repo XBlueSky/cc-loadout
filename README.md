@@ -19,7 +19,7 @@
 `cc-loadout` is a small Rust CLI that manages two parts of your Claude Code setup:
 
 - **Accounts** — snapshot the credentials of each Claude Max / subscription account and switch between them with one command (e.g. when one account hits its session limit).
-- **Profiles** — decide which plugins each repo needs, and keep that in sync. An interactive **board** (`cc-loadout profile init`, or just run `cc-loadout` and tab to Profile) scans your installed plugins and repos so you can sort them into profiles — optionally letting Claude draft the grouping for you — and writes your `profiles.json`. Open any profile to edit its **detection rules** (which repos it applies to) right in the board, with a live count of matching repos and near-miss hints as you type. It then turns the profile-specific plugins **off globally** (keeping the universal ones on), so by default a repo loads only the universal set; `apply` re-enables each repo's matching plugins in its `.claude/settings.local.json`. The result: the right plugins per repo, instead of loading all of them everywhere.
+- **Profiles** — decide which plugins each repo needs, and keep that in sync. An interactive **board** (`cc-loadout profile init`, or just run `cc-loadout` and tab to Profile) scans your installed plugins and repos so you can sort them into profiles, and writes your `profiles.json`. (Prefer to have Claude propose the grouping? Use the bundled `/cc-loadout:init` skill — it validates and backs up before writing.) Open any profile to edit its **detection rules** (which repos it applies to) right in the board, with a live count of matching repos and near-miss hints as you type. It then turns the profile-specific plugins **off globally** (keeping the universal ones on), so by default a repo loads only the universal set; `apply` re-enables each repo's matching plugins in its `.claude/settings.local.json`. The result: the right plugins per repo, instead of loading all of them everywhere.
 
 ## Quickstart
 
@@ -37,9 +37,9 @@ cc-loadout account use personal --launch
 
 # 4. Set up per-repo plugin profiles — open the hub:
 cc-loadout
-#    → Tab to Profile. On first run it offers "✨ Let Claude draft your
-#      profiles?" (or sort the Unassigned plugins yourself), then press w
-#      to apply. Each repo now loads only the plugins that fit it.
+#    → Tab to Profile, sort the Unassigned plugins into profiles, then
+#      press w to apply. Each repo now loads only the plugins that fit it.
+#      (Or run /cc-loadout:init in Claude Code and set it up by chatting.)
 ```
 
 New here? The Profile tab is a **board**: every plugin sits under **Universal**
@@ -56,11 +56,11 @@ Setup = empty the Unassigned bucket, then `w` to apply.
 - Single binary, no runtime dependencies.
 - `account` — snapshot / switch / list real Claude logins; transactional, atomic credential swaps with rollback and post-switch verification.
 - `profile inventory` — list your installed plugins and per-repo signals (also `--json`, to feed the wizard and the agent skill).
-- `profile init` / `edit` — an interactive **board** (also reachable by running `cc-loadout` and tabbing to Profile) that builds `profiles.json` by sorting installed plugins into profiles, with an optional `✨` AI draft (Claude proposes the grouping) and a re-edit view that flags drift (new/uninstalled plugins, uncovered repos, global drift). Atomic write; backs up any existing file; adjusts the global enabled set so non-universal plugins stop loading everywhere. `profile init --root <dir> --assign <file>` runs the same setup non-interactively for agents / CI.
+- `profile init` / `edit` — an interactive **board** (also reachable by running `cc-loadout` and tabbing to Profile) that builds `profiles.json` by sorting installed plugins into profiles, with a re-edit view that flags drift (new/uninstalled plugins, uncovered repos, global drift). Atomic write; backs up any existing file; adjusts the global enabled set so non-universal plugins stop loading everywhere. `profile init --root <dir> --assign <file>` runs the same setup non-interactively for agents / CI.
 - **Edit detection rules in the board** — open a profile's Detail view → Rules tab to author what it matches, no JSON by hand: four rule kinds (`path under` / `has file` / `has any` / `contains`), a live match-count and **near-miss** panel as you type, `?` to explain why any scanned repo matches (or doesn't), `f` to seed rules from an example repo, and ghost path-completion for `path under` values.
 - `profile detect` / `apply` — per-repo plugin detection (path prefix, marker files, marker globs, and file-content matches — a named file containing a word; legacy `package.json`-deps / dependency-keyword rules are still honoured for older configs) with manual override; additive universal + profile plugin sets; a surgical merge that preserves your on-demand and unrelated settings. `--all` sweeps every git repo under your scan roots.
 - `doctor` / `doctor --fix` — inspect and repair cc-loadout's own installation: seeds a missing `profiles.json`, promotes managed plugins (including cc-loadout itself) back to `scope: user` when they've drifted to `scope: local`, clears retired `settings.json` hook entries from older versions, and reports (`--prune-backups` to delete) the timestamped backup files earlier versions left behind. It also reports (`--prune-records` to delete) redundant `scope: local` plugin records: Claude Code writes one installation record per (plugin, repo) whenever a repo's `settings.local.json` enables a plugin, even when a `scope: user` record already resolves it everywhere, so they accumulate one batch per repo you open. Only records for keys cc-loadout manages *and* that already have a `scope: user` twin are removed, so nothing you installed locally on purpose is touched.
-- Ships as a Claude Code plugin too: the bundled `/cc-loadout:init` skill creates your profiles by chatting with Claude (no TTY needed); the board's `✨` AI draft is the in-TUI equivalent.
+- Ships as a Claude Code plugin too: the bundled `/cc-loadout:init` skill creates your profiles by chatting with Claude (no TTY needed). This is the only Claude-assisted path — it routes through `profile init --assign`, which validates the assignment and backs up your existing config before writing.
 
 ## Install
 

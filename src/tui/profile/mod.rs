@@ -19,6 +19,7 @@ mod by_plugin;
 pub mod detail;
 pub(crate) mod explain;
 pub(crate) mod on_demand_help;
+pub(crate) mod pool;
 pub(crate) mod rules;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -44,6 +45,7 @@ enum Sub {
     Board,
     Assign(assign::AssignState),
     Detail(Box<detail::DetailState>),
+    PoolDetail(pool::PoolDetailState),
     Apply(apply::ApplyState),
 }
 
@@ -61,8 +63,6 @@ pub struct ProfileView {
     pub(super) view: ViewMode,
     sub: Sub,
     pub(super) uncovered: Vec<String>,
-    pub(super) claude_available: bool,
-    pub(super) ai_offer: bool,
     /// Active membership picker (ByPlugin Board only).
     pub(super) pick: Option<by_plugin::MembershipPick>,
     /// Suggested/confirmed scan roots (header summary + `s` scan targets, union).
@@ -114,12 +114,7 @@ pub struct ProfileView {
 
 impl ProfileView {
     /// Create a new `ProfileView`.
-    ///
-    /// - `claude_available`: whether `claude` is on PATH (from `util::claude_on_path()`).
-    /// - `offer`: whether this is a first-run setup (i.e. `profiles.json` was absent).
-    ///   The consent offer is shown only when BOTH are true.
-    pub fn new(inv: Inventory, working: Profiles, claude_available: bool, offer: bool) -> Self {
-        let ai_offer = claude_available && offer;
+    pub fn new(inv: Inventory, working: Profiles) -> Self {
         let saved = working.clone();
         ProfileView {
             inv,
@@ -133,8 +128,6 @@ impl ProfileView {
             // synchronously, so `uncovered` simply starts empty and is filled
             // in by a scan outcome or a seeded cache value.
             uncovered: Vec::new(),
-            claude_available,
-            ai_offer,
             pick: None,
             scan_roots: Vec::new(),
             roots_editor: None,
@@ -287,21 +280,6 @@ impl ProfileView {
     /// gathered yet so Claude receives real repo context instead of a
     /// universal-only guess. `scan()` is idempotent and a no-op on an empty
     /// scan root, so this is safe whether or not the user already scanned.
-    fn draft_action(&mut self) -> Option<Action> {
-        // Never scan on the UI thread: the draft job walks the roots in the
-        // background (spinner visible) when it has no repo context yet. Prefer
-        // the already-scanned roots, else the suggested/confirmed roots.
-        let scan_roots = if self.working.scan_roots.is_empty() {
-            self.nonempty_scan_roots().unwrap_or_default()
-        } else {
-            self.working.scan_roots.clone()
-        };
-        Some(Action::DraftWithClaude {
-            inv: self.inv.clone(),
-            scan_roots,
-        })
-    }
-
     /// Test-visible: assemble the current Drift for assertions.
     #[cfg(test)]
     pub fn drift_for_test(&self, snap: &Snapshot) -> crate::profile::drift::Drift {
@@ -457,6 +435,7 @@ impl View for ProfileView {
         match &self.sub {
             Sub::Detail(_) => matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('r')),
             Sub::Assign(_) => matches!(code, KeyCode::Esc),
+            Sub::PoolDetail(_) => matches!(code, KeyCode::Esc),
             Sub::Apply(_) => matches!(code, KeyCode::Esc),
             Sub::Board => {
                 if matches!(self.view, ViewMode::ByPlugin) {
@@ -475,6 +454,9 @@ impl View for ProfileView {
     fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
         match &self.sub {
             Sub::Assign(_) => vec![("↑↓", "choose"), ("⏎", "assign"), ("esc", "back")],
+            // Both ⏎ and esc leave the pool; advertise both rather than
+            // leaving one of them looking dead.
+            Sub::PoolDetail(_) => vec![("↑↓", "move"), ("space", "toggle"), ("⏎/esc", "done")],
             Sub::Apply(_) => vec![
                 ("space", "toggle"),
                 ("⏎", "write"),
@@ -503,31 +485,33 @@ impl View for ProfileView {
                         }
                         return vec![("space", "toggle"), ("⏎", "done"), ("esc", "cancel")];
                     }
-                    let mut hints = vec![
+                    vec![
                         ("↑↓", "browse"),
                         ("⏎", "assign"),
                         ("v", "by-profile"),
                         ("w", "apply"),
-                    ];
-                    if self.claude_available {
-                        hints.push(("a", "draft"));
-                    }
-                    hints
+                    ]
                 }
                 ViewMode::ByProfile => {
                     if self.on_demand_help {
                         return vec![("esc", "close")];
                     }
-                    let mut hints = vec![
-                        ("↑↓", "select"),
-                        ("⏎", "open"),
-                        ("s", "scan"),
-                        ("w", "apply"),
-                    ];
-                    if self.claude_available {
-                        hints.push(("a", "ai draft"));
+                    let labels = self.row_labels();
+                    let row = labels.get(self.cursor).map(String::as_str);
+                    // Every row opens something EXCEPT Unassigned with an empty
+                    // triage queue — that row already renders "(none)", so there
+                    // is nothing to open and the hint would be a promise the
+                    // Enter handler cannot keep.
+                    let opens = row != Some("Unassigned")
+                        || !crate::profile::draft::unassigned_keys(&self.inv, &self.working)
+                            .is_empty();
+                    let mut hints = vec![("↑↓", "select")];
+                    if opens {
+                        hints.push(("⏎", "open"));
                     }
-                    if self.row_labels().get(self.cursor).map(String::as_str) == Some("On-demand") {
+                    hints.push(("s", "scan"));
+                    hints.push(("w", "apply"));
+                    if row == Some("On-demand") {
                         hints.push(("?", "what is on-demand?"));
                     }
                     hints
@@ -675,27 +659,6 @@ impl View for ProfileView {
                             self.on_demand_help = false;
                         }
                         return None;
-                    }
-
-                    // While the AI consent offer is showing, y/n are high-priority.
-                    if self.ai_offer {
-                        match key.code {
-                            KeyCode::Char('y') => {
-                                self.ai_offer = false;
-                                return self.draft_action();
-                            }
-                            KeyCode::Char('n') => {
-                                self.ai_offer = false;
-                                return None;
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    // 'a' key — trigger AI draft any time on Board when claude is available.
-                    if self.claude_available && key.code == KeyCode::Char('a') {
-                        self.ai_offer = false;
-                        return self.draft_action();
                     }
 
                     // 's' — explicit, skippable repo scan. Fires in either view mode
@@ -909,7 +872,25 @@ impl View for ProfileView {
                                             .iter()
                                             .position(|l| l == "Unassigned")
                                             .unwrap_or(usize::MAX);
-                                        if self.cursor == unassigned_idx {
+                                        if self.cursor == 0 {
+                                            // Universal: a pool, not a profile
+                                            // — no detect rules to edit.
+                                            self.sub =
+                                                Sub::PoolDetail(pool::PoolDetailState::open(
+                                                    pool::Pool::Universal,
+                                                    &self.inv,
+                                                    &self.working,
+                                                ));
+                                        } else if labels.get(self.cursor).map(String::as_str)
+                                            == Some("On-demand")
+                                        {
+                                            self.sub =
+                                                Sub::PoolDetail(pool::PoolDetailState::open(
+                                                    pool::Pool::OnDemand,
+                                                    &self.inv,
+                                                    &self.working,
+                                                ));
+                                        } else if self.cursor == unassigned_idx {
                                             // Open Assign sub-view for unassigned plugins.
                                             let queue = crate::profile::draft::unassigned_keys(
                                                 &self.inv,
@@ -919,8 +900,9 @@ impl View for ProfileView {
                                                 self.sub =
                                                     Sub::Assign(assign::AssignState::new(queue));
                                             }
-                                        } else if self.cursor > 0 && self.cursor < unassigned_idx {
-                                            // A named profile row (not Universal at index 0).
+                                        } else if self.cursor < unassigned_idx {
+                                            // A named profile row — the pool rows
+                                            // and Unassigned are handled above.
                                             let name = labels[self.cursor].clone();
                                             if self.working.profiles.contains_key(&name) {
                                                 self.sub = Sub::Detail(Box::new(
@@ -970,6 +952,11 @@ impl View for ProfileView {
                     // which repos are uncovered; editing plugins or renaming does
                     // not, so skip the expensive all-repos recompute in that case.
                     recompute = state.detection_changed();
+                }
+            }
+            Sub::PoolDetail(state) => {
+                if state.handle_key(key, &mut self.working) {
+                    self.sub = Sub::Board;
                 }
             }
             Sub::Apply(state) => {
@@ -1092,23 +1079,11 @@ impl View for ProfileView {
             Sub::Detail(state) => {
                 detail::render(state, &self.inv, f, area, now_ms, self.scanned_at)
             }
+            Sub::PoolDetail(state) => pool::render(state, f, area),
             Sub::Apply(state) => {
                 apply::render(state, &self.working, self.scanned_at, now_ms, f, area)
             }
         }
-    }
-
-    fn accept_draft(&mut self, draft: crate::profile::config::Profiles) {
-        self.working = draft;
-        self.ai_offer = false;
-        // The draft replaces every profile's detect rules, so coverage changes —
-        // recompute it in place from the indexed signal (zero filesystem I/O).
-        let (unc, pending) =
-            crate::profile::drift::uncovered_from_signals(&self.inv.repos, &self.working);
-        if !pending {
-            self.uncovered = unc;
-        }
-        self.uncovered_pending = pending;
     }
 
     fn accept_scan(&mut self, outcome: crate::tui::job::ScanOutcome) {
@@ -1233,8 +1208,6 @@ mod tests {
     use crate::tui::profile::test_support;
     use ratatui::crossterm::event::KeyEvent;
 
-    // ── Task 4: AI consent offer + 'a' key + accept_draft ────────────────────
-
     fn inv_one_plugin() -> Inventory {
         Inventory {
             plugins: vec![PluginInfo {
@@ -1252,159 +1225,10 @@ mod tests {
     }
 
     #[test]
-    fn ai_offer_y_emits_draft_action_and_clears_offer() {
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        let mut v = ProfileView::new(inv, working, true, true);
-        assert!(v.ai_offer, "ai_offer must be true on first-run with claude");
-        let (_home, _data, c) = test_support::ctx();
-        let s = test_support::snap();
-        let action = v.on_key(KeyEvent::from(KeyCode::Char('y')), &c, &s);
-        assert!(
-            matches!(action, Some(Action::DraftWithClaude { .. })),
-            "y must emit DraftWithClaude"
-        );
-        assert!(!v.ai_offer, "ai_offer must be cleared after y");
-    }
-
-    #[test]
-    fn ai_offer_n_clears_offer_without_action() {
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        let mut v = ProfileView::new(inv, working, true, true);
-        let (_home, _data, c) = test_support::ctx();
-        let s = test_support::snap();
-        let action = v.on_key(KeyEvent::from(KeyCode::Char('n')), &c, &s);
-        assert!(action.is_none(), "n must not emit an action");
-        assert!(!v.ai_offer, "ai_offer must be cleared after n");
-    }
-
-    #[test]
-    fn a_key_emits_draft_when_claude_available() {
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        // offer=false so the offer isn't showing, but claude_available=true
-        let mut v = ProfileView::new(inv, working, true, false);
-        assert!(!v.ai_offer, "ai_offer must be false when offer=false");
-        let (_home, _data, c) = test_support::ctx();
-        let s = test_support::snap();
-        let action = v.on_key(KeyEvent::from(KeyCode::Char('a')), &c, &s);
-        assert!(
-            matches!(action, Some(Action::DraftWithClaude { .. })),
-            "a must emit DraftWithClaude when claude is available"
-        );
-    }
-
-    #[test]
-    fn a_key_does_not_scan_on_the_ui_thread_before_drafting() {
-        // The pre-draft repo scan must move to the job thread (the draft job
-        // scans in the background with the spinner visible). Pressing 'a' with a
-        // real git repo under the scan root must emit DraftWithClaude carrying
-        // that root, but must NOT walk the filesystem synchronously.
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("svc");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
-
-        let inv = Inventory {
-            plugins: vec![],
-            repos: vec![],
-            suggested_profiles: vec![],
-        };
-        let mut v = ProfileView::new(inv, Profiles::default(), true, false)
-            .with_scan_roots(vec![dir.path().display().to_string()]);
-        let (_home, _data, c) = test_support::ctx();
-        let s = test_support::snap();
-        let action = v.on_key(KeyEvent::from(KeyCode::Char('a')), &c, &s);
-        match action {
-            Some(Action::DraftWithClaude { scan_roots, .. }) => assert_eq!(
-                scan_roots,
-                vec![dir.path().display().to_string()],
-                "draft must carry the roots for the background scan"
-            ),
-            other => panic!("'a' must emit DraftWithClaude, got {other:?}"),
-        }
-        assert!(
-            v.inv_for_test().repos.is_empty(),
-            "'a' must not scan the filesystem on the UI thread"
-        );
-    }
-
-    #[test]
-    fn accept_draft_replaces_working() {
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        let mut v = ProfileView::new(inv.clone(), working, false, false);
-        let replacement = crate::profile::config::Profiles {
-            universal: vec!["unique@marker".to_string()],
-            ..Default::default()
-        };
-        v.accept_draft(replacement);
-        assert_eq!(
-            v.working_for_test().universal,
-            vec!["unique@marker".to_string()],
-            "accept_draft must replace working with the draft"
-        );
-        assert!(!v.ai_offer, "accept_draft must clear ai_offer");
-    }
-
-    #[test]
-    fn accept_draft_recomputes_uncovered_from_the_index_not_the_disk() {
-        // accept_draft changes every detect rule, so coverage must be
-        // recomputed — but there is no filesystem walk to wait on: the repo's
-        // directory below does not exist on disk, only its indexed signal says
-        // Cargo.toml is present. A stale disk-walking recompute would find
-        // nothing and leave the repo uncovered; the signal-based recompute
-        // must pick it up synchronously, no job required.
-        use crate::profile::discover::RepoSignal;
-        let repo = RepoSignal {
-            path: "/does/not/exist/a".into(),
-            marker_files: vec![],
-            marker_globs: vec![],
-            package_json_deps: vec![],
-            languages: vec![],
-            rule_hits: [("file:Cargo.toml".to_string(), true)]
-                .into_iter()
-                .collect(),
-            override_names: None,
-        };
-        let inv = Inventory {
-            plugins: vec![],
-            repos: vec![repo],
-            suggested_profiles: vec![],
-        };
-        // `ProfileView::new` no longer walks the disk to seed `uncovered` — seed
-        // the starting precondition ("no profiles yet, so this repo counts as
-        // uncovered") the same way a real scan-cache reopen would.
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_uncovered(vec!["/does/not/exist/a".to_string()]);
-        assert_eq!(
-            v.uncovered_for_test(),
-            &["/does/not/exist/a".to_string()],
-            "no profiles yet: the repo is uncovered"
-        );
-
-        let draft: Profiles = serde_json::from_str(
-            r#"{"universal": [], "profiles": {
-                "rust": {"plugins": [], "detect": {"marker_files": ["Cargo.toml"]}}}}"#,
-        )
-        .unwrap();
-        v.accept_draft(draft);
-        assert!(
-            v.uncovered_for_test().is_empty(),
-            "the indexed marker_file hit must cover the repo synchronously"
-        );
-        assert!(
-            !v.uncovered_pending_for_test(),
-            "a fully indexed repo must not be pending"
-        );
-    }
-
-    #[test]
     fn dirty_config_reports_change_once_then_clean() {
         let inv = inv_one_plugin();
         let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        let mut v = ProfileView::new(inv, working, false, false);
+        let mut v = ProfileView::new(inv, working);
         assert!(v.dirty_config().is_none(), "clean right after construction");
         v.working.universal.push("newplug@m".into()); // simulate an edit
         assert!(v.dirty_config().is_some(), "reports the change once");
@@ -1438,7 +1262,7 @@ mod tests {
         let snap = test_support::snap();
 
         let render = |scanned_at: i64| -> String {
-            let v = ProfileView::new(inv.clone(), Profiles::default(), false, false)
+            let v = ProfileView::new(inv.clone(), Profiles::default())
                 .with_scan_roots(vec!["/workspace".into()])
                 .with_scanned_at(Some(scanned_at));
             let mut t = Terminal::new(TestBackend::new(90, 12)).unwrap();
@@ -1470,25 +1294,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_offer_when_claude_unavailable() {
-        let inv = inv_one_plugin();
-        let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        // claude_available=false even though offer=true: offer must be suppressed
-        let mut v = ProfileView::new(inv, working, false, true);
-        assert!(
-            !v.ai_offer,
-            "ai_offer must be false when claude is unavailable"
-        );
-        let (_home, _data, c) = test_support::ctx();
-        let s = test_support::snap();
-        let action = v.on_key(KeyEvent::from(KeyCode::Char('a')), &c, &s);
-        assert!(
-            action.is_none(),
-            "a must do nothing when claude is unavailable"
-        );
-    }
-
     // ── Pre-existing tests (updated call sites to 4-arg new) ─────────────────
 
     #[test]
@@ -1514,7 +1319,7 @@ mod tests {
             r#"{"universal":["serena@x"],"profiles":{"rust":{"plugins":["gone@x"],"detect":{}}}}"#,
         )
         .unwrap();
-        let v = ProfileView::new(inv, working, false, false);
+        let v = ProfileView::new(inv, working);
         // global has the profile plugin "gone@x" enabled (drift) — provide via a snapshot.
         let mut s = test_support::snap();
         s.global_enabled = vec!["gone@x".to_string()];
@@ -1544,7 +1349,7 @@ mod tests {
             }],
         };
         let working = crate::profile::draft::scan_draft(&inv, vec!["/r".into()]);
-        ProfileView::new(inv, working, false, false)
+        ProfileView::new(inv, working)
     }
 
     #[test]
@@ -1745,7 +1550,7 @@ mod tests {
         };
         // Neither "serena" nor "eslint" matches "rust", so both remain unassigned.
         let working = crate::profile::draft::scan_draft(&inv, vec![]);
-        ProfileView::new(inv, working, false, false)
+        ProfileView::new(inv, working)
     }
 
     #[test]
@@ -1759,6 +1564,164 @@ mod tests {
             "Unassigned".to_string(),
             "On-demand must come right after Unassigned"
         );
+    }
+
+    #[test]
+    fn enter_on_the_universal_row_leaves_the_board() {
+        // The board's footer advertises "⏎ open" for every row, but Enter on
+        // Universal (cursor 0) used to fall through both branches of the Enter
+        // handler and do nothing at all — a silent no-op the UI promised was
+        // an action.
+        let mut v = view_with_two_unassigned();
+        v.switch_to_by_profile_for_test();
+        v.cursor = 0; // Universal
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        assert!(
+            !matches!(&v.sub, Sub::Board),
+            "Enter on Universal must open a sub-view, not silently do nothing"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_on_demand_row_leaves_the_board() {
+        // On-demand is always the last row, so it fell past `cursor <
+        // unassigned_idx` and was equally dead.
+        let mut v = view_with_two_unassigned();
+        v.working.on_demand.push("pixijs@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = v.row_labels().len() - 1; // On-demand
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        assert!(
+            !matches!(&v.sub, Sub::Board),
+            "Enter on On-demand must open a sub-view, not silently do nothing"
+        );
+    }
+
+    #[test]
+    fn toggling_in_the_universal_pool_writes_back_to_working() {
+        let mut v = view_with_two_unassigned(); // plugins: serena@x, eslint@x
+        v.switch_to_by_profile_for_test();
+        v.cursor = 0; // Universal
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s); // open the pool
+        v.on_key(KeyEvent::from(KeyCode::Char(' ')), &c, &s); // check serena@x
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s); // done
+        assert_eq!(
+            v.working_for_test().universal,
+            vec!["serena@x".to_string()],
+            "checking a plugin in the Universal pool must land in working.universal"
+        );
+    }
+
+    #[test]
+    fn checking_into_universal_evicts_the_plugin_from_profiles_and_on_demand() {
+        // `by_plugin::membership` treats universal / on_demand / profiles as
+        // mutually exclusive buckets and resolves them in that order, so a
+        // plugin left in two of them would silently report the wrong home.
+        let mut v = view_with_two_unassigned();
+        v.working
+            .profiles
+            .get_mut("rust")
+            .unwrap()
+            .plugins
+            .push("serena@x".to_string());
+        v.working.on_demand.push("serena@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = 0; // Universal
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        v.on_key(KeyEvent::from(KeyCode::Char(' ')), &c, &s); // check serena@x
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s);
+
+        let w = v.working_for_test();
+        assert!(
+            w.universal.contains(&"serena@x".to_string()),
+            "serena@x must land in universal"
+        );
+        assert!(
+            !w.profiles["rust"].plugins.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from the rust profile"
+        );
+        assert!(
+            !w.on_demand.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from on_demand"
+        );
+    }
+
+    #[test]
+    fn checking_into_on_demand_evicts_the_plugin_from_universal_and_profiles() {
+        let mut v = view_with_two_unassigned();
+        v.working.universal.push("serena@x".to_string());
+        v.working
+            .profiles
+            .get_mut("rust")
+            .unwrap()
+            .plugins
+            .push("serena@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = v.row_labels().len() - 1; // On-demand
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        v.on_key(KeyEvent::from(KeyCode::Char(' ')), &c, &s); // check serena@x
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s);
+
+        let w = v.working_for_test();
+        assert!(
+            w.on_demand.contains(&"serena@x".to_string()),
+            "serena@x must land in on_demand"
+        );
+        assert!(
+            !w.universal.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from universal"
+        );
+        assert!(
+            !w.profiles["rust"].plugins.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from the rust profile"
+        );
+    }
+
+    #[test]
+    fn the_open_hint_disappears_when_the_unassigned_row_has_nothing_to_open() {
+        // The Unassigned row already renders "(none)" when the triage queue is
+        // empty, so there is no screen worth opening — but the footer still
+        // said "⏎ open", and Enter did nothing. Withdraw the promise instead
+        // of inventing an empty sub-view.
+        let mut v = view_with_two_unassigned();
+        v.working.universal.push("serena@x".to_string());
+        v.working.universal.push("eslint@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = v
+            .row_labels()
+            .iter()
+            .position(|l| l == "Unassigned")
+            .unwrap();
+        assert!(
+            !v.footer_hints().iter().any(|(k, _)| *k == "⏎"),
+            "no ⏎ hint when the Unassigned row has nothing to triage: {:?}",
+            v.footer_hints()
+        );
+    }
+
+    #[test]
+    fn the_open_hint_stays_on_rows_that_do_open_something() {
+        // Guards the fix from over-reaching: the hint must only vanish on the
+        // one dead row, not on every row.
+        let mut v = view_with_two_unassigned(); // serena@x + eslint@x unassigned
+        v.switch_to_by_profile_for_test();
+        for (idx, label) in v.row_labels().iter().enumerate() {
+            v.cursor = idx;
+            assert!(
+                v.footer_hints().iter().any(|(k, _)| *k == "⏎"),
+                "row {label:?} opens a sub-view, so it must keep the ⏎ hint"
+            );
+        }
     }
 
     #[test]
@@ -1988,7 +1951,7 @@ mod tests {
             .profiles
             .insert("frontend".into(), Profile::default());
         working.profiles.insert("node".into(), Profile::default());
-        ProfileView::new(inv, working, false, false)
+        ProfileView::new(inv, working)
     }
 
     /// inv has eslint@x; working has "frontend" profile already containing eslint@x.
@@ -2012,7 +1975,7 @@ mod tests {
         let mut prof = Profile::default();
         prof.plugins.push("eslint@x".into());
         working.profiles.insert("frontend".into(), prof);
-        ProfileView::new(inv, working, false, false)
+        ProfileView::new(inv, working)
     }
 
     #[test]
@@ -2077,7 +2040,7 @@ mod tests {
         working
             .profiles
             .insert("frontend".into(), Profile::default());
-        ProfileView::new(inv, working, false, false)
+        ProfileView::new(inv, working)
     }
 
     #[test]
@@ -2151,8 +2114,7 @@ mod tests {
             suggested_profiles: vec![],
         };
         let root = dir.path().display().to_string();
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_scan_roots(vec![root.clone()]);
+        let mut v = ProfileView::new(inv, Profiles::default()).with_scan_roots(vec![root.clone()]);
 
         assert!(v.inv_for_test().repos.is_empty(), "starts unscanned");
         v.scan();
@@ -2185,7 +2147,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false);
+        let mut v = ProfileView::new(inv, Profiles::default());
         v.scan(); // scan_root defaults to ""
         assert!(v.inv_for_test().repos.is_empty());
         assert!(v.working_for_test().scan_roots.is_empty());
@@ -2308,7 +2270,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+        let mut v = ProfileView::new(inv, Profiles::default())
             .with_scan_roots(vec![dir.path().display().to_string()]);
         let (_h, _d, c) = test_support::ctx();
         let s = test_support::snap();
@@ -2346,7 +2308,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let v = ProfileView::new(inv, Profiles::default(), false, false)
+        let v = ProfileView::new(inv, Profiles::default())
             .with_scan_roots(vec!["/home/u/code".to_string()]);
         let snap = test_support::snap();
         let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
@@ -2393,7 +2355,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false);
+        let mut v = ProfileView::new(inv, Profiles::default());
         v.plugin_cursor = 39; // select the last plugin
 
         let snap = test_support::snap();
@@ -2454,7 +2416,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false).with_scan_roots(vec![
+        let mut v = ProfileView::new(inv, Profiles::default()).with_scan_roots(vec![
             a.path().display().to_string(),
             b.path().display().to_string(),
         ]);
@@ -2478,8 +2440,8 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_scan_roots(vec!["/home/u/code".into()]);
+        let mut v =
+            ProfileView::new(inv, Profiles::default()).with_scan_roots(vec!["/home/u/code".into()]);
         let (_h, _d, c) = test_support::ctx();
         let s = test_support::snap();
         let action = v.on_key(KeyEvent::from(KeyCode::Char('s')), &c, &s);
@@ -2503,7 +2465,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false);
+        let mut v = ProfileView::new(inv, Profiles::default());
         let outcome = crate::tui::job::ScanOutcome {
             roots: vec!["/x".into()],
             repos: vec![RepoSignal {
@@ -2548,7 +2510,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false);
+        let mut v = ProfileView::new(inv, Profiles::default());
         let outcome = crate::tui::job::ScanOutcome {
             roots: vec!["/x".into()],
             repos: vec![RepoSignal {
@@ -2586,8 +2548,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v =
-            ProfileView::new(inv, Profiles::default(), false, false).with_uncovered_pending(true);
+        let mut v = ProfileView::new(inv, Profiles::default()).with_uncovered_pending(true);
         assert!(
             v.uncovered_pending_for_test(),
             "seeded pending from a legacy cache"
@@ -2634,7 +2595,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+        let mut v = ProfileView::new(inv, Profiles::default())
             .with_index_rebuilding(true)
             .with_uncovered_pending(true);
         assert!(v.index_rebuilding_for_test(), "seeded rebuilding");
@@ -2680,7 +2641,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+        let mut v = ProfileView::new(inv, Profiles::default())
             .with_index_rebuilding(true)
             .with_uncovered(vec!["/x/a".into()]); // concrete, not pending, at seed time
         assert!(v.index_rebuilding_for_test(), "seeded rebuilding");
@@ -2709,8 +2670,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let v =
-            ProfileView::new(inv, Profiles::default(), false, false).with_index_rebuilding(true);
+        let v = ProfileView::new(inv, Profiles::default()).with_index_rebuilding(true);
         let snap = test_support::snap();
         let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
@@ -2746,8 +2706,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v =
-            ProfileView::new(inv, Profiles::default(), false, false).with_index_rebuilding(true);
+        let mut v = ProfileView::new(inv, Profiles::default()).with_index_rebuilding(true);
         v.switch_to_by_profile_for_test();
         let snap = test_support::snap();
         let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
@@ -2784,7 +2743,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let v = ProfileView::new(inv, Profiles::default(), false, false); // index_rebuilding defaults false
+        let v = ProfileView::new(inv, Profiles::default()); // index_rebuilding defaults false
         let snap = test_support::snap();
         let now = time::OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
         let mut t = Terminal::new(TestBackend::new(80, 14)).unwrap();
@@ -2819,7 +2778,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let v = ProfileView::new(inv, Profiles::default(), false, false)
+        let v = ProfileView::new(inv, Profiles::default())
             .with_scan_repos(vec![RepoSignal {
                 path: "/workspace/does-not-exist".into(),
                 marker_files: vec![],
@@ -2852,8 +2811,7 @@ mod tests {
             suggested_profiles: vec![],
         };
         // Seeded clean via with_uncovered → no pending write on open.
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_uncovered(vec!["/a".into()]);
+        let mut v = ProfileView::new(inv, Profiles::default()).with_uncovered(vec!["/a".into()]);
         assert!(
             v.dirty_uncovered().is_none(),
             "a freshly seeded uncovered set is clean (no re-persist on open)"
@@ -2895,7 +2853,7 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
+        let mut v = ProfileView::new(inv, Profiles::default())
             .with_scan_roots(vec!["/a".to_string(), "/b".to_string()]);
         let (_h, _d, c) = test_support::ctx();
         let s = test_support::snap();
@@ -2945,8 +2903,8 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_scan_roots(vec!["/old".to_string()]);
+        let mut v =
+            ProfileView::new(inv, Profiles::default()).with_scan_roots(vec!["/old".to_string()]);
         let (_h, _d, c) = test_support::ctx();
         let s = test_support::snap();
 
@@ -2974,8 +2932,8 @@ mod tests {
             suggested_profiles: vec![],
         };
         // A root that is a partial path under the temp dir: "<base>/aa"
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_scan_roots(vec![format!("{base}/aa")]);
+        let mut v =
+            ProfileView::new(inv, Profiles::default()).with_scan_roots(vec![format!("{base}/aa")]);
         let (_h, _d, c) = test_support::ctx();
         let s = test_support::snap();
 
@@ -2998,65 +2956,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ai_draft_defers_scan_to_the_job_thread_when_unscanned() {
-        use crate::profile::config::Profiles;
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("svc");
-        std::fs::create_dir_all(repo.join(".git")).unwrap();
-        std::fs::write(repo.join("Cargo.toml"), "[package]").unwrap();
-
-        let inv = Inventory {
-            plugins: vec![PluginInfo {
-                key: "serena@x".into(),
-                scopes: vec![],
-                description: None,
-            }],
-            repos: vec![],
-            suggested_profiles: vec![],
-        };
-        // claude_available=true so 'a' is honored; offer=false (test 'a' directly).
-        let mut v = ProfileView::new(inv, Profiles::default(), true, false)
-            .with_scan_roots(vec![dir.path().display().to_string()]);
-        let (_h, _d, c) = test_support::ctx();
-        let s = test_support::snap();
-
-        let action = v.on_key(KeyEvent::from(KeyCode::Char('a')), &c, &s);
-
-        // The scan is deferred to the background draft job: pressing 'a' must NOT
-        // walk the filesystem or merge a bucket synchronously (no UI freeze). The
-        // emitted action carries the root so the job can scan before prompting.
-        assert!(
-            !v.working_for_test().profiles.contains_key("rust"),
-            "'a' must not scan/merge synchronously — the job thread does it"
-        );
-        assert!(
-            v.inv_for_test().repos.is_empty(),
-            "'a' must not populate repos on the UI thread"
-        );
-        match action {
-            Some(Action::DraftWithClaude { inv, scan_roots }) => {
-                assert!(
-                    inv.repos.is_empty(),
-                    "the inventory scan is deferred to the job thread"
-                );
-                assert_eq!(
-                    scan_roots,
-                    vec![dir.path().display().to_string()],
-                    "draft must carry the root for the background scan"
-                );
-            }
-            other => panic!("expected DraftWithClaude, got {other:?}"),
-        }
-    }
-
     // ── On-demand help overlay (`?` on the On-demand row) ────────────────────
 
     /// ByProfile board with the cursor parked on the On-demand row (always last).
     fn view_on_demand_row() -> ProfileView {
         let inv = inv_one_plugin();
         let working = crate::profile::draft::scan_draft(&inv, vec![]);
-        let mut v = ProfileView::new(inv, working, false, false);
+        let mut v = ProfileView::new(inv, working);
         v.switch_to_by_profile_for_test();
         v.cursor = v.row_labels().len() - 1;
         v
@@ -3175,7 +3081,7 @@ mod tests {
             suggested_profiles: vec![],
         };
         let working = working_with_empty_web_profile();
-        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        let mut v = ProfileView::new(inv.clone(), working.clone());
         v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
         v.indexing = true;
         v.indexing_atoms = vec!["glob:*.tsx".to_string()];
@@ -3236,7 +3142,7 @@ mod tests {
             suggested_profiles: vec![],
         };
         let working = working_with_empty_web_profile();
-        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        let mut v = ProfileView::new(inv.clone(), working.clone());
         v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
         // A REAL IndexAtoms batch is genuinely in flight for a DIFFERENT atom.
         v.indexing = true;
@@ -3343,7 +3249,7 @@ mod tests {
             repos: vec![stale_repo],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, working.clone(), false, false);
+        let mut v = ProfileView::new(inv, working.clone());
 
         // Reopening Apply now (before any refresh) shows the stale no-match.
         let (_home2, _data2, c) = test_support::ctx();
@@ -3409,7 +3315,7 @@ mod tests {
             suggested_profiles: vec![],
         };
         let working = working_with_empty_web_profile();
-        let mut v = ProfileView::new(inv.clone(), working.clone(), false, false);
+        let mut v = ProfileView::new(inv.clone(), working.clone());
         v.sub = Sub::Detail(Box::new(detail::DetailState::open("web", &inv, &working)));
         v.indexing = true;
         v.indexing_atoms = vec!["glob:*.tsx".to_string(), "file:go.mod".to_string()];
@@ -3468,7 +3374,7 @@ mod tests {
             suggested_profiles: vec![],
         };
         let working = working_with_empty_web_profile();
-        let mut v = ProfileView::new(inv, working, false, false);
+        let mut v = ProfileView::new(inv, working);
         v.switch_to_by_profile_for_test();
         v.cursor = 1; // "web" (row 0 is Universal)
 
@@ -3531,8 +3437,8 @@ mod tests {
             repos: vec![],
             suggested_profiles: vec![],
         };
-        let mut v = ProfileView::new(inv, Profiles::default(), false, false)
-            .with_scan_roots(vec!["/workspace".into()]);
+        let mut v =
+            ProfileView::new(inv, Profiles::default()).with_scan_roots(vec!["/workspace".into()]);
         let snap = test_support::snap();
         let now = time::OffsetDateTime::from_unix_timestamp(0).unwrap();
         let render = |v: &ProfileView| -> String {

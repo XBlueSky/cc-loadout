@@ -102,6 +102,5 @@ the fix only for someone using the CLI without the plugin.
 - This sets up config and enablement only — it does NOT install plugins (that is
   Claude Code's job).
 - If the user would rather click than chat, point them at the interactive board:
-  run `cc-loadout` and tab to the Profile tab (it has the same setup, plus an optional
-  `✨` "let Claude draft it" button). The board's `w` does the equivalent of
-  `init --assign` + `apply --all` in one step.
+  run `cc-loadout` and tab to the Profile tab, which has the same setup by hand.
+  The board's `w` does the equivalent of `init --assign` + `apply --all` in one step.
