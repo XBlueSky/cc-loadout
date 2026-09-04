@@ -19,6 +19,7 @@ mod by_plugin;
 pub mod detail;
 pub(crate) mod explain;
 pub(crate) mod on_demand_help;
+pub(crate) mod pool;
 pub(crate) mod rules;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -44,6 +45,7 @@ enum Sub {
     Board,
     Assign(assign::AssignState),
     Detail(Box<detail::DetailState>),
+    PoolDetail(pool::PoolDetailState),
     Apply(apply::ApplyState),
 }
 
@@ -433,6 +435,7 @@ impl View for ProfileView {
         match &self.sub {
             Sub::Detail(_) => matches!(code, KeyCode::Esc | KeyCode::Tab | KeyCode::Char('r')),
             Sub::Assign(_) => matches!(code, KeyCode::Esc),
+            Sub::PoolDetail(_) => matches!(code, KeyCode::Esc),
             Sub::Apply(_) => matches!(code, KeyCode::Esc),
             Sub::Board => {
                 if matches!(self.view, ViewMode::ByPlugin) {
@@ -451,6 +454,9 @@ impl View for ProfileView {
     fn footer_hints(&self) -> Vec<(&'static str, &'static str)> {
         match &self.sub {
             Sub::Assign(_) => vec![("↑↓", "choose"), ("⏎", "assign"), ("esc", "back")],
+            // Both ⏎ and esc leave the pool; advertise both rather than
+            // leaving one of them looking dead.
+            Sub::PoolDetail(_) => vec![("↑↓", "move"), ("space", "toggle"), ("⏎/esc", "done")],
             Sub::Apply(_) => vec![
                 ("space", "toggle"),
                 ("⏎", "write"),
@@ -857,7 +863,25 @@ impl View for ProfileView {
                                             .iter()
                                             .position(|l| l == "Unassigned")
                                             .unwrap_or(usize::MAX);
-                                        if self.cursor == unassigned_idx {
+                                        if self.cursor == 0 {
+                                            // Universal: a pool, not a profile
+                                            // — no detect rules to edit.
+                                            self.sub =
+                                                Sub::PoolDetail(pool::PoolDetailState::open(
+                                                    pool::Pool::Universal,
+                                                    &self.inv,
+                                                    &self.working,
+                                                ));
+                                        } else if labels.get(self.cursor).map(String::as_str)
+                                            == Some("On-demand")
+                                        {
+                                            self.sub =
+                                                Sub::PoolDetail(pool::PoolDetailState::open(
+                                                    pool::Pool::OnDemand,
+                                                    &self.inv,
+                                                    &self.working,
+                                                ));
+                                        } else if self.cursor == unassigned_idx {
                                             // Open Assign sub-view for unassigned plugins.
                                             let queue = crate::profile::draft::unassigned_keys(
                                                 &self.inv,
@@ -867,8 +891,9 @@ impl View for ProfileView {
                                                 self.sub =
                                                     Sub::Assign(assign::AssignState::new(queue));
                                             }
-                                        } else if self.cursor > 0 && self.cursor < unassigned_idx {
-                                            // A named profile row (not Universal at index 0).
+                                        } else if self.cursor < unassigned_idx {
+                                            // A named profile row — the pool rows
+                                            // and Unassigned are handled above.
                                             let name = labels[self.cursor].clone();
                                             if self.working.profiles.contains_key(&name) {
                                                 self.sub = Sub::Detail(Box::new(
@@ -918,6 +943,11 @@ impl View for ProfileView {
                     // which repos are uncovered; editing plugins or renaming does
                     // not, so skip the expensive all-repos recompute in that case.
                     recompute = state.detection_changed();
+                }
+            }
+            Sub::PoolDetail(state) => {
+                if state.handle_key(key, &mut self.working) {
+                    self.sub = Sub::Board;
                 }
             }
             Sub::Apply(state) => {
@@ -1040,6 +1070,7 @@ impl View for ProfileView {
             Sub::Detail(state) => {
                 detail::render(state, &self.inv, f, area, now_ms, self.scanned_at)
             }
+            Sub::PoolDetail(state) => pool::render(state, f, area),
             Sub::Apply(state) => {
                 apply::render(state, &self.working, self.scanned_at, now_ms, f, area)
             }
@@ -1523,6 +1554,127 @@ mod tests {
             labels[labels.len() - 2],
             "Unassigned".to_string(),
             "On-demand must come right after Unassigned"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_universal_row_leaves_the_board() {
+        // The board's footer advertises "⏎ open" for every row, but Enter on
+        // Universal (cursor 0) used to fall through both branches of the Enter
+        // handler and do nothing at all — a silent no-op the UI promised was
+        // an action.
+        let mut v = view_with_two_unassigned();
+        v.switch_to_by_profile_for_test();
+        v.cursor = 0; // Universal
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        assert!(
+            !matches!(&v.sub, Sub::Board),
+            "Enter on Universal must open a sub-view, not silently do nothing"
+        );
+    }
+
+    #[test]
+    fn enter_on_the_on_demand_row_leaves_the_board() {
+        // On-demand is always the last row, so it fell past `cursor <
+        // unassigned_idx` and was equally dead.
+        let mut v = view_with_two_unassigned();
+        v.working.on_demand.push("pixijs@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = v.row_labels().len() - 1; // On-demand
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        assert!(
+            !matches!(&v.sub, Sub::Board),
+            "Enter on On-demand must open a sub-view, not silently do nothing"
+        );
+    }
+
+    #[test]
+    fn toggling_in_the_universal_pool_writes_back_to_working() {
+        let mut v = view_with_two_unassigned(); // plugins: serena@x, eslint@x
+        v.switch_to_by_profile_for_test();
+        v.cursor = 0; // Universal
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s); // open the pool
+        v.on_key(KeyEvent::from(KeyCode::Char(' ')), &c, &s); // check serena@x
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s); // done
+        assert_eq!(
+            v.working_for_test().universal,
+            vec!["serena@x".to_string()],
+            "checking a plugin in the Universal pool must land in working.universal"
+        );
+    }
+
+    #[test]
+    fn checking_into_universal_evicts_the_plugin_from_profiles_and_on_demand() {
+        // `by_plugin::membership` treats universal / on_demand / profiles as
+        // mutually exclusive buckets and resolves them in that order, so a
+        // plugin left in two of them would silently report the wrong home.
+        let mut v = view_with_two_unassigned();
+        v.working
+            .profiles
+            .get_mut("rust")
+            .unwrap()
+            .plugins
+            .push("serena@x".to_string());
+        v.working.on_demand.push("serena@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = 0; // Universal
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        v.on_key(KeyEvent::from(KeyCode::Char(' ')), &c, &s); // check serena@x
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s);
+
+        let w = v.working_for_test();
+        assert!(
+            w.universal.contains(&"serena@x".to_string()),
+            "serena@x must land in universal"
+        );
+        assert!(
+            !w.profiles["rust"].plugins.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from the rust profile"
+        );
+        assert!(
+            !w.on_demand.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from on_demand"
+        );
+    }
+
+    #[test]
+    fn checking_into_on_demand_evicts_the_plugin_from_universal_and_profiles() {
+        let mut v = view_with_two_unassigned();
+        v.working.universal.push("serena@x".to_string());
+        v.working
+            .profiles
+            .get_mut("rust")
+            .unwrap()
+            .plugins
+            .push("serena@x".to_string());
+        v.switch_to_by_profile_for_test();
+        v.cursor = v.row_labels().len() - 1; // On-demand
+        let (_home, _data, c) = test_support::ctx();
+        let s = test_support::snap();
+        v.on_key(KeyEvent::from(KeyCode::Enter), &c, &s);
+        v.on_key(KeyEvent::from(KeyCode::Char(' ')), &c, &s); // check serena@x
+        v.on_key(KeyEvent::from(KeyCode::Esc), &c, &s);
+
+        let w = v.working_for_test();
+        assert!(
+            w.on_demand.contains(&"serena@x".to_string()),
+            "serena@x must land in on_demand"
+        );
+        assert!(
+            !w.universal.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from universal"
+        );
+        assert!(
+            !w.profiles["rust"].plugins.contains(&"serena@x".to_string()),
+            "serena@x must be dropped from the rust profile"
         );
     }
 
