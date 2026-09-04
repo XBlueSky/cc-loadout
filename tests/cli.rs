@@ -1628,3 +1628,61 @@ fn doctor_fix_prune_records_deletes_only_the_managed_redundant_records() {
         "an unmanaged key is never pruned"
     );
 }
+
+/// Seed `~/.claude/` with an on-demand plugin that is globally enabled — the
+/// state that makes it load in every repo no matter what any session holds.
+fn seed_leaked_on_demand(home: &Path) -> std::path::PathBuf {
+    let claude = home.join(".claude");
+    std::fs::create_dir_all(claude.join("profiles")).unwrap();
+    std::fs::write(
+        claude.join("profiles").join("profiles.json"),
+        r#"{"universal":[],"profiles":{},"on_demand":["od@m"]}"#,
+    )
+    .unwrap();
+    let settings = claude.join("settings.json");
+    std::fs::write(&settings, r#"{"enabledPlugins":{"od@m":true}}"#).unwrap();
+    settings
+}
+
+#[test]
+fn doctor_reports_a_globally_enabled_on_demand_plugin_without_writing() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let settings = seed_leaked_on_demand(home);
+    let before = std::fs::read_to_string(&settings).unwrap();
+
+    cmd(home, ddir.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("on-demand enabled globally (1)"))
+        .stdout(predicate::str::contains("od@m"));
+
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        before,
+        "doctor without --fix must not touch settings.json"
+    );
+}
+
+#[test]
+fn doctor_fix_demotes_a_globally_enabled_on_demand_plugin() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let home = hdir.path();
+    let settings = seed_leaked_on_demand(home);
+
+    cmd(home, ddir.path())
+        .args(["doctor", "--fix"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("disabled globally (1)"));
+
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    assert_eq!(
+        v["enabledPlugins"]["od@m"],
+        serde_json::json!(false),
+        "the leak must be closed at global scope: {v}"
+    );
+}

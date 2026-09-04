@@ -28,6 +28,11 @@ pub struct DoctorReport {
     pub redundant_records: crate::profile::registry::PruneReport,
     /// Whether `redundant_records` describes a completed deletion.
     pub pruned_records: bool,
+    /// On-demand keys enabled in the GLOBAL settings.json: what a read-only run
+    /// found, or (with `--fix`) what it demoted to `false`.
+    pub on_demand_global: Vec<String>,
+    /// Whether `on_demand_global` describes a completed demotion.
+    pub demoted_on_demand: bool,
     pub standalone_link: Option<StandaloneLink>,
 }
 
@@ -301,6 +306,7 @@ pub fn run(
         None
     };
 
+    let settings = crate::hooks::settings_path(home, config_override);
     let registry = crate::profile::discover::resolve_registry_path(home, config_override);
     // Probed once, unconditionally, before the fix/read-only split below:
     // `keys_needing_promotion` is built on the infallible `discover::list_plugins`
@@ -326,9 +332,23 @@ pub fn run(
             report.redundant_records =
                 crate::profile::registry::prunable_local_records(&cfg, &registry);
         }
+        // A different failure mode in the same file `promote_all` repairs, and
+        // the only check here that is about `enabledPlugins` rather than the
+        // registry: an on-demand plugin left `true` at global scope is enabled
+        // in every repo, because the unheld state of such a key is *absence*
+        // from the repo layer — which inherits, not disables. See
+        // `apply::demotable_on_demand_keys` for why `apply_global` cannot
+        // reach these keys itself.
+        if fix {
+            report.on_demand_global =
+                crate::profile::apply::demote_on_demand_global(&settings, &cfg)?;
+            report.demoted_on_demand = true;
+        } else {
+            report.on_demand_global =
+                crate::profile::apply::demotable_on_demand_keys(&settings, &cfg)?;
+        }
     }
 
-    let settings = crate::hooks::settings_path(home, config_override);
     report.legacy_hooks = if fix {
         crate::hooks::legacy::remove_legacy_hooks(&settings)?
     } else {
@@ -407,6 +427,17 @@ pub fn print(report: &DoctorReport, fix: bool) {
             println!("{counts} (pass --prune-records to delete)");
         } else {
             println!("{counts} (run with --fix --prune-records to delete)");
+        }
+    }
+    if !report.on_demand_global.is_empty() {
+        let n = report.on_demand_global.len();
+        if report.demoted_on_demand {
+            println!("disabled globally ({n}) — no longer inherited by every repo:");
+        } else {
+            println!("on-demand enabled globally ({n}) — every repo inherits these (run with --fix to disable):");
+        }
+        for k in &report.on_demand_global {
+            println!("  {k}");
         }
     }
     if report.legacy_hooks > 0 {
