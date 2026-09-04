@@ -44,6 +44,11 @@ pub struct Profiles {
     /// Plugins available for session-scoped `acquire`/`release` (see
     /// `src/profile/on_demand.rs`). Deliberately NOT fed into
     /// `managed_keys()`/`desired_plugins()` — `apply` must never touch these.
+    /// The single exception is `doctor`, which demotes a key left `true` in the
+    /// GLOBAL settings.json (see `apply::demotable_on_demand_keys`): that value
+    /// is inherited by every repo precisely BECAUSE `apply` leaves the key
+    /// absent, so excluding the pool from `apply` is what makes the global
+    /// value decisive.
     #[serde(default)]
     pub on_demand: Vec<String>,
 }

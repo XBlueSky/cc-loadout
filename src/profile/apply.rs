@@ -199,7 +199,6 @@ pub fn global_settings_path(claude: &ClaudePaths) -> std::path::PathBuf {
 
 /// Currently-`true` plugin keys in the global settings.json, sorted. Empty when
 /// the file or the `enabledPlugins` key is absent.
-#[allow(dead_code)]
 pub fn read_global_enabled(settings_path: &Path) -> Result<Vec<String>> {
     if !settings_path.exists() {
         return Ok(Vec::new());
@@ -257,6 +256,67 @@ pub fn apply_global(settings_path: &Path, cfg: &Profiles) -> Result<(Value, Valu
     })?;
 
     Ok((before, after))
+}
+
+/// On-demand keys that are `true` in the GLOBAL settings.json — the state that
+/// silently enables them in every repo.
+///
+/// `enabledPlugins` merges per key, so a key a repo's `settings.local.json`
+/// does not mention inherits the global value. An unheld on-demand key's
+/// correct state is *absent* from a repo (`on_demand::release` removes the key
+/// rather than writing `false`; see `managed::orphans`), so a global `true` is
+/// inherited everywhere: the plugin loads in every repo, `acquire` has nothing
+/// to turn on and `release` nothing to revert. `apply_global` cannot correct
+/// this, because `managed_keys()` deliberately excludes the on-demand pool —
+/// it never writes these keys at all, leaving whatever Claude Code wrote when
+/// the plugin was installed.
+///
+/// A key that is ALSO universal or profile-specific is excluded: nothing
+/// validates that the pools are disjoint, and for a key in both `apply_global`
+/// owns the global value — demoting it here would only make the two fight.
+pub fn demotable_on_demand_keys(settings_path: &Path, cfg: &Profiles) -> Result<Vec<String>> {
+    let globally_true: BTreeSet<String> = read_global_enabled(settings_path)?.into_iter().collect();
+    let managed: BTreeSet<String> = managed_keys(cfg).into_iter().collect();
+    // Through a BTreeSet, which sorts and dedupes in one step, so the report is
+    // stable regardless of the order the pool happens to be written in.
+    Ok(cfg
+        .on_demand
+        .iter()
+        .filter(|k| globally_true.contains(*k) && !managed.contains(*k))
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect())
+}
+
+/// Write `false` for every key `demotable_on_demand_keys` reports, returning
+/// the keys changed.
+///
+/// A clean run does not write the file at all. This is `~/.claude/settings.json`
+/// — the one file the user does not expect a tool to touch unasked — and a
+/// diagnostic must not rewrite it just to report that nothing was wrong.
+///
+/// Safe to run while a session holds one of these keys: `acquire` writes the
+/// key `true` in the repo's `settings.local.json`, and the repo layer wins.
+pub fn demote_on_demand_global(settings_path: &Path, cfg: &Profiles) -> Result<Vec<String>> {
+    let keys = demotable_on_demand_keys(settings_path, cfg)?;
+    if keys.is_empty() {
+        return Ok(keys);
+    }
+    crate::util::jsonmerge::merge_object(settings_path, 0o644, |settings| {
+        let enabled = settings
+            .entry("enabledPlugins")
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !enabled.is_object() {
+            *enabled = Value::Object(Map::new());
+        }
+        let enabled_obj = enabled.as_object_mut().unwrap();
+        for key in &keys {
+            enabled_obj.insert(key.clone(), Value::Bool(false));
+        }
+        Ok(())
+    })?;
+    Ok(keys)
 }
 
 /// Return the current `enabledPlugins` object, or None if the file/key is missing.
@@ -621,5 +681,105 @@ mod tests {
                  clobbered by a concurrent apply()"
             );
         }
+    }
+
+    fn cfg_on_demand() -> Profiles {
+        // `u@m` sits in BOTH `universal` and `on_demand`: nothing validates
+        // that the pools are disjoint, and a key in both is a managed key
+        // whose global value `apply_global` owns.
+        serde_json::from_str(
+            r#"{
+            "universal": ["u@m"],
+            "profiles": {
+                "a": {"plugins": ["a1@m"], "detect": {}}
+            },
+            "on_demand": ["od@m", "off@m", "absent@m", "u@m"]
+        }"#,
+        )
+        .unwrap()
+    }
+
+    fn write_global_settings(dir: &Path) -> std::path::PathBuf {
+        let s = dir.join("settings.json");
+        std::fs::write(
+            &s,
+            r#"{"theme":"dark","enabledPlugins":{"od@m":true,"off@m":false,"u@m":true,"a1@m":false,"other@m":true}}"#,
+        )
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn demotable_on_demand_keys_lists_only_globally_true_unmanaged_on_demand_keys() {
+        // od@m: on-demand and globally true -> the leak.
+        // off@m: on-demand but already false. absent@m: not in the file at all.
+        // u@m: on-demand AND universal, so a managed key. a1@m: profile-specific.
+        // other@m: globally true but not an on-demand key at all.
+        let dir = tempfile::tempdir().unwrap();
+        let s = write_global_settings(dir.path());
+        assert_eq!(
+            demotable_on_demand_keys(&s, &cfg_on_demand()).unwrap(),
+            vec!["od@m".to_string()]
+        );
+    }
+
+    #[test]
+    fn demotable_on_demand_keys_is_empty_when_the_settings_file_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path().join("settings.json");
+        assert!(demotable_on_demand_keys(&s, &cfg_on_demand())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn demote_on_demand_global_writes_false_and_preserves_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = write_global_settings(dir.path());
+        assert_eq!(
+            demote_on_demand_global(&s, &cfg_on_demand()).unwrap(),
+            vec!["od@m".to_string()]
+        );
+        let v: Value = serde_json::from_slice(&std::fs::read(&s).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["od@m"], json!(false));
+        assert_eq!(
+            v["enabledPlugins"]["other@m"],
+            json!(true),
+            "a key outside every pool must survive"
+        );
+        assert_eq!(
+            v["theme"],
+            json!("dark"),
+            "other settings keys must survive"
+        );
+    }
+
+    #[test]
+    fn demote_on_demand_global_leaves_a_key_that_is_also_universal_enabled() {
+        // Without the managed-key guard `doctor --fix` and `apply_global`
+        // would fight over `u@m` forever: one writes false, the other true.
+        let dir = tempfile::tempdir().unwrap();
+        let s = write_global_settings(dir.path());
+        demote_on_demand_global(&s, &cfg_on_demand()).unwrap();
+        let v: Value = serde_json::from_slice(&std::fs::read(&s).unwrap()).unwrap();
+        assert_eq!(v["enabledPlugins"]["u@m"], json!(true));
+    }
+
+    #[test]
+    fn demote_on_demand_global_writes_nothing_when_no_key_leaks() {
+        // The file this touches is `~/.claude/settings.json`. A clean run must
+        // leave it byte-identical rather than rewrite it with the same content.
+        let dir = tempfile::tempdir().unwrap();
+        let s = dir.path().join("settings.json");
+        let body = r#"{"enabledPlugins":{"off@m":false,"u@m":true}}"#;
+        std::fs::write(&s, body).unwrap();
+        assert!(demote_on_demand_global(&s, &cfg_on_demand())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&s).unwrap(),
+            body,
+            "nothing leaked, so nothing may be written"
+        );
     }
 }
