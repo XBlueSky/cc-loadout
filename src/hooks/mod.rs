@@ -9,7 +9,6 @@ pub mod legacy;
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// The fields cc-loadout needs from the hook payload.
@@ -37,24 +36,14 @@ pub fn settings_path(home: &Path, config_override: Option<&Path>) -> PathBuf {
     base.join("settings.json")
 }
 
-/// True only for a session id safe to interpolate, unquoted, into a shell
-/// script that `$CLAUDE_ENV_FILE` will later be `source`d as. Hook stdin is
-/// untrusted everywhere else in this module (see `parse_input`'s
-/// `unwrap_or_default`), and this is the single most dangerous thing this
-/// module does with that input: a JSON string can legally contain a newline
-/// (which would split into a second shell command) or `$(...)`/backticks
-/// (command substitution). Claude Code supplies a UUID today, so this is
-/// latent rather than exploitable — but the trust boundary should be
-/// consistent regardless of what the current producer happens to send.
-fn is_safe_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
-/// SessionStart: publish the session id, re-assert plugin scope, and finish the
-/// one-time migration off the retired `settings.json` hooks.
+/// SessionStart: re-assert plugin scope, and finish the one-time migration off
+/// the retired `settings.json` hooks.
+///
+/// It no longer publishes the session id through `$CLAUDE_ENV_FILE`: Claude
+/// Code exports `CLAUDE_CODE_SESSION_ID` to every Bash tool subprocess itself
+/// (and keeps it current across `/clear` and `/resume`), whereas the env-file
+/// append re-ran on every compact/resume and piled duplicate lines onto every
+/// Bash command of a long session.
 ///
 /// Every step below is deliberately best-effort (`if let Ok`/`let _ =`): a
 /// SessionStart hook must never block a session from starting. If a future
@@ -62,28 +51,7 @@ fn is_safe_session_id(id: &str) -> bool {
 /// not propagate it just because the function is typed `-> Result<()>` and
 /// called with `?` at the dispatch site; today nothing inside can actually
 /// return `Err`, and that `?` is inert on purpose.
-pub fn session_start(home: &Path, config_override: Option<&Path>, raw: &str) -> Result<()> {
-    let input = parse_input(raw);
-
-    // `profile on-demand acquire` needs the id, and a hook can only publish an
-    // env var to the rest of the session through $CLAUDE_ENV_FILE. Anything
-    // that fails the safety check is skipped entirely rather than escaped or
-    // truncated: writing a sanitized guess would still corrupt trust in a
-    // file the shell is about to execute, whereas skipping just means
-    // `profile on-demand acquire` won't find a session id — which it already
-    // handles by erroring with a clear message.
-    if is_safe_session_id(&input.session_id) {
-        if let Some(env_file) = std::env::var_os("CLAUDE_ENV_FILE") {
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(env_file)
-            {
-                let _ = writeln!(f, "export CC_LOADOUT_SESSION_ID={}", input.session_id);
-            }
-        }
-    }
-
+pub fn session_start(home: &Path, config_override: Option<&Path>) -> Result<()> {
     let cfg_path = crate::profile::config::profiles_path(home);
     if let Ok(cfg) = crate::profile::config::load(&cfg_path) {
         let registry = crate::profile::discover::resolve_registry_path(home, config_override);

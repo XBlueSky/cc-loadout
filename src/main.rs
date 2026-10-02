@@ -213,7 +213,7 @@ enum OnDemandAction {
         /// Key to release. Omit with --all to release everything held.
         key: Option<String>,
         /// Explicit session id — used by the SessionEnd hook. Defaults to
-        /// $CC_LOADOUT_SESSION_ID for interactive use.
+        /// $CLAUDE_CODE_SESSION_ID for interactive use.
         #[arg(long)]
         session_id: Option<String>,
         /// Release every key the session holds instead of a single <key>.
@@ -1000,7 +1000,7 @@ fn run() -> Result<()> {
                 let _ = std::io::stdin().read_to_string(&mut raw);
                 match action {
                     HookAction::SessionStart => {
-                        hooks::session_start(&home, config_override.as_deref(), &raw)?
+                        hooks::session_start(&home, config_override.as_deref())?
                     }
                     HookAction::SessionEnd => hooks::session_end(&raw)?,
                 }
