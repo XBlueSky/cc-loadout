@@ -188,8 +188,19 @@ pub fn release_all(root: &Path, session_id: &str) -> Result<()> {
 use crate::profile::config::Profiles;
 use anyhow::bail;
 
+/// The id of the Claude Code session this command runs under. Claude Code
+/// (v2.1.132+) exports it to every Bash tool subprocess and keeps it current
+/// across `/clear` and `/resume`, matching the `session_id` hooks receive — so
+/// the SessionEnd hook releases exactly the holds taken under this id.
+fn session_id_from_env() -> Result<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID").context(
+        "CLAUDE_CODE_SESSION_ID not set — run this from inside a Claude Code session \
+         (v2.1.132 or later)",
+    )
+}
+
 /// `cc-loadout profile on-demand acquire <key>`. Validates `key` is listed in
-/// `cfg.on_demand`, reads the session id from `$CC_LOADOUT_SESSION_ID`.
+/// `cfg.on_demand`, reads the session id from `$CLAUDE_CODE_SESSION_ID`.
 pub fn cli_acquire(cwd: &Path, cfg: &Profiles, key: &str) -> Result<()> {
     if !cfg.on_demand.iter().any(|k| k == key) {
         bail!(
@@ -198,10 +209,7 @@ pub fn cli_acquire(cwd: &Path, cfg: &Profiles, key: &str) -> Result<()> {
             cfg.on_demand.join(", ")
         );
     }
-    let session_id = std::env::var("CC_LOADOUT_SESSION_ID").context(
-        "CC_LOADOUT_SESSION_ID not set — the cc-loadout SessionStart hook must have run \
-         in this session first",
-    )?;
+    let session_id = session_id_from_env()?;
     acquire(cwd, &session_id, key)?;
     println!(
         "acquired '{key}' in {} — run /reload-plugins to use it now",
@@ -220,8 +228,7 @@ pub fn cli_release(
 ) -> Result<()> {
     let session_id = match session_id {
         Some(s) => s,
-        None => std::env::var("CC_LOADOUT_SESSION_ID")
-            .context("CC_LOADOUT_SESSION_ID not set and no --session-id given")?,
+        None => session_id_from_env().context("no --session-id given")?,
     };
     if all {
         release_all(cwd, &session_id)?;
@@ -450,12 +457,13 @@ mod tests {
     #[test]
     fn cli_acquire_without_session_id_env_var_errors_clearly() {
         // No other test in this file or in main.rs sets/reads
-        // CC_LOADOUT_SESSION_ID directly (tests/cli.rs sets it via `.env()` on
+        // CLAUDE_CODE_SESSION_ID directly (tests/cli.rs sets it via `.env()` on
         // a spawned subprocess, which is a separate process and cannot race
         // this in-process env mutation), so removing it here is safe against
         // cross-test interference under `cargo test`'s default parallel
-        // in-process threading.
-        std::env::remove_var("CC_LOADOUT_SESSION_ID");
+        // in-process threading. It must be removed: `cargo test` run from a
+        // Claude Code Bash tool inherits the live session's id.
+        std::env::remove_var("CLAUDE_CODE_SESSION_ID");
 
         let dir = tempfile::tempdir().unwrap();
         let cfg = Profiles {
@@ -465,8 +473,8 @@ mod tests {
 
         let err = cli_acquire(dir.path(), &cfg, "pixijs@x").unwrap_err();
         assert!(
-            err.to_string().contains("CC_LOADOUT_SESSION_ID"),
-            "error must name CC_LOADOUT_SESSION_ID so the user knows what to fix: {err}"
+            err.to_string().contains("CLAUDE_CODE_SESSION_ID"),
+            "error must name CLAUDE_CODE_SESSION_ID so the user knows what to fix: {err}"
         );
     }
 

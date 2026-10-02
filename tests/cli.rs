@@ -24,14 +24,15 @@ fn write_login(home: &Path, email: &str) {
 /// that forgets to patch PATH itself (the gap that once wiped a live prime schedule).
 /// It ALSO removes CC_LOADOUT_PROFILES (profiles_path() prefers it over $HOME, so a
 /// value leaking in from the ambient shell would redirect profiles.json reads/writes
-/// out of the sandbox) and CLAUDE_ENV_FILE (this branch newly taught `hook
-/// session-start` to open and append to it — an ambient value would make that write
-/// land outside the sandbox too). Do NOT call `Command::cargo_bin("cc-loadout")`
-/// directly anywhere in this file — always go through `cmd()` and chain extra
-/// `.env(...)` / `.current_dir(...)` as needed. A test that must inspect the table
-/// overrides PATH with its own `fake_crontab_path(dir)` and reads that dir's `tab`.
-/// A test that wants CC_LOADOUT_PROFILES or CLAUDE_ENV_FILE set does so explicitly
-/// after construction — `.env()` after `.env_remove()` still wins.
+/// out of the sandbox) and CLAUDE_CODE_SESSION_ID (`cargo test` run from a Claude
+/// Code Bash tool inherits the live session's id, which would let an on-demand test
+/// pass on the ambient value instead of the one it sets). Do NOT call
+/// `Command::cargo_bin("cc-loadout")` directly anywhere in this file — always go
+/// through `cmd()` and chain extra `.env(...)` / `.current_dir(...)` as needed. A
+/// test that must inspect the table overrides PATH with its own
+/// `fake_crontab_path(dir)` and reads that dir's `tab`. A test that wants
+/// CC_LOADOUT_PROFILES or CLAUDE_CODE_SESSION_ID set does so explicitly after
+/// construction — `.env()` after `.env_remove()` still wins.
 fn cmd(home: &Path, data: &Path) -> Command {
     let mut c = Command::cargo_bin("cc-loadout").unwrap();
     // Default crontab isolation. The fake bin lives under the caller-owned `data`
@@ -45,7 +46,7 @@ fn cmd(home: &Path, data: &Path) -> Command {
         .env("PATH", fake_path)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CC_LOADOUT_PROFILES")
-        .env_remove("CLAUDE_ENV_FILE");
+        .env_remove("CLAUDE_CODE_SESSION_ID");
     c
 }
 
@@ -845,7 +846,7 @@ fn on_demand_acquire_then_release_round_trips_enabled_plugins() {
 
     cmd(hdir.path(), ddir.path())
         .env("CC_LOADOUT_PROFILES", &profiles)
-        .env("CC_LOADOUT_SESSION_ID", "sess-cli-1")
+        .env("CLAUDE_CODE_SESSION_ID", "sess-cli-1")
         .current_dir(repo.path())
         .args(["profile", "on-demand", "acquire", "pixijs@x"])
         .assert()
@@ -859,7 +860,7 @@ fn on_demand_acquire_then_release_round_trips_enabled_plugins() {
 
     cmd(hdir.path(), ddir.path())
         .env("CC_LOADOUT_PROFILES", &profiles)
-        .env("CC_LOADOUT_SESSION_ID", "sess-cli-1")
+        .env("CLAUDE_CODE_SESSION_ID", "sess-cli-1")
         .current_dir(repo.path())
         .args(["profile", "on-demand", "release", "pixijs@x"])
         .assert()
@@ -885,7 +886,7 @@ fn on_demand_acquire_rejects_key_not_in_on_demand_list() {
 
     cmd(hdir.path(), ddir.path())
         .env("CC_LOADOUT_PROFILES", &profiles)
-        .env("CC_LOADOUT_SESSION_ID", "sess-cli-1")
+        .env("CLAUDE_CODE_SESSION_ID", "sess-cli-1")
         .current_dir(repo.path())
         .args(["profile", "on-demand", "acquire", "pixijs@x"])
         .assert()
@@ -1057,27 +1058,6 @@ fn task_list_shows_that_a_prime_runs_on_the_cheap_model() {
 }
 
 #[test]
-fn hook_session_start_exports_the_session_id() {
-    let hdir = tempfile::tempdir().unwrap();
-    let ddir = tempfile::tempdir().unwrap();
-    let home = hdir.path();
-    let env_file = ddir.path().join("env");
-
-    cmd(home, ddir.path())
-        .args(["hook", "session-start"])
-        .env("CLAUDE_ENV_FILE", &env_file)
-        .write_stdin(r#"{"session_id":"sess-abc"}"#)
-        .assert()
-        .success();
-
-    let body = std::fs::read_to_string(&env_file).unwrap();
-    assert!(
-        body.contains("export CC_LOADOUT_SESSION_ID=sess-abc"),
-        "env file was: {body}"
-    );
-}
-
-#[test]
 fn hook_session_start_promotes_managed_plugins_to_user_scope() {
     let hdir = tempfile::tempdir().unwrap();
     let ddir = tempfile::tempdir().unwrap();
@@ -1162,40 +1142,6 @@ fn hook_session_end_is_a_noop_without_a_session_id() {
 }
 
 #[test]
-fn hook_session_start_rejects_a_hostile_session_id_in_the_env_file() {
-    // `$CLAUDE_ENV_FILE` is sourced by a shell later in the session. A session
-    // id is JSON-string input from Claude Code, which can legally contain a
-    // newline (splits into a second command line) or `$(...)`/backticks
-    // (command substitution). Regression test for the fix: the hook must
-    // never write such a value into the file, even though it must still
-    // exit successfully (a hook must never block a session).
-    let hdir = tempfile::tempdir().unwrap();
-    let ddir = tempfile::tempdir().unwrap();
-    let home = hdir.path();
-    let env_file = ddir.path().join("env");
-
-    let hostile = "abc\n$(touch /tmp/pwned)";
-    let stdin = serde_json::json!({ "session_id": hostile }).to_string();
-
-    cmd(home, ddir.path())
-        .args(["hook", "session-start"])
-        .env("CLAUDE_ENV_FILE", &env_file)
-        .write_stdin(stdin)
-        .assert()
-        .success();
-
-    if env_file.exists() {
-        let body = std::fs::read_to_string(&env_file).unwrap();
-        assert!(
-            !body
-                .lines()
-                .any(|l| l.starts_with("export CC_LOADOUT_SESSION_ID=abc")),
-            "a hostile session id must never be written into the sourced env file: {body}"
-        );
-    }
-}
-
-#[test]
 fn hook_session_end_releases_the_sessions_on_demand_holds() {
     // Positive-path coverage for session_end's actual wiring to
     // `profile::on_demand::release_all` — the earlier noop test only covers
@@ -1221,7 +1167,7 @@ fn hook_session_end_releases_the_sessions_on_demand_holds() {
 
     cmd(hdir.path(), ddir.path())
         .env("CC_LOADOUT_PROFILES", &profiles)
-        .env("CC_LOADOUT_SESSION_ID", "sess-hookend-1")
+        .env("CLAUDE_CODE_SESSION_ID", "sess-hookend-1")
         .current_dir(repo.path())
         .args(["profile", "on-demand", "acquire", "pixijs@x"])
         .assert()

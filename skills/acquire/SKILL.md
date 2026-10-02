@@ -42,9 +42,9 @@ only for someone using the CLI without the plugin.
    ```
    cc-loadout profile on-demand acquire <key>
    ```
-   If this fails with a `CC_LOADOUT_SESSION_ID not set` error, tell the user
-   the cc-loadout SessionStart hook hasn't run in this session yet —
-   starting a fresh session is the first thing to try — and stop.
+   If this fails with a `CLAUDE_CODE_SESSION_ID not set` error, tell the user
+   their Claude Code is too old to export the session id to Bash (it needs
+   v2.1.132 or later) — upgrading Claude Code is the fix — and stop.
 
 3. **Tell the user to reload.** The plugin is now enabled in
    `.claude/settings.local.json`, but Claude Code doesn't pick up newly
