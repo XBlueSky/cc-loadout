@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-10-02
+
+### Bug Fixes
+
+- read CLAUDE_CODE_SESSION_ID instead of appending to $CLAUDE_ENV_FILE
+
 ## [0.1.28] - 2026-09-04
 
 ### Bug Fixes
