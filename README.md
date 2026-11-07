@@ -60,6 +60,7 @@ Setup = empty the Unassigned bucket, then `w` to apply.
 - **Edit detection rules in the board** — open a profile's Detail view → Rules tab to author what it matches, no JSON by hand: four rule kinds (`path under` / `has file` / `has any` / `contains`), a live match-count and **near-miss** panel as you type, `?` to explain why any scanned repo matches (or doesn't), `f` to seed rules from an example repo, and ghost path-completion for `path under` values.
 - `profile detect` / `apply` — per-repo plugin detection (path prefix, marker files, marker globs, and file-content matches — a named file containing a word; legacy `package.json`-deps / dependency-keyword rules are still honoured for older configs) with manual override; additive universal + profile plugin sets; a surgical merge that preserves your on-demand and unrelated settings. `--all` sweeps every git repo under your scan roots.
 - `doctor` / `doctor --fix` — inspect and repair cc-loadout's own installation: seeds a missing `profiles.json`, promotes managed plugins (including cc-loadout itself) back to `scope: user` when they've drifted to `scope: local`, clears retired `settings.json` hook entries from older versions, and reports (`--prune-backups` to delete) the timestamped backup files earlier versions left behind. It also reports (`--prune-records` to delete) redundant `scope: local` plugin records: Claude Code writes one installation record per (plugin, repo) whenever a repo's `settings.local.json` enables a plugin, even when a `scope: user` record already resolves it everywhere, so they accumulate one batch per repo you open. Only records for keys cc-loadout manages *and* that already have a `scope: user` twin are removed, so nothing you installed locally on purpose is touched.
+- **Collector tasks** — `collector set` and `task add --collector` schedule a run of Geralt's collector launcher instead of `claude -p`: fail-fast lock, per-task wall timeout, a subreaper-backed clean-up of the whole process tree, and one metadata-only execution record per attempt (Linux only; see [Collector tasks (Geralt)](#collector-tasks-geralt)).
 - Ships as a Claude Code plugin too: the bundled `/cc-loadout:init` skill creates your profiles by chatting with Claude (no TTY needed). This is the only Claude-assisted path — it routes through `profile init --assign`, which validates the assignment and backs up your existing config before writing.
 
 ## Install
@@ -285,6 +286,134 @@ uses. The full setup is three steps:
 Net effect: every repo loads just the universal plugins by default, and each
 profile's plugins appear only in the repos that match it.
 
+### Collector tasks (Geralt)
+
+A **collector task** is a scheduled run that is handed to the collector launcher
+of a Geralt checkout instead of starting `claude -p`. cc-loadout stays the
+scheduler and the process supervisor, and writes one small *execution record*
+per attempt for Geralt's reporter to pick up. It does not talk to Geralt, hold a
+Geralt token or read Geralt's configuration, and it never builds a Claude
+command line: how Claude is started (flags, MCP config, allowed tools, plugins,
+model, max turns, the prompt file) is all in the launcher config. A collector
+task has no prompt, cwd, profile or model of its own.
+
+```bash
+# once per machine: the Node.js binary, the Geralt checkout, the export directory
+cc-loadout collector set --node /usr/bin/node --geralt-repo /srv/geralt \
+  --export-dir /var/lib/geralt/runner-export --runner-instance-id runner-a
+cc-loadout collector show [--json]     # prints the saved settings (touches nothing)
+
+# per task; every path is absolute, there are no defaults for the last three flags
+cc-loadout task add geralt-collect --account work --at 07:00 12:00 --collector \
+  --launcher-config /etc/geralt/launcher.toml \
+  --wall-timeout-secs 1800 --grace-ms 12000
+```
+
+`collector set` replaces the saved settings and touches no crontab. `task add`
+installs the cron line the way it does for any task (it rewrites the managed
+`cron` block). The task id is also the `taskId` of every record, so it must be
+1-200 characters of letters, digits, `_ . : -`, starting with a letter or digit;
+`runner-instance-id` follows the same rule and has to match the reporter's
+binding. `--wall-timeout-secs` is 1..=86400 and `--grace-ms` is 2500..=600000.
+
+**What a run does.** `cc-loadout task run <id>` (the cron entry point):
+
+1. Tries the cc-loadout lock **without waiting**. If another run holds it, the
+   attempt is recorded as `skipped_busy` / `lock_busy` and ends at once; no
+   launcher starts. (Plain tasks still block on the lock.)
+2. Starts `<node> --import tsx <geralt-repo>/src/launcher/main.ts run --config
+   <launcher-config> --attempt-ref <attempt-id> --session-id <uuid>` with the
+   Geralt checkout as its cwd, stdin closed and its own process group. The
+   prompt is never on the command line. The environment is yours, except that
+   `CORTEX_SKIP_RECORD=1` is set and `CORTEX_FORCE_RECORD` is removed, so the
+   Cortex hook does not record the session. For a non-active account
+   `CLAUDE_CONFIG_DIR` is set as for any task.
+3. Waits for the launcher, the wall timeout (`--wall-timeout-secs`) or a manual
+   kill (SIGTERM or SIGINT sent to cc-loadout), then cleans up the whole process
+   tree the launcher left (see below).
+4. Writes exactly one record and exits 0 for a clean `exited_ok`, 1 otherwise.
+
+cc-loadout makes itself the *child subreaper* of everything the launcher starts
+(`prctl(PR_SET_CHILD_SUBREAPER)`), so a descendant that detaches from the
+launcher's process group, or whose parent exits first, still ends up under
+cc-loadout and cannot hide from the clean-up. The lock is held until the clean-up
+is verified.
+
+**Grace.** `grace_ms` is how long cc-loadout lets the launcher wind down before it
+stops waiting. cc-loadout cannot read the launcher's or the proxy's config, so
+you set it, and it must satisfy:
+
+```
+grace_ms  >=  launcher terminate_grace  +  2000 ms (the launcher's KILL_WAIT_MS)  +  margin
+```
+
+and, between the launcher config and the proxy config (checked by nobody):
+
+```
+launcher terminate_grace  >=  Claude Code's shutdown window (about 500 ms)
+                          >   proxy signal_drain_timeout + signal_finalize_timeout  (together <= 450 ms)
+```
+
+- On the wall timeout or a manual kill, SIGTERM goes to the launcher's process
+  group; after `grace_ms`, SIGKILL goes to the group and to every descendant
+  still alive, and cc-loadout verifies they are gone. A descendant that left the
+  group (for example with `setsid`) gets no SIGTERM, only the SIGKILL after the
+  grace. The record is `timed_out` or `killed`.
+- When the launcher ends by itself, cc-loadout still waits up to the full
+  `grace_ms` for what it left behind to leave on its own, then sends SIGTERM,
+  one second later SIGKILL, and verifies for up to five seconds. So a run that
+  leaves a stubborn descendant holds the lock for about `grace_ms` + 6 s.
+- A `grace_ms` below the inequality does not break the record, but the tree is
+  SIGKILLed while the launcher is still finishing, so Geralt's collector run for
+  that attempt is left unfinished (read as interrupted, never as complete).
+- Anything that survives the SIGKILL is a residual: the record carries
+  `process_tree_residual` (with `timed_out`, `killed` or `exited_ok`; after a
+  launcher `exited_error` the residual is only logged). If `/proc` cannot be
+  read, the tree is treated as not clean rather than as empty.
+
+**Output.** The launcher's stdout is read (first 4096 bytes) and parsed for the
+model fields of the record; it is never printed. Of its stderr, only lines
+starting with `geralt-launcher ` (at most 4096 bytes each, 64 KiB in total) are
+forwarded to cc-loadout's stderr. cc-loadout's own lines are fixed-code,
+`cc-loadout-collector <code> k=v ...`, with an attempt id, a status or an integer
+as the only values. With the usual cron redirect, that is all that reaches
+`prime.log`; the model's output never does.
+
+**Export directory.** One file per attempt, `<attemptId>.<recordRevision>.json`
+(revision always 1; cc-loadout writes no corrections), at most 16 KiB, 16 fixed
+fields: ids, `status`, `safeErrorCode`, exit code, UTC timestamps, model names and
+a policy digest. Never the prompt, stdout, cwd or an error message. Each file is
+written to a hidden `.`-prefixed temporary file (mode 0600) and renamed into
+place, and an existing record is never overwritten. `status` is one of
+`exited_ok`, `exited_error`, `timed_out`, `skipped_busy`, `killed`,
+`launch_failed`; a failure before the launcher starts (unknown task or account,
+unreadable state, no spawn) is `launch_failed`.
+
+- **Owner.** cc-loadout creates the directory (mode 0700, owned by the user that
+  runs it; only missing components are created, an existing directory keeps its
+  mode and the permissions above it are yours). Point it at the directory
+  Geralt's reporter reads (`export.dir`) and keep nothing else in it.
+- **Clean-up is yours.** cc-loadout never deletes, rotates or expires records;
+  the reporter only reads them. Prune old records yourself, and any
+  `.`-prefixed temporary file a crash left behind (the reporter ignores it, and
+  nothing removes it). A directory that only grows is re-sent in full whenever
+  the reporter restarts: safe, because the server is idempotent, but not free.
+- If cc-loadout cannot even tell where to write (`tasks.json` unreadable, no or
+  invalid collector settings, a task id outside the grammar), it writes no record
+  and exits 1 with one fixed-code line on stderr.
+
+**What it leaves alone.** A collector run never writes `tasks.json` (no
+`last_run`, `last_status` or `last_session_id`) and never updates `last_primed`
+in `state.json`; the export is the only record. `task resume` refuses a collector
+task. Rotated credentials of an isolated account are still written back. A
+`tasks.json` that has collector settings or a collector task is saved as
+`"version": 2`, so an older cc-loadout fails fast instead of silently dropping
+the new keys; a file that never used a collector stays version 1, byte for byte.
+
+**Linux only.** Supervising the tree needs `prctl` and `/proc`. On any other
+platform `collector set` and `task add` still work, but an attempt is recorded as
+`launch_failed` and no launcher is started.
+
 ## Configuration
 
 Profiles live in `~/.claude/profiles/profiles.json` (override the path with `$CC_LOADOUT_PROFILES`). The easiest way to create it is `cc-loadout profile init` (or the `/cc-loadout:init` skill), which scans your repos and walks you through the choices. To hand-write it instead, start from the shipped `profiles.example.json`. Universal plugins are enabled in every repo; profiles add on top and stack. Writing `profiles.json` via `profile init` also adjusts the global enabled set in `~/.claude/settings.json` (universal plugins stay on, other managed plugins are turned off there) so they stop loading in every repo; `apply` then re-enables each repo's matching plugins locally.
@@ -306,6 +435,7 @@ To override detection, write profile names (one per line) to `.claude/profile`, 
 
 - **Linux-first.** Credentials are read/written as files (`~/.claude/.credentials.json` and the `oauthAccount` block of `~/.claude.json`); `$CLAUDE_CONFIG_DIR` is honoured. macOS Keychain is not yet supported.
 - These are Claude Code's **internal, undocumented** files and may change between releases. A switch verifies the result and fails loudly rather than silently leaving you on the wrong account.
+- **Collector tasks are Linux-only.** They need `prctl` and `/proc` to supervise the launcher's process tree; elsewhere an attempt is recorded as `launch_failed`. cc-loadout does not delete export records or the temporary files a crash leaves in the export directory — that is up to you.
 - `account use` swaps credentials only by default; pass `--launch` to relaunch Claude (`claude --continue`). A running Claude reads the login into memory at startup, so it won't pick up the new account until it is restarted.
 
 ## Website
