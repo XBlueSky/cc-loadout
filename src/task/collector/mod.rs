@@ -3,5 +3,7 @@
 //! each one is self-contained and called from the collector run path.
 
 pub mod export;
+pub mod launch;
 pub mod log;
+pub mod outcome;
 pub mod run;

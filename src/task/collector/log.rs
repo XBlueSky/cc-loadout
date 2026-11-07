@@ -60,7 +60,6 @@ pub enum LogLine<'a> {
     /// Another run holds the cc-loadout lock.
     Busy { attempt: &'a str },
     /// The launcher process was started.
-    #[allow(dead_code)] // emitted by the launch code of Task 4
     Started { attempt: &'a str },
     /// The attempt's export record was written.
     Recorded {
@@ -72,7 +71,6 @@ pub enum LogLine<'a> {
     #[allow(dead_code)] // emitted by the supervision code of Task 5
     Residual { attempt: &'a str, count: usize },
     /// Launcher stderr lines were counted but not forwarded.
-    #[allow(dead_code)] // emitted by the launch code of Task 4
     StderrDropped { attempt: &'a str, lines: usize },
     /// The attempt's export record could not be written.
     ExportFailed { attempt: &'a str },

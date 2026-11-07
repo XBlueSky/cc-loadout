@@ -7,12 +7,18 @@
 //! alone.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use time::OffsetDateTime;
 
 use crate::account::store::Store;
+use crate::account::{creds, paths};
 use crate::task::collector::export::{
-    new_attempt_id, write_export, ExportRecord, SafeErrorCode, Status,
+    format_instant, new_attempt_id, write_export, ExportRecord, SafeErrorCode, Status,
 };
+use crate::task::collector::launch::{launcher_command, Captured, OutputPumps, CLOSE_WAIT_MS};
 use crate::task::collector::log::{LogLine, PrelaunchReason};
+use crate::task::collector::outcome::{classify, parse_outcome_line, Observation, Observed};
 use crate::task::config::{is_collector_id, CollectorSettings, CollectorTask, Kind, Tasks};
 use crate::task::run::{run_location, RunLocation};
 use crate::task::sandbox;
@@ -22,11 +28,6 @@ use crate::util::lock;
 /// command.
 pub struct RunCtx<'a> {
     pub store: &'a Store,
-    // Part of the run context every task path gets; a collector run never
-    // writes `tasks.json` (its export record is the only bookkeeping), so
-    // nothing reads it yet.
-    #[allow(dead_code)]
-    pub data_root: &'a Path,
     pub home: &'a Path,
     pub live_plugins: &'a Path,
 }
@@ -51,9 +52,8 @@ pub fn run_collector(ctx: &RunCtx<'_>, tasks: &Tasks, id: &str) -> i32 {
 }
 
 /// What `launch_and_watch` needs from the steps before it.
-// Read by the launch code of Task 4.
-#[allow(dead_code)]
 struct Launch<'a> {
+    task_id: &'a str,
     settings: &'a CollectorSettings,
     task: &'a CollectorTask,
     account: &'a str,
@@ -163,6 +163,7 @@ fn run_with_log(
     let record = launch_and_watch(
         ctx,
         &Launch {
+            task_id: id,
             settings,
             task,
             account: &def.account,
@@ -170,6 +171,7 @@ fn run_with_log(
             session: &session,
             cfg_dir,
         },
+        log,
     );
 
     // 9. Write the record; the lock is released when this function returns.
@@ -177,10 +179,131 @@ fn run_with_log(
 }
 
 /// Step 8: start the launcher and supervise it until the attempt is over, then
-/// describe how it ended. Task 4 fills this in; nothing before it reaches it in
-/// a test.
-fn launch_and_watch(_ctx: &RunCtx<'_>, _launch: &Launch<'_>) -> ExportRecord {
-    unimplemented!("Task 4")
+/// describe how it ended.
+fn launch_and_watch(
+    ctx: &RunCtx<'_>,
+    launch: &Launch<'_>,
+    log: &mut dyn FnMut(&LogLine<'_>),
+) -> ExportRecord {
+    let watched = watch_launcher(launch, log);
+
+    // Rotated credentials are token state, not attempt state: keep them however
+    // the attempt went.
+    if let Some(dir) = &launch.cfg_dir {
+        sync_rotated_credentials(ctx, launch.account, dir);
+    }
+
+    // Stdout counts as an outcome line only if it was kept whole.
+    let outcome = if watched.captured.stdout_truncated {
+        None
+    } else {
+        parse_outcome_line(&watched.captured.stdout)
+    };
+    let c = classify(&watched.observation, &watched.seen, outcome);
+
+    ExportRecord {
+        session_id: Some(launch.session.to_string()),
+        exit_code: c.exit_code,
+        started_at: Some(format_instant(watched.started)),
+        ended_at: Some(format_instant(watched.ended)),
+        requested_model: c.requested_model,
+        effective_model: c.effective_model,
+        effective_policy_digest: c.effective_policy_digest,
+        ..ExportRecord::not_launched(
+            &launch.settings.runner_instance_id,
+            launch.task_id,
+            launch.attempt,
+            c.status,
+            c.safe_error_code,
+        )
+    }
+}
+
+/// What watching the launcher left behind: how it ended, what the runner itself
+/// did to it, what it printed, and when.
+struct Watched {
+    observation: Observation,
+    seen: Observed,
+    captured: Captured,
+    started: OffsetDateTime,
+    ended: OffsetDateTime,
+}
+
+/// Start the launcher and wait for it to end.
+///
+/// This is the whole of the supervision for now: it waits for the launcher and
+/// does nothing about its descendants or its running time, so `seen` is always
+/// empty. The process-tree supervision of Task 5 replaces the wait and fills `seen`.
+fn watch_launcher(launch: &Launch<'_>, log: &mut dyn FnMut(&LogLine<'_>)) -> Watched {
+    let started = OffsetDateTime::now_utc();
+    let spawned = crate::util::retry_etxtbsy(|| {
+        launcher_command(
+            launch.settings,
+            launch.task,
+            launch.attempt,
+            launch.session,
+            launch.cfg_dir.as_deref(),
+        )
+        .spawn()
+    });
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            return Watched {
+                observation: Observation::SpawnError {
+                    enoent: e.kind() == std::io::ErrorKind::NotFound,
+                },
+                seen: Observed::default(),
+                captured: Captured {
+                    stdout: Vec::new(),
+                    stdout_truncated: false,
+                    stderr_dropped: 0,
+                },
+                started,
+                ended: started,
+            };
+        }
+    };
+    let pumps = OutputPumps::start(&mut child, launch.attempt);
+    log(&LogLine::Started {
+        attempt: launch.attempt,
+    });
+
+    let observation = match child.wait() {
+        Ok(status) => status
+            .code()
+            .map_or(Observation::Signaled, Observation::Exited),
+        Err(_) => Observation::NotReaped,
+    };
+    let captured = pumps.finish(Duration::from_millis(CLOSE_WAIT_MS));
+    if captured.stderr_dropped > 0 {
+        log(&LogLine::StderrDropped {
+            attempt: launch.attempt,
+            lines: captured.stderr_dropped,
+        });
+    }
+    Watched {
+        observation,
+        seen: Observed::default(),
+        captured,
+        // Never earlier than the start, even if the wall clock stepped back.
+        ended: OffsetDateTime::now_utc().max(started),
+        started,
+    }
+}
+
+/// Copy credentials the launcher's Claude rotated in an isolated config dir back
+/// to the account's snapshot, as a plain scheduled task does after its run; a
+/// refresh token that is used once is gone, so the new one must not be lost.
+/// Best effort: a record of the attempt matters more than this write.
+fn sync_rotated_credentials(ctx: &RunCtx<'_>, account: &str, cfg_dir: &Path) {
+    let eph = paths::resolve(ctx.home, Some(cfg_dir));
+    if let Ok(rotated) = creds::read_credentials(&eph.credentials) {
+        let snap = ctx.store.credentials_snapshot(account);
+        if creds::read_credentials(&snap).ok() != Some(rotated.clone()) {
+            let _ = creds::write_credentials(&snap, &rotated);
+        }
+    }
 }
 
 /// Step 9: write the attempt's export record and map it to the exit code. Any
@@ -267,6 +390,10 @@ mod tests {
             std::fs::create_dir_all(&data_root).unwrap();
             let home = dir.path().join("home");
             std::fs::create_dir_all(&home).unwrap();
+            // Where the settings point `node` and the Geralt checkout; a test
+            // that launches writes its stand-in `node` into `bin`.
+            std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+            std::fs::create_dir_all(dir.path().join("repo")).unwrap();
             Fx {
                 store: Store::new(&data_root),
                 live_plugins: home.join(".claude").join("plugins"),
@@ -280,19 +407,39 @@ mod tests {
         fn ctx(&self) -> RunCtx<'_> {
             RunCtx {
                 store: &self.store,
-                data_root: &self.data_root,
                 home: &self.home,
                 live_plugins: &self.live_plugins,
             }
         }
 
+        fn root(&self) -> &Path {
+            self._dir.path()
+        }
+
+        /// The stand-in `node`: absent until a test calls `write_node`.
+        fn node_path(&self) -> PathBuf {
+            self.root().join("bin").join("node")
+        }
+
         fn settings(&self) -> CollectorSettings {
             CollectorSettings {
-                node: PathBuf::from("/opt/node/bin/node"),
-                geralt_repo: PathBuf::from("/opt/geralt"),
+                node: self.node_path(),
+                geralt_repo: self.root().join("repo"),
                 export_dir: self.export_dir.clone(),
                 runner_instance_id: "runner-test".into(),
             }
+        }
+
+        /// Install a stand-in for `node` that runs `body` as a POSIX shell script
+        /// and returns its path. This is the only program a test in this module
+        /// ever launches: never the real `node`, never Geralt's launcher, never
+        /// `claude`. `PATH` is pinned so the script cannot find anything else.
+        fn write_node(&self, body: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.node_path();
+            std::fs::write(&path, format!("#!/bin/sh\nPATH=/usr/bin:/bin\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
         }
 
         /// A `Tasks` with the collector section set and the given tasks in it.
@@ -844,5 +991,406 @@ mod tests {
             lines,
             ["cc-loadout-collector attempt_recorded attempt=att-fin status=exited_ok safe_error=process_tree_residual"]
         );
+    }
+
+    /// Tests that reach step 8 run a stand-in `node` (see `Fx::write_node`), and
+    /// step 6 only lets a run get there on Linux.
+    #[cfg(target_os = "linux")]
+    mod launched {
+        use super::*;
+        use crate::account::creds;
+
+        fn digest() -> String {
+            format!("sha256:{}", "a".repeat(64))
+        }
+
+        /// A shell command that prints a valid outcome line.
+        fn print_outcome() -> String {
+            format!(
+                "printf '%s\\n' '{{\"schema\":\"geralt.launch-outcome\",\"version\":1,\"requestedModel\":\"m1\",\"effectiveModel\":\"m2\",\"effectivePolicyDigest\":\"{}\"}}'",
+                digest()
+            )
+        }
+
+        /// A shell command that records argv (one word per line) and the config
+        /// dir the stand-in was given into `dump`.
+        fn dump_to(dump: &Path) -> String {
+            format!(
+                "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{d}'\nprintf 'cfg=%s\\n' \"${{CLAUDE_CONFIG_DIR-unset}}\" >> '{d}'",
+                d = dump.display()
+            )
+        }
+
+        fn live_fx() -> (Fx, Tasks) {
+            let fx = Fx::new();
+            fx.write_state(Some("work"), &["work"]);
+            let tasks = fx.tasks(vec![("weekly", collector_def("work"))]);
+            (fx, tasks)
+        }
+
+        /// The record shape every launched attempt shares.
+        fn assert_launched(rec: &Value) {
+            assert_eq!(rec["schema"], "geralt.execution-record");
+            assert_eq!(rec["version"], 1);
+            assert_eq!(rec["recordRevision"], 1);
+            assert_eq!(rec["runnerInstanceId"], "runner-test");
+            assert_eq!(rec["taskId"], "weekly");
+            assert_eq!(rec["taskRevision"], Value::Null);
+            let session = rec["sessionId"].as_str().unwrap();
+            assert_eq!(session.len(), 36, "a UUID: {session}");
+            let (started, ended) = (
+                rec["startedAt"].as_str().unwrap(),
+                rec["endedAt"].as_str().unwrap(),
+            );
+            for t in [started, ended] {
+                assert_eq!(t.len(), 24, "{t}");
+                assert!(t.ends_with('Z') && t.as_bytes()[10] == b'T', "{t}");
+            }
+            // Q3 rule 5: the same fixed-width format, so text order is time order.
+            assert!(started <= ended, "{started} .. {ended}");
+        }
+
+        #[test]
+        fn a_clean_launcher_exit_is_an_exited_ok_record_with_the_outcome_models() {
+            let (fx, tasks) = live_fx();
+            let dump = fx.root().join("dump");
+            fx.write_node(&format!("{}\n{}", dump_to(&dump), print_outcome()));
+
+            let (code, lines) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 0);
+            let (name, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "exited_ok");
+            assert_eq!(rec["safeErrorCode"], Value::Null);
+            assert_eq!(rec["exitCode"], 0);
+            assert_eq!(rec["requestedModel"], "m1");
+            assert_eq!(rec["effectiveModel"], "m2");
+            assert_eq!(rec["effectivePolicyDigest"], digest());
+
+            let attempt = attempt_of(&rec);
+            assert_eq!(name, export_file_name(&attempt, 1));
+            assert_eq!(
+                lines,
+                [
+                    format!("cc-loadout-collector attempt_started attempt={attempt}"),
+                    format!(
+                        "cc-loadout-collector attempt_recorded attempt={attempt} status=exited_ok safe_error=none"
+                    ),
+                ]
+            );
+
+            // The launcher got this attempt's and this session's names, the
+            // contract argv, and no config dir (the live account).
+            let dumped = std::fs::read_to_string(&dump).unwrap();
+            let words: Vec<&str> = dumped.lines().collect();
+            let main_ts = fx.root().join("repo/src/launcher/main.ts");
+            assert_eq!(
+                words,
+                [
+                    "--import",
+                    "tsx",
+                    main_ts.to_str().unwrap(),
+                    "run",
+                    "--config",
+                    "/etc/geralt/launcher.json",
+                    "--attempt-ref",
+                    attempt.as_str(),
+                    "--session-id",
+                    rec["sessionId"].as_str().unwrap(),
+                    "cfg=unset",
+                ]
+            );
+        }
+
+        #[test]
+        fn every_launcher_exit_lands_in_its_row_of_the_table() {
+            // (launcher exit, status, safeErrorCode, record exitCode, runner exit)
+            let rows = [
+                (0, "exited_ok", None, Some(0), 0),
+                (1, "exited_error", Some("launcher_error"), Some(1), 1),
+                (2, "launch_failed", Some("config_invalid"), None, 1),
+                (7, "launch_failed", Some("auth_required"), None, 1),
+                (21, "exited_error", Some("turn_limit"), Some(21), 1),
+                (22, "exited_error", Some("session_error"), Some(22), 1),
+                (30, "exited_error", None, Some(30), 1),
+                (99, "exited_error", None, Some(99), 1),
+            ];
+            for (launcher_exit, status, safe, exit_code, runner_exit) in rows {
+                let (fx, tasks) = live_fx();
+                fx.write_node(&format!("exit {launcher_exit}"));
+                let (code, lines) = fx.run(&tasks, "weekly");
+                let ctx = format!("launcher exit {launcher_exit}");
+                assert_eq!(code, runner_exit, "{ctx}");
+                let (_, rec) = only_export(&fx);
+                assert_launched(&rec);
+                assert_eq!(rec["status"], status, "{ctx}");
+                assert_eq!(
+                    rec["safeErrorCode"],
+                    safe.map_or(Value::Null, Value::from),
+                    "{ctx}"
+                );
+                assert_eq!(
+                    rec["exitCode"],
+                    exit_code.map_or(Value::Null, Value::from),
+                    "{ctx}"
+                );
+                // No outcome line was printed: no model, no digest.
+                for k in ["requestedModel", "effectiveModel", "effectivePolicyDigest"] {
+                    assert_eq!(rec[k], Value::Null, "{ctx}: {k}");
+                }
+                assert!(lines[0].starts_with("cc-loadout-collector attempt_started "));
+                assert!(lines.last().unwrap().contains("attempt_recorded"), "{ctx}");
+            }
+        }
+
+        #[test]
+        fn after_a_failed_start_only_the_requested_model_is_believed() {
+            // Exit 8 with a complete outcome line: the effective model and the
+            // policy digest are dropped, the requested model stays.
+            let (fx, tasks) = live_fx();
+            fx.write_node(&format!("{}\nexit 8", print_outcome()));
+            assert_eq!(fx.run(&tasks, "weekly").0, 1);
+            let (_, rec) = only_export(&fx);
+            assert_eq!(rec["status"], "launch_failed");
+            assert_eq!(rec["safeErrorCode"], "preflight_failed");
+            assert_eq!(rec["exitCode"], Value::Null);
+            assert_eq!(rec["requestedModel"], "m1");
+            assert_eq!(rec["effectiveModel"], Value::Null);
+            assert_eq!(rec["effectivePolicyDigest"], Value::Null);
+        }
+
+        #[test]
+        fn a_launcher_ended_by_a_signal_is_an_exited_error_without_an_exit_code() {
+            let (fx, tasks) = live_fx();
+            fx.write_node("kill -KILL $$");
+            let (code, _) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 1);
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "exited_error");
+            assert_eq!(rec["safeErrorCode"], Value::Null);
+            assert_eq!(rec["exitCode"], Value::Null);
+        }
+
+        #[test]
+        fn stdout_that_is_not_one_valid_outcome_line_gives_no_models() {
+            let cases: [(&str, String); 3] = [
+                ("garbage", "echo 'not json'".to_string()),
+                (
+                    "the line plus more output",
+                    format!("{}\necho 'and more'", print_outcome()),
+                ),
+                (
+                    // The line is there but the output is over the 4096 byte cap.
+                    "an oversized output",
+                    format!("{}\nhead -c 8000 /dev/zero | tr '\\0' x", print_outcome()),
+                ),
+            ];
+            for (name, script) in cases {
+                let (fx, tasks) = live_fx();
+                fx.write_node(&format!("{script}\nexit 0"));
+                assert_eq!(fx.run(&tasks, "weekly").0, 0, "{name}");
+                let (_, rec) = only_export(&fx);
+                assert_eq!(rec["status"], "exited_ok", "{name}");
+                for k in ["requestedModel", "effectiveModel", "effectivePolicyDigest"] {
+                    assert_eq!(rec[k], Value::Null, "{name}: {k}");
+                }
+            }
+        }
+
+        #[test]
+        fn a_megabyte_of_output_does_not_stall_the_launcher_or_reach_the_record() {
+            let (fx, tasks) = live_fx();
+            fx.write_node("head -c 1048576 /dev/zero\nhead -c 1048576 /dev/zero >&2\nexit 0");
+            let (code, lines) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 0);
+            let (_, rec) = only_export(&fx);
+            assert_eq!(rec["status"], "exited_ok");
+            // Two zero-filled "lines" of stderr are counted, never printed.
+            assert!(
+                lines.iter().any(|l| l.contains("launcher_stderr_dropped")),
+                "{lines:?}"
+            );
+            let body =
+                std::fs::read_to_string(fx.export_dir.join(export_file_name(&attempt_of(&rec), 1)))
+                    .unwrap();
+            assert!(body.len() < 1024, "{} bytes", body.len());
+        }
+
+        #[test]
+        fn a_missing_launcher_program_is_spawn_enoent_with_a_session_and_times() {
+            let (fx, tasks) = live_fx();
+            // No `node` written: the program does not exist.
+            let (code, lines) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 1);
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "launch_failed");
+            assert_eq!(rec["safeErrorCode"], "spawn_enoent");
+            assert_eq!(rec["exitCode"], Value::Null);
+            // Nothing ran, so the instant it was tried is both its start and end.
+            assert_eq!(rec["startedAt"], rec["endedAt"]);
+            // No process was started, so there is no "started" line either.
+            assert_eq!(
+                lines,
+                [format!(
+                    "cc-loadout-collector attempt_recorded attempt={} status=launch_failed safe_error=spawn_enoent",
+                    attempt_of(&rec)
+                )]
+            );
+        }
+
+        #[test]
+        fn a_missing_geralt_checkout_is_also_spawn_enoent() {
+            // The working directory is part of starting the launcher: the OS
+            // reports it with the same error as a missing program.
+            let (fx, tasks) = live_fx();
+            fx.write_node("exit 0");
+            let mut tasks = tasks;
+            tasks.collector.as_mut().unwrap().geralt_repo = fx.root().join("no-such-repo");
+            assert_eq!(fx.run(&tasks, "weekly").0, 1);
+            let (_, rec) = only_export(&fx);
+            assert_eq!(rec["status"], "launch_failed");
+            assert_eq!(rec["safeErrorCode"], "spawn_enoent");
+        }
+
+        #[test]
+        fn a_launcher_program_that_cannot_run_is_spawn_failed() {
+            use std::os::unix::fs::PermissionsExt;
+            let (fx, tasks) = live_fx();
+            let node = fx.write_node("exit 0");
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o644)).unwrap();
+            // With no execute bit at all even root cannot run it.
+            let (code, _) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 1);
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "launch_failed");
+            assert_eq!(rec["safeErrorCode"], "spawn_failed");
+            assert_eq!(rec["exitCode"], Value::Null);
+        }
+
+        #[test]
+        fn stderr_that_is_not_forwarded_is_counted_in_the_runner_log() {
+            let (fx, tasks) = live_fx();
+            fx.write_node("echo noise-1 >&2\necho noise-2 >&2\necho noise-3 >&2\nexit 0");
+            let (code, lines) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 0);
+            let attempt = attempt_of(&only_export(&fx).1);
+            assert_eq!(
+                lines,
+                [
+                    format!("cc-loadout-collector attempt_started attempt={attempt}"),
+                    format!(
+                        "cc-loadout-collector launcher_stderr_dropped attempt={attempt} lines=3"
+                    ),
+                    format!(
+                        "cc-loadout-collector attempt_recorded attempt={attempt} status=exited_ok safe_error=none"
+                    ),
+                ]
+            );
+            assert!(lines.iter().all(|l| !l.contains("noise")));
+        }
+
+        #[test]
+        fn an_isolated_account_gets_its_config_dir_and_its_rotated_credentials_are_kept() {
+            let fx = Fx::new();
+            fx.write_state(Some("other"), &["work", "other"]);
+            fx.store.ensure_account_dir("work").unwrap();
+            let before =
+                serde_json::json!({"claudeAiOauth":{"accessToken":"A","refreshToken":"R"}});
+            creds::write_credentials(&fx.store.credentials_snapshot("work"), &before).unwrap();
+            std::fs::create_dir_all(&fx.live_plugins).unwrap();
+            let dump = fx.root().join("dump");
+            fx.write_node(&format!(
+                "{}\nprintf '%s' '{{\"claudeAiOauth\":{{\"accessToken\":\"ROTATED\",\"refreshToken\":\"NEW\"}}}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"",
+                dump_to(&dump)
+            ));
+            let tasks = fx.tasks(vec![("weekly", collector_def("work"))]);
+
+            let (code, _) = fx.run(&tasks, "weekly");
+            assert_eq!(code, 0);
+            assert_eq!(only_export(&fx).1["status"], "exited_ok");
+
+            let cfg = fx.store.account_dir("work").join("run").join("cfg");
+            let dumped = std::fs::read_to_string(&dump).unwrap();
+            assert_eq!(
+                dumped.lines().last().unwrap(),
+                format!("cfg={}", cfg.display())
+            );
+            let after = creds::read_credentials(&fx.store.credentials_snapshot("work")).unwrap();
+            assert_eq!(after["claudeAiOauth"]["accessToken"], "ROTATED");
+            assert_eq!(after["claudeAiOauth"]["refreshToken"], "NEW");
+        }
+
+        #[test]
+        fn rotated_credentials_are_kept_even_when_the_launcher_fails() {
+            let fx = Fx::new();
+            fx.write_state(Some("other"), &["work", "other"]);
+            fx.store.ensure_account_dir("work").unwrap();
+            let before =
+                serde_json::json!({"claudeAiOauth":{"accessToken":"A","refreshToken":"R"}});
+            creds::write_credentials(&fx.store.credentials_snapshot("work"), &before).unwrap();
+            std::fs::create_dir_all(&fx.live_plugins).unwrap();
+            fx.write_node(
+                "printf '%s' '{\"claudeAiOauth\":{\"accessToken\":\"ROTATED\",\"refreshToken\":\"NEW\"}}' > \"$CLAUDE_CONFIG_DIR/.credentials.json\"\nexit 22",
+            );
+            let tasks = fx.tasks(vec![("weekly", collector_def("work"))]);
+            assert_eq!(fx.run(&tasks, "weekly").0, 1);
+            assert_eq!(only_export(&fx).1["status"], "exited_error");
+            let after = creds::read_credentials(&fx.store.credentials_snapshot("work")).unwrap();
+            assert_eq!(after["claudeAiOauth"]["accessToken"], "ROTATED");
+        }
+
+        #[test]
+        fn a_launched_run_leaves_tasks_json_and_state_json_untouched() {
+            let (fx, tasks) = live_fx();
+            fx.write_node(&format!("{}\nexit 0", print_outcome()));
+            let tasks_file = config::tasks_path(&fx.data_root);
+            config::save(&tasks_file, &tasks).unwrap();
+            let tasks_before = std::fs::read(&tasks_file).unwrap();
+            let state_before = std::fs::read(fx.store.state_path()).unwrap();
+
+            assert_eq!(fx.run(&tasks, "weekly").0, 0);
+
+            assert_eq!(std::fs::read(&tasks_file).unwrap(), tasks_before);
+            assert_eq!(std::fs::read(fx.store.state_path()).unwrap(), state_before);
+        }
+
+        /// Kills the grandchild whose pid the stand-in wrote to `pid_file`, when
+        /// dropped, so a failing test leaves nothing running.
+        struct KillGrandchild(PathBuf);
+
+        impl Drop for KillGrandchild {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    let pid = pid.trim();
+                    if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) {
+                        let _ = std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("kill {pid}"))
+                            .status();
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_grandchild_holding_the_pipes_does_not_hold_the_run() {
+            let (fx, tasks) = live_fx();
+            let pid_file = fx.root().join("grandchild.pid");
+            let _cleanup = KillGrandchild(pid_file.clone());
+            // The launcher ends at once; the grandchild keeps both pipes open.
+            fx.write_node(&format!(
+                "sleep 20 &\necho $! > '{}'\nexit 0",
+                pid_file.display()
+            ));
+            let start = std::time::Instant::now();
+            let (code, _) = fx.run(&tasks, "weekly");
+            let took = start.elapsed();
+            assert_eq!(code, 0);
+            assert_eq!(only_export(&fx).1["status"], "exited_ok");
+            assert!(took < Duration::from_secs(10), "the run took {took:?}");
+        }
     }
 }

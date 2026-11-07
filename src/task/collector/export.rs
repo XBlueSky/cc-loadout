@@ -21,9 +21,6 @@ pub const MAX_EXPORT_RECORD_BYTES: usize = 16384;
 /// How the attempt ended. The closed list is Geralt's `EXECUTION_STATUSES`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-// `ExitedError`, `TimedOut` and `Killed` are chosen by the launcher-outcome
-// classification of Task 4; until then only the pre-launch path builds records.
-#[allow(dead_code)]
 pub enum Status {
     ExitedOk,
     ExitedError,
@@ -38,9 +35,6 @@ pub enum Status {
 /// code-to-status table lists, which the caller must respect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-// Every code but `LockBusy` is chosen by the launcher-outcome classification of
-// Task 4; until then only the pre-launch path builds records.
-#[allow(dead_code)]
 pub enum SafeErrorCode {
     AssembleFailed,
     AuthRequired,
@@ -121,7 +115,6 @@ pub fn new_attempt_id() -> String {
 
 /// `t` in UTC as `YYYY-MM-DDTHH:MM:SS.mmmZ`, sub-millisecond digits truncated:
 /// the shape of JavaScript's `Date#toISOString`. Meant for years 0000-9999.
-#[allow(dead_code)] // stamps the start and end of a launched attempt (Task 4)
 pub fn format_instant(t: OffsetDateTime) -> String {
     let t = t.to_offset(UtcOffset::UTC);
     format!(

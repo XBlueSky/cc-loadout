@@ -1036,7 +1036,6 @@ fn run() -> Result<()> {
                                 if task::collector::run::routes_to_collector(&tasks, &id) {
                                     let ctx = task::collector::run::RunCtx {
                                         store: &store,
-                                        data_root: &data_root,
                                         home: &home,
                                         live_plugins: &live_plugins,
                                     };
