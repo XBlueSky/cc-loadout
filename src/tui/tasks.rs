@@ -151,7 +151,7 @@ impl View for TasksView {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "  {:<20}{:<8}{:<14}{:<8}{:<18}{:<14}{}",
+                    "  {:<20}{:<12}{:<14}{:<8}{:<18}{:<14}{}",
                     "id", "kind", "account", "next", "times", "model", "status"
                 ),
                 theme::dim(),
@@ -166,6 +166,7 @@ impl View for TasksView {
                 let kind_str = match row.kind {
                     crate::task::config::Kind::Prime => "prime",
                     crate::task::config::Kind::Task => "task",
+                    crate::task::config::Kind::Collector => "collector",
                 };
                 let next_str = row.next_fire.map(hhmm).unwrap_or_else(|| "—".into());
                 let times_str = if row.times.is_empty() {
@@ -186,11 +187,12 @@ impl View for TasksView {
                     None => "—".to_string(),
                 };
                 let spans = vec![Span::styled(
-                    // The `kind` cell is `[xxxxx] ` = 8 chars, matching the
-                    // header's `{:<8}` column so every column to its right
-                    // (account/next/times/model/status) lines up with its label.
+                    // The `kind` cell is `[xxxxxxxxx] ` = 12 chars (wide enough for
+                    // `collector`), matching the header's `{:<12}` column so every
+                    // column to its right (account/next/times/model/status) lines
+                    // up with its label.
                     format!(
-                        "{:<20}[{kind_str:<5}] {:<14}{:<8}{:<18}{model_str:<14}{status_str}",
+                        "{:<20}[{kind_str:<9}] {:<14}{:<8}{:<18}{model_str:<14}{status_str}",
                         row.id, row.account, next_str, times_str,
                     ),
                     theme::text(),
@@ -263,7 +265,9 @@ mod tests {
                         crate::task::config::Kind::Prime => {
                             Some(crate::task::config::PING_MODEL.into())
                         }
-                        crate::task::config::Kind::Task => None,
+                        crate::task::config::Kind::Task | crate::task::config::Kind::Collector => {
+                            None
+                        }
                     },
                     id: id.into(),
                     kind,
@@ -360,6 +364,29 @@ mod tests {
             text.contains(crate::task::config::PING_MODEL),
             "prime row must show the model it runs on: {text:?}"
         );
+    }
+
+    #[test]
+    fn a_collector_row_shows_its_kind_and_no_model_and_keeps_the_columns_aligned() {
+        let s = snap_with(vec![
+            ("geralt-collect", crate::task::config::Kind::Collector),
+            ("weekly", crate::task::config::Kind::Task),
+        ]);
+        let text = rendered(&s);
+        let lines: Vec<String> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(110)
+            .map(|c| c.iter().collect())
+            .collect();
+        let header = lines.iter().find(|l| l.contains("account")).unwrap();
+        let collector = lines.iter().find(|l| l.contains("[collector]")).unwrap();
+        let task = lines.iter().find(|l| l.contains("[task     ]")).unwrap();
+        assert!(!collector.contains(crate::task::config::PING_MODEL));
+        // Char columns, not byte offsets: the highlight symbol `▸` is 3 bytes.
+        let col = |l: &str, needle: &str| l[..l.find(needle).unwrap()].chars().count();
+        assert_eq!(col(header, "account"), col(collector, "work"), "{text:?}");
+        assert_eq!(col(header, "account"), col(task, "work"), "{text:?}");
     }
 
     #[test]

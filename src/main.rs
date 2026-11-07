@@ -58,6 +58,11 @@ enum Command {
         #[command(subcommand)]
         action: Option<TaskAction>,
     },
+    /// collector slot — machine-wide settings for `kind: collector` tasks (Geralt's launcher)
+    Collector {
+        #[command(subcommand)]
+        action: CollectorAction,
+    },
     /// Hook entry points for the bundled plugin's shims (not for direct use)
     #[command(hide = true)]
     Hook {
@@ -97,6 +102,25 @@ enum TaskAction {
         /// Omit to inherit whatever the CLI resolves; primes default to haiku.
         #[arg(long, allow_hyphen_values = true)]
         model: Option<String>,
+        /// Make this a collector task: the run is handed to Geralt's launcher
+        /// (see `collector set`) instead of `claude -p`. Takes none of
+        /// --prompt/--cwd/--profile/--model; needs the three flags below.
+        #[arg(
+            long,
+            conflicts_with_all = ["prompt", "cwd", "profile", "model"],
+            requires_all = ["launcher_config", "wall_timeout_secs", "grace_ms"]
+        )]
+        collector: bool,
+        /// Absolute path of the launcher config (collector tasks only).
+        #[arg(long = "launcher-config", requires = "collector")]
+        launcher_config: Option<PathBuf>,
+        /// Hard wall-clock limit of one attempt, 1..=86400 seconds (collector tasks only).
+        #[arg(long = "wall-timeout-secs", requires = "collector")]
+        wall_timeout_secs: Option<u64>,
+        /// Time the launcher gets to wind down after the limit, 2500..=600000 ms
+        /// (collector tasks only).
+        #[arg(long = "grace-ms", requires = "collector")]
+        grace_ms: Option<u64>,
     },
     /// Remove a task
     Rm { id: String },
@@ -113,6 +137,31 @@ enum TaskAction {
     },
     /// Reopen the most recent session for a task
     Resume { id: String },
+}
+
+#[derive(Subcommand)]
+enum CollectorAction {
+    /// Save the machine-wide collector settings (replaces; touches no crontab)
+    Set {
+        /// Absolute path of the Node.js binary that runs the launcher
+        #[arg(long)]
+        node: PathBuf,
+        /// Absolute path of the Geralt checkout that holds the launcher
+        #[arg(long = "geralt-repo")]
+        geralt_repo: PathBuf,
+        /// Absolute path of the directory run records are exported to
+        #[arg(long = "export-dir")]
+        export_dir: PathBuf,
+        /// Identifies this runner in every exported record
+        #[arg(long = "runner-instance-id")]
+        runner_instance_id: String,
+    },
+    /// Show the saved collector settings
+    Show {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -810,6 +859,7 @@ fn run() -> Result<()> {
                                 cwd: None,
                                 profile: None,
                                 model: None,
+                                collector: None,
                                 last_session_id: None,
                                 last_config_dir: None,
                                 last_run: None,
@@ -907,12 +957,38 @@ fn run() -> Result<()> {
                             cwd,
                             profile,
                             model,
+                            collector,
+                            launcher_config,
+                            wall_timeout_secs,
+                            grace_ms,
                         } => {
                             let parsed = crate::task::config::parse_times(&times.join(","))?;
-                            let kind = if prompt.is_some() {
-                                task::config::Kind::Task
+                            // collector > prompt → task > prime. clap already
+                            // guarantees the three collector flags come together with
+                            // `--collector` and never with prompt/cwd/profile/model.
+                            let (kind, collector) = if collector {
+                                let (
+                                    Some(launcher_config),
+                                    Some(wall_timeout_secs),
+                                    Some(grace_ms),
+                                ) = (launcher_config, wall_timeout_secs, grace_ms)
+                                else {
+                                    anyhow::bail!(
+                                        "--collector needs --launcher-config, --wall-timeout-secs and --grace-ms"
+                                    );
+                                };
+                                (
+                                    task::config::Kind::Collector,
+                                    Some(task::config::CollectorTask {
+                                        launcher_config,
+                                        wall_timeout_secs,
+                                        grace_ms,
+                                    }),
+                                )
+                            } else if prompt.is_some() {
+                                (task::config::Kind::Task, None)
                             } else {
-                                task::config::Kind::Prime
+                                (task::config::Kind::Prime, None)
                             };
                             let def = task::config::TaskDef {
                                 kind,
@@ -922,6 +998,7 @@ fn run() -> Result<()> {
                                 cwd,
                                 profile,
                                 model,
+                                collector,
                                 last_session_id: None,
                                 last_config_dir: None,
                                 last_run: None,
@@ -991,6 +1068,45 @@ fn run() -> Result<()> {
                             "task",
                             "Use: cc-loadout task add <id> --account <a> --at <HH:MM…> --prompt <p> --cwd <dir>.",
                         )?;
+                    }
+                }
+            },
+            Command::Collector { action } => match action {
+                CollectorAction::Set {
+                    node,
+                    geralt_repo,
+                    export_dir,
+                    runner_instance_id,
+                } => {
+                    task::ops::set_collector_settings(
+                        &data_root,
+                        task::config::CollectorSettings {
+                            node,
+                            geralt_repo,
+                            export_dir,
+                            runner_instance_id,
+                        },
+                    )?;
+                    println!("collector settings saved");
+                }
+                CollectorAction::Show { json } => {
+                    let settings = task::ops::load_collector_settings(&data_root)?;
+                    if json {
+                        #[derive(serde::Serialize)]
+                        struct Shown<'a> {
+                            collector: Option<&'a task::config::CollectorSettings>,
+                        }
+                        json::emit(&Shown {
+                            collector: settings.as_ref(),
+                        })?;
+                    } else if let Some(c) = settings {
+                        println!("collector:");
+                        println!("  node: {}", c.node.display());
+                        println!("  geralt_repo: {}", c.geralt_repo.display());
+                        println!("  export_dir: {}", c.export_dir.display());
+                        println!("  runner_instance_id: {}", c.runner_instance_id);
+                    } else {
+                        println!("collector: not configured");
                     }
                 }
             },
