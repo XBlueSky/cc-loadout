@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::account::cron::{self, render_tasks_block};
 use crate::account::crontab;
 use crate::account::store::Store;
-use crate::task::config::{self, Kind, TaskDef, Tasks};
+use crate::task::config::{self, CollectorSettings, Kind, TaskDef, Tasks};
 
 /// Everything needed to (re)generate the managed cron block.
 pub struct CronContext {
@@ -91,6 +91,14 @@ pub fn add(
 ) -> Result<()> {
     crate::account::validate_alias(id)?;
     def.validate()?;
+    // A collector's id is also its `taskId` in every exported record, so it must
+    // fit the stricter collector grammar, not just the alias one.
+    if def.kind == Kind::Collector && !config::is_collector_id(id) {
+        bail!(
+            "invalid collector task id '{id}': expected 1-200 characters of letters, \
+             digits, '_', '.', ':' or '-', starting with a letter or digit"
+        );
+    }
     if !store.load_state()?.accounts.contains_key(&def.account) {
         bail!("unknown account '{}'", def.account);
     }
@@ -109,6 +117,22 @@ pub fn add(
     // schedule, so a failed install can never leave a phantom schedule the UI shows.
     apply_cron(crontab_bin, &tasks, data_root, home)?;
     config::save(&path, &tasks)
+}
+
+/// Save the machine-wide collector settings into `tasks.json`, replacing any
+/// earlier ones. Like every other `tasks.json` write here it takes no lock, and
+/// it touches no crontab: the settings schedule nothing by themselves.
+pub fn set_collector_settings(data_root: &Path, settings: CollectorSettings) -> Result<()> {
+    settings.validate()?;
+    let path = config::tasks_path(data_root);
+    let mut tasks = config::load(&path)?;
+    tasks.collector = Some(settings);
+    config::save(&path, &tasks)
+}
+
+/// The saved collector settings, or `None` when `collector set` was never run.
+pub fn load_collector_settings(data_root: &Path) -> Result<Option<CollectorSettings>> {
+    Ok(config::load(&config::tasks_path(data_root))?.collector)
 }
 
 /// Remove task `id`; persist; regenerate cron.
@@ -210,6 +234,7 @@ pub fn write_prime_schedule(
                 cwd: None,
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -383,6 +408,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -394,6 +420,118 @@ mod tests {
         let tab = std::fs::read_to_string(&storef).unwrap();
         assert!(tab.contains("0 0 * * * backup.sh"), "foreign job preserved");
         assert!(tab.contains("task run weekly --quiet"));
+    }
+
+    fn collector_def() -> TaskDef {
+        TaskDef {
+            kind: Kind::Collector,
+            account: "work".into(),
+            times: vec!["07:00".into()],
+            prompt: None,
+            cwd: None,
+            profile: None,
+            model: None,
+            collector: Some(config::CollectorTask {
+                launcher_config: std::path::PathBuf::from("/etc/geralt/launcher.json"),
+                wall_timeout_secs: 3600,
+                grace_ms: 5000,
+            }),
+            last_session_id: None,
+            last_config_dir: None,
+            last_run: None,
+            last_status: None,
+        }
+    }
+
+    #[test]
+    fn add_collector_validates_the_id_and_installs_the_cron_line() {
+        let bin = tempfile::tempdir().unwrap();
+        let storef = bin.path().join("tab");
+        let crontab = fake_crontab(bin.path(), &storef);
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::new(data.path());
+        let mut st = store.load_state().unwrap();
+        st.accounts.insert(
+            "work".into(),
+            AccountMeta {
+                email: "a@b".into(),
+                ..Default::default()
+            },
+        );
+        store.save_state(&st).unwrap();
+
+        // Fine as an alias, but not a collector id: the first character.
+        for bad in ["_collect", ".collect", "-collect"] {
+            let err = add(
+                &crontab,
+                &store,
+                data.path(),
+                home.path(),
+                bad,
+                collector_def(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("collector task id"), "{bad}: {err}");
+        }
+        assert!(!config::tasks_path(data.path()).exists());
+        assert!(!storef.exists(), "a rejected id must not touch the crontab");
+
+        add(
+            &crontab,
+            &store,
+            data.path(),
+            home.path(),
+            "geralt-collect",
+            collector_def(),
+        )
+        .unwrap();
+        let tab = std::fs::read_to_string(&storef).unwrap();
+        assert!(tab.contains("task run geralt-collect --quiet"), "{tab}");
+        let saved = config::load(&config::tasks_path(data.path())).unwrap();
+        assert_eq!(saved.version, 2);
+        assert_eq!(saved.tasks["geralt-collect"].kind, Kind::Collector);
+
+        // A prime or task keeps the looser alias grammar.
+        let mut task = collector_def();
+        task.kind = Kind::Prime;
+        task.collector = None;
+        add(&crontab, &store, data.path(), home.path(), "_p", task).unwrap();
+    }
+
+    #[test]
+    fn set_collector_settings_validates_replaces_and_keeps_the_rest() {
+        let data = tempfile::tempdir().unwrap();
+        let settings = |id: &str| CollectorSettings {
+            node: std::path::PathBuf::from("/usr/bin/node"),
+            geralt_repo: std::path::PathBuf::from("/srv/geralt"),
+            export_dir: std::path::PathBuf::from("/var/lib/geralt/export"),
+            runner_instance_id: id.into(),
+        };
+        assert_eq!(load_collector_settings(data.path()).unwrap(), None);
+
+        // An existing prime and a maintenance sweep must survive a `collector set`.
+        let mut tasks = Tasks::default();
+        tasks.maintenance.enabled = true;
+        tasks.maintenance.times = vec!["04:00".into()];
+        let mut prime = collector_def();
+        prime.kind = Kind::Prime;
+        prime.collector = None;
+        tasks.tasks.insert("work".into(), prime);
+        config::save(&config::tasks_path(data.path()), &tasks).unwrap();
+
+        let err = set_collector_settings(data.path(), settings("has space")).unwrap_err();
+        assert!(err.to_string().contains("runner_instance_id"), "{err}");
+        assert_eq!(load_collector_settings(data.path()).unwrap(), None);
+
+        set_collector_settings(data.path(), settings("runner-1")).unwrap();
+        set_collector_settings(data.path(), settings("runner-2")).unwrap();
+        let saved = config::load(&config::tasks_path(data.path())).unwrap();
+        assert_eq!(saved.version, 2);
+        assert_eq!(saved.collector, Some(settings("runner-2")));
+        assert!(saved.tasks.contains_key("work"));
+        assert!(saved.maintenance.enabled);
     }
 
     #[test]
@@ -429,6 +567,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -475,6 +614,7 @@ mod tests {
                 cwd: None,
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -491,6 +631,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -536,6 +677,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/c")),
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -571,6 +713,7 @@ mod tests {
                 cwd: None,
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -618,6 +761,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/tmp")),
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -641,6 +785,7 @@ mod tests {
                 cwd: None,
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,
@@ -688,6 +833,7 @@ mod tests {
                 cwd: Some(std::path::PathBuf::from("/tmp")),
                 profile: None,
                 model: None,
+                collector: None,
                 last_session_id: None,
                 last_config_dir: None,
                 last_run: None,

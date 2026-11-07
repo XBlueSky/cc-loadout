@@ -1,76 +1,8 @@
-use assert_cmd::Command;
+mod common;
+
+use common::{cmd, fake_crontab_path, write_login};
 use predicates::prelude::*;
 use std::path::Path;
-
-fn write_login(home: &Path, email: &str) {
-    std::fs::create_dir_all(home.join(".claude")).unwrap();
-    std::fs::write(
-        home.join(".claude").join(".credentials.json"),
-        format!(r#"{{"claudeAiOauth":{{"accessToken":"tok-{email}"}}}}"#),
-    )
-    .unwrap();
-    std::fs::write(
-        home.join(".claude.json"),
-        format!(r#"{{"oauthAccount":{{"emailAddress":"{email}"}}}}"#),
-    )
-    .unwrap();
-}
-
-/// The ONLY constructor for the cc-loadout binary under test. It pins HOME and
-/// XDG_DATA_HOME to throwaway temp dirs and removes CLAUDE_CONFIG_DIR, so no test
-/// (and no `claude` subprocess it might spawn) can ever read or write the
-/// developer's real ~/.claude config. It ALSO puts a file-backed fake `crontab`
-/// first on PATH, so no test can splice the developer's real user crontab — even one
-/// that forgets to patch PATH itself (the gap that once wiped a live prime schedule).
-/// It ALSO removes CC_LOADOUT_PROFILES (profiles_path() prefers it over $HOME, so a
-/// value leaking in from the ambient shell would redirect profiles.json reads/writes
-/// out of the sandbox) and CLAUDE_CODE_SESSION_ID (`cargo test` run from a Claude
-/// Code Bash tool inherits the live session's id, which would let an on-demand test
-/// pass on the ambient value instead of the one it sets). Do NOT call
-/// `Command::cargo_bin("cc-loadout")` directly anywhere in this file — always go
-/// through `cmd()` and chain extra `.env(...)` / `.current_dir(...)` as needed. A
-/// test that must inspect the table overrides PATH with its own
-/// `fake_crontab_path(dir)` and reads that dir's `tab`. A test that wants
-/// CC_LOADOUT_PROFILES or CLAUDE_CODE_SESSION_ID set does so explicitly after
-/// construction — `.env()` after `.env_remove()` still wins.
-fn cmd(home: &Path, data: &Path) -> Command {
-    let mut c = Command::cargo_bin("cc-loadout").unwrap();
-    // Default crontab isolation. The fake bin lives under the caller-owned `data`
-    // temp dir (test lifetime) so it outlives the spawned command; a tempdir created
-    // here would be dropped on return, leaving PATH pointing at a deleted directory.
-    let fakebin = data.join(".fakebin");
-    std::fs::create_dir_all(&fakebin).unwrap();
-    let fake_path = fake_crontab_path(&fakebin);
-    c.env("HOME", home)
-        .env("XDG_DATA_HOME", data)
-        .env("PATH", fake_path)
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CC_LOADOUT_PROFILES")
-        .env_remove("CLAUDE_CODE_SESSION_ID");
-    c
-}
-
-/// Install a file-backed fake `crontab` in `bin_dir` and return the PATH string to
-/// hand the command (fake dir first). Unlike a `>/dev/null` stub, this persists the
-/// table to `bin_dir/tab`, so the binary's write-then-read-back verification (which
-/// guards against a `crontab` that silently swallows writes) round-trips instead of
-/// failing — while still never touching the developer's real user crontab.
-fn fake_crontab_path(bin_dir: &Path) -> String {
-    use std::os::unix::fs::PermissionsExt;
-    let store = bin_dir.join("tab");
-    let script = format!(
-        "#!/bin/sh\nSTORE='{s}'\nif [ \"$1\" = '-l' ]; then [ -f \"$STORE\" ] && cat \"$STORE\" || exit 1; elif [ \"$1\" = '-' ]; then cat > \"$STORE\"; else exit 2; fi\n",
-        s = store.display()
-    );
-    let bin = bin_dir.join("crontab");
-    std::fs::write(&bin, script).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    format!(
-        "{}:{}",
-        bin_dir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
 
 #[test]
 fn full_account_cycle() {
@@ -1055,6 +987,386 @@ fn task_list_shows_that_a_prime_runs_on_the_cheap_model() {
         .assert()
         .success()
         .stdout(predicate::str::contains("model=haiku"));
+}
+
+/// Flags of a valid `task add --collector` call (everything after the id).
+fn collector_add_args(launcher_config: &str) -> Vec<&str> {
+    vec![
+        "--account",
+        "work",
+        "--at",
+        "07:00",
+        "--collector",
+        "--launcher-config",
+        launcher_config,
+        "--wall-timeout-secs",
+        "3600",
+        "--grace-ms",
+        "5000",
+    ]
+}
+
+fn read_tasks_json(data: &Path) -> serde_json::Value {
+    let raw = std::fs::read(data.join("cc-loadout").join("tasks.json"))
+        .expect("tasks.json should have been written");
+    serde_json::from_slice(&raw).unwrap()
+}
+
+/// Account `work` snapshotted into the sandbox, so `task add` can validate it.
+fn sandbox_with_work_account(home: &Path, data: &Path) {
+    write_login(home, "work@x");
+    cmd(home, data)
+        .args(["account", "add", "work"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn collector_set_then_show_json_round_trips() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+
+    cmd(home, data)
+        .args([
+            "collector",
+            "set",
+            "--node",
+            "/usr/bin/node",
+            "--geralt-repo",
+            "/srv/geralt",
+            "--export-dir",
+            "/var/lib/geralt/export",
+            "--runner-instance-id",
+            "runner-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("collector settings saved"));
+
+    let out = cmd(home, data)
+        .args(["collector", "show", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["collector"]["node"], "/usr/bin/node");
+    assert_eq!(v["collector"]["geralt_repo"], "/srv/geralt");
+    assert_eq!(v["collector"]["export_dir"], "/var/lib/geralt/export");
+    assert_eq!(v["collector"]["runner_instance_id"], "runner-1");
+
+    cmd(home, data)
+        .args(["collector", "show"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("node: /usr/bin/node")
+                .and(predicate::str::contains("runner_instance_id: runner-1")),
+        );
+
+    // The settings alone bump the file to schema version 2 and schedule nothing.
+    let tasks = read_tasks_json(data);
+    assert_eq!(tasks["version"], 2);
+    assert!(
+        !data.join(".fakebin").join("tab").exists(),
+        "collector set must not write a crontab"
+    );
+}
+
+#[test]
+fn collector_show_without_settings_says_so() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+
+    cmd(home, data)
+        .args(["collector", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("collector: not configured"));
+    let out = cmd(home, data)
+        .args(["collector", "show", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert!(v["collector"].is_null());
+    assert!(!data.join("cc-loadout").join("tasks.json").exists());
+}
+
+#[test]
+fn collector_set_rejects_relative_path() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+
+    for (node, repo, export) in [
+        ("node", "/srv/geralt", "/var/lib/geralt/export"),
+        ("/usr/bin/node", "geralt", "/var/lib/geralt/export"),
+        ("/usr/bin/node", "/srv/geralt", "export"),
+    ] {
+        cmd(home, data)
+            .args([
+                "collector",
+                "set",
+                "--node",
+                node,
+                "--geralt-repo",
+                repo,
+                "--export-dir",
+                export,
+                "--runner-instance-id",
+                "runner-1",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("absolute"));
+        assert!(
+            !data.join("cc-loadout").join("tasks.json").exists(),
+            "a rejected set must not create tasks.json"
+        );
+    }
+}
+
+#[test]
+fn collector_set_rejects_a_bad_runner_instance_id_and_leaves_tasks_json_alone() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    let set = |id: &str| {
+        let mut c = cmd(home, data);
+        c.args([
+            "collector",
+            "set",
+            "--node",
+            "/usr/bin/node",
+            "--geralt-repo",
+            "/srv/geralt",
+            "--export-dir",
+            "/var/lib/geralt/export",
+            "--runner-instance-id",
+            id,
+        ]);
+        c
+    };
+    set("runner-1").assert().success();
+    let before = std::fs::read(data.join("cc-loadout").join("tasks.json")).unwrap();
+    set("has space")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("runner_instance_id"));
+    assert_eq!(
+        std::fs::read(data.join("cc-loadout").join("tasks.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn task_add_collector_writes_kind_collector_and_cron_line() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    sandbox_with_work_account(home, data);
+
+    let mut args = vec!["task", "add", "geralt-collect"];
+    args.extend(collector_add_args("/etc/geralt/launcher.json"));
+    cmd(home, data)
+        .args(&args)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("added task 'geralt-collect'"));
+
+    let tab = std::fs::read_to_string(data.join(".fakebin").join("tab"))
+        .expect("task add must land on the fake crontab");
+    assert!(tab.contains("task run geralt-collect --quiet"), "{tab}");
+
+    let tasks = read_tasks_json(data);
+    assert_eq!(tasks["version"], 2);
+    let t = &tasks["tasks"]["geralt-collect"];
+    assert_eq!(t["kind"], "collector");
+    assert_eq!(t["account"], "work");
+    assert_eq!(
+        t["collector"]["launcher_config"],
+        "/etc/geralt/launcher.json"
+    );
+    assert_eq!(t["collector"]["wall_timeout_secs"], 3600);
+    assert_eq!(t["collector"]["grace_ms"], 5000);
+    assert!(t.get("prompt").is_none(), "{t}");
+    assert!(t.get("cwd").is_none(), "{t}");
+}
+
+#[test]
+fn task_add_collector_conflicts_with_prompt() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    sandbox_with_work_account(home, data);
+
+    for (flag, value) in [
+        ("--prompt", "hi"),
+        ("--cwd", "/tmp"),
+        ("--profile", "cortex"),
+        ("--model", "haiku"),
+    ] {
+        let mut args = vec!["task", "add", "geralt-collect"];
+        args.extend(collector_add_args("/etc/geralt/launcher.json"));
+        args.extend([flag, value]);
+        cmd(home, data)
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("cannot be used with"));
+    }
+    assert!(!data.join("cc-loadout").join("tasks.json").exists());
+    assert!(!data.join(".fakebin").join("tab").exists());
+}
+
+#[test]
+fn task_add_collector_requires_grace() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    sandbox_with_work_account(home, data);
+
+    cmd(home, data)
+        .args([
+            "task",
+            "add",
+            "geralt-collect",
+            "--account",
+            "work",
+            "--at",
+            "07:00",
+            "--collector",
+            "--launcher-config",
+            "/etc/geralt/launcher.json",
+            "--wall-timeout-secs",
+            "3600",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--grace-ms"));
+    assert!(!data.join("cc-loadout").join("tasks.json").exists());
+}
+
+#[test]
+fn task_add_collector_flags_without_collector_are_rejected() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    sandbox_with_work_account(home, data);
+
+    cmd(home, data)
+        .args([
+            "task",
+            "add",
+            "weekly",
+            "--account",
+            "work",
+            "--at",
+            "07:00",
+            "--prompt",
+            "hi",
+            "--cwd",
+            "/tmp",
+            "--grace-ms",
+            "5000",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--collector"));
+}
+
+#[test]
+fn task_add_collector_rejects_out_of_range_values_and_a_bad_id() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    sandbox_with_work_account(home, data);
+
+    let mut low_grace = vec!["task", "add", "geralt-collect"];
+    low_grace.extend(collector_add_args("/etc/geralt/launcher.json"));
+    let grace_at = low_grace.iter().position(|a| *a == "5000").unwrap();
+    low_grace[grace_at] = "2499";
+    cmd(home, data)
+        .args(&low_grace)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("grace_ms"));
+
+    let mut relative = vec!["task", "add", "geralt-collect"];
+    relative.extend(collector_add_args("launcher.json"));
+    cmd(home, data)
+        .args(&relative)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("launcher_config"));
+
+    let mut bad_id = vec!["task", "add", "_collect"];
+    bad_id.extend(collector_add_args("/etc/geralt/launcher.json"));
+    cmd(home, data)
+        .args(&bad_id)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("collector task id"));
+
+    assert!(!data.join("cc-loadout").join("tasks.json").exists());
+    assert!(!data.join(".fakebin").join("tab").exists());
+}
+
+#[test]
+fn task_resume_collector_is_rejected() {
+    let hdir = tempfile::tempdir().unwrap();
+    let ddir = tempfile::tempdir().unwrap();
+    let (home, data) = (hdir.path(), ddir.path());
+    sandbox_with_work_account(home, data);
+
+    let mut args = vec!["task", "add", "geralt-collect"];
+    args.extend(collector_add_args("/etc/geralt/launcher.json"));
+    cmd(home, data).args(&args).assert().success();
+
+    // Even a recorded session id (written by hand: nothing in cc-loadout records
+    // one for a collector) must not make it resumable.
+    let path = data.join("cc-loadout").join("tasks.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["tasks"]["geralt-collect"]["last_session_id"] = serde_json::json!("dead-beef");
+    std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+
+    // `task resume` ends in `exec claude --resume`. The real `claude` must never be
+    // reachable from a test, so PATH is rebuilt from a fake one that only leaves a
+    // marker; a missing guard would then show up as the marker, not as a model call.
+    let fake_claude_dir = data.join("fake-claude-bin");
+    let marker = data.join("claude-was-run");
+    std::fs::create_dir_all(&fake_claude_dir).unwrap();
+    let fake_claude = fake_claude_dir.join("claude");
+    std::fs::write(
+        &fake_claude,
+        format!("#!/bin/sh\necho run > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let sandbox_path = format!(
+        "{}:{}:/usr/bin:/bin",
+        fake_claude_dir.display(),
+        data.join(".fakebin").display()
+    );
+
+    cmd(home, data)
+        .env("PATH", &sandbox_path)
+        .args(["task", "resume", "geralt-collect"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "collector tasks cannot be resumed",
+        ));
+    assert!(!marker.exists(), "resume must not reach claude at all");
 }
 
 #[test]

@@ -1,11 +1,16 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
 use crate::account::store::Store;
-use crate::task::config::{self, TaskDef};
+use crate::task::config::{self, Kind, TaskDef};
 
 /// Resolve `(config_dir, session_id, cwd)` for the most recent run of a task.
 pub(crate) fn resume_argv(def: &TaskDef) -> Result<(Option<PathBuf>, String, PathBuf)> {
+    // A collector run is Geralt's launcher driving its own Claude process; there
+    // is no cc-loadout session to reopen, whatever `last_session_id` says.
+    if def.kind == Kind::Collector {
+        bail!("collector tasks cannot be resumed");
+    }
     let sid = def
         .last_session_id
         .clone()
@@ -49,6 +54,7 @@ mod tests {
             cwd: Some(PathBuf::from("/c")),
             profile: None,
             model: None,
+            collector: None,
             last_session_id: Some("dead-beef".into()),
             last_config_dir: Some(PathBuf::from("/data/accounts/work/run/cfg")),
             last_run: Some(1700),
@@ -65,6 +71,23 @@ mod tests {
             Some(std::path::Path::new("/data/accounts/work/run/cfg"))
         );
         assert_eq!(cwd, std::path::PathBuf::from("/c"));
+    }
+
+    #[test]
+    fn collector_task_resume_is_rejected_even_with_a_session_id() {
+        use crate::task::config::CollectorTask;
+        let mut d = def_with_session();
+        d.kind = Kind::Collector;
+        d.prompt = None;
+        d.cwd = None;
+        d.collector = Some(CollectorTask {
+            launcher_config: PathBuf::from("/etc/geralt/launcher.json"),
+            wall_timeout_secs: 3600,
+            grace_ms: 5000,
+        });
+        assert!(d.last_session_id.is_some());
+        let msg = resume_argv(&d).unwrap_err().to_string();
+        assert!(msg.contains("cannot be resumed"), "{msg}");
     }
 
     #[test]
