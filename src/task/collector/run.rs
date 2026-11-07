@@ -626,11 +626,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     impl ProcOps for GhostTree {
-        fn descendants(&self) -> Vec<crate::task::collector::tree::ProcRef> {
-            vec![crate::task::collector::tree::ProcRef {
+        fn descendants(&self) -> std::io::Result<Vec<crate::task::collector::tree::ProcRef>> {
+            Ok(vec![crate::task::collector::tree::ProcRef {
                 pid: i32::MAX,
                 start_time: 0,
-            }]
+            }])
         }
         fn signal(&self, _: crate::task::collector::tree::ProcRef, _: crate::util::Sig) {}
         fn signal_group(&self, _: i32, _: crate::util::Sig) {}
@@ -1580,6 +1580,22 @@ mod tests {
 
         #[test]
         fn a_launcher_past_its_wall_timeout_is_timed_out_and_its_group_stopped() {
+            // Under load the wall can run out before the shell has written its
+            // child's pid, or between creating the file and writing it. Such an
+            // attempt still has to be a correct timed-out record, but says
+            // nothing about the child, so it is retried; one attempt that names
+            // its child is required.
+            for _ in 0..5 {
+                if wall_timeout_attempt() {
+                    return;
+                }
+            }
+            panic!("no attempt wrote its child's pid before the wall ran out");
+        }
+
+        /// One timed-out attempt; true if it named its child, which must then be
+        /// gone with the launcher's group.
+        fn wall_timeout_attempt() -> bool {
             let (fx, tasks) = live_fx();
             let pid_file = fx.root().join("child.pid");
             let _cleanup = KillGrandchild(pid_file.clone());
@@ -1607,13 +1623,19 @@ mod tests {
             assert!(took >= Duration::from_millis(300), "took {took:?}");
             assert!(took < Duration::from_secs(5), "took {took:?}");
             assert!(lines.last().unwrap().contains("status=timed_out"));
+
+            let pid = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            let pid = pid.trim();
+            if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
             // The child was in the launcher's group and went with it.
-            let pid = std::fs::read_to_string(&pid_file).unwrap();
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
             assert!(
                 stat.map_or(true, |s| s.contains(") Z ")),
                 "the launcher's child outlived the attempt"
             );
+            true
         }
 
         #[test]

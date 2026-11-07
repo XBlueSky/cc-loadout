@@ -36,8 +36,10 @@ pub struct ProcRef {
 
 /// The process table, as far as one attempt's supervision may see and touch it.
 pub trait ProcOps {
-    /// Every live (not zombie) process of the tree being watched.
-    fn descendants(&self) -> Vec<ProcRef>;
+    /// Every live (not zombie) process of the tree being watched, or an error
+    /// when the process table cannot be read: then nothing is known, and the
+    /// supervision never takes it for an empty tree.
+    fn descendants(&self) -> io::Result<Vec<ProcRef>>;
     /// Send `sig` to `p`, but only if `p.pid` is still the process that started
     /// at `p.start_time`.
     fn signal(&self, p: ProcRef, sig: Sig);
@@ -119,6 +121,10 @@ pub struct Supervised {
 /// Then a SIGKILL to the group (only while the launcher is unreaped, so its pid
 /// is still its own) and to each process still there, and up to `verify` to see
 /// them gone. What is still alive after that is the residual.
+///
+/// "The tree is empty" is never taken from one look at the process table (see
+/// [`tree_empty`]), and a table that cannot be read is never empty: the
+/// clean-up then runs its full course and ends as a residual.
 pub fn supervise(
     l: &mut dyn Launcher,
     ops: &dyn ProcOps,
@@ -148,7 +154,7 @@ pub fn supervise(
 
     let settled = if ended_by_itself {
         settle(&mut w, ops, pid, cfg.grace, cfg.poll) || {
-            for p in ops.descendants() {
+            for p in listed(ops) {
                 ops.signal(p, Sig::Term);
             }
             settle(&mut w, ops, pid, cfg.term_settle, cfg.poll)
@@ -162,13 +168,13 @@ pub fn supervise(
         if !w.gone() {
             ops.signal_group(pid, Sig::Kill);
         }
-        for p in ops.descendants() {
+        for p in listed(ops) {
             ops.signal(p, Sig::Kill);
         }
         settle(&mut w, ops, pid, cfg.verify, cfg.poll);
     }
 
-    let residual_count = ops.descendants().len();
+    let residual_count = residual_count(ops);
     observed.residual = residual_count > 0;
     let observation = match w.end {
         Some(Some(status)) => status
@@ -221,7 +227,7 @@ fn settle(
     loop {
         let launcher_gone = w.gone();
         ops.reap_orphans(pid);
-        if launcher_gone && ops.descendants().is_empty() {
+        if launcher_gone && tree_empty(ops) {
             return true;
         }
         let elapsed = start.elapsed();
@@ -229,6 +235,35 @@ fn settle(
             return false;
         }
         std::thread::sleep(poll.min(within - elapsed));
+    }
+}
+
+/// What one look at the table lists, or nothing when it cannot be read (there is
+/// nothing to signal then).
+fn listed(ops: &dyn ProcOps) -> Vec<ProcRef> {
+    ops.descendants().unwrap_or_default()
+}
+
+fn one_scan_empty(ops: &dyn ProcOps) -> bool {
+    matches!(ops.descendants(), Ok(v) if v.is_empty())
+}
+
+/// Whether the tree is gone, by two looks in a row. `/proc` is read one entry
+/// at a time, so one look can miss a live process: its entry, read first, names
+/// a parent whose entry is read later, when that parent has already been reaped
+/// and the process moved to its new parent. The second look finds it there.
+fn tree_empty(ops: &dyn ProcOps) -> bool {
+    one_scan_empty(ops) && one_scan_empty(ops)
+}
+
+/// How many processes are left at the end. An empty look is confirmed by a
+/// second one, as in [`tree_empty`]; an unreadable table counts as one
+/// process, since it cannot be shown to be none.
+fn residual_count(ops: &dyn ProcOps) -> usize {
+    match ops.descendants() {
+        Ok(v) if !v.is_empty() => v.len(),
+        Ok(_) => ops.descendants().map_or(1, |v| v.len()),
+        Err(_) => 1,
     }
 }
 
@@ -243,11 +278,11 @@ enum Root {
     /// Everything below this process, which is the subreaper of the attempt:
     /// orphans of the launcher's tree come back to it and are reaped here.
     Own(i32),
-    /// The launcher and what descends from it, for a caller that shares its
-    /// process with others (the unit tests) and must not touch their children:
+    /// The launcher and what descends from it, for the unit tests, which share
+    /// their process with each other and must not touch other tests' children:
     /// no orphan is reaped, and once the launcher is reaped (or its pid is
     /// someone else's) nothing is seen, because its orphans went elsewhere.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Launcher(ProcRef),
 }
 
@@ -271,9 +306,9 @@ impl LinuxProcOps {
         }
     }
 
-    /// Only launcher `pid` and its descendants. Call it while `pid` is
-    /// unreaped, so the start time read now is the launcher's.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Only launcher `pid` and its descendants (tests only). Call it while `pid`
+    /// is unreaped, so the start time read now is the launcher's.
+    #[cfg(test)]
     pub fn launcher_subtree(pid: i32) -> Self {
         let start_time = stat_of(pid).map_or(0, |e| e.start_time);
         LinuxProcOps {
@@ -281,13 +316,19 @@ impl LinuxProcOps {
         }
     }
 
-    fn table() -> Vec<Entry> {
-        let Ok(dir) = std::fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-        dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<i32>().ok())
-            .filter_map(stat_of)
-            .collect()
+    /// Every process entry of `/proc`. A directory that cannot be listed is an
+    /// error; an entry that is gone by the time its `stat` is read is not (the
+    /// process ended in between).
+    fn table() -> io::Result<Vec<Entry>> {
+        let mut table = Vec::new();
+        for e in std::fs::read_dir("/proc")? {
+            let e = e?;
+            let pid = e.file_name().to_str().and_then(|n| n.parse::<i32>().ok());
+            if let Some(entry) = pid.and_then(stat_of) {
+                table.push(entry);
+            }
+        }
+        Ok(table)
     }
 }
 
@@ -310,17 +351,18 @@ fn is_dead(state: char) -> bool {
 
 #[cfg(target_os = "linux")]
 impl ProcOps for LinuxProcOps {
-    fn descendants(&self) -> Vec<ProcRef> {
-        let table = Self::table();
+    fn descendants(&self) -> io::Result<Vec<ProcRef>> {
+        let table = Self::table()?;
         let mut found = Vec::new();
         let mut frontier = match self.root {
             Root::Own(me) => vec![me],
+            #[cfg(test)]
             Root::Launcher(r) => {
                 let Some(e) = table.iter().find(|e| e.pid == r.pid) else {
-                    return found;
+                    return Ok(found);
                 };
                 if e.start_time != r.start_time {
-                    return found;
+                    return Ok(found);
                 }
                 if !is_dead(e.state) {
                     found.push(r);
@@ -342,7 +384,7 @@ impl ProcOps for LinuxProcOps {
                 }
             }
         }
-        found
+        Ok(found)
     }
 
     fn signal(&self, p: ProcRef, sig: Sig) {
@@ -360,10 +402,16 @@ impl ProcOps for LinuxProcOps {
     }
 
     fn reap_orphans(&self, except_pid: i32) {
-        let Root::Own(me) = self.root else {
+        // Only the subreaper's own tree has orphans of its own to reap.
+        let own = match self.root {
+            Root::Own(me) => Some(me),
+            #[cfg(test)]
+            Root::Launcher(_) => None,
+        };
+        let Some(me) = own else {
             return;
         };
-        for e in Self::table() {
+        for e in Self::table().unwrap_or_default() {
             if e.ppid == me && e.state == 'Z' && e.pid != except_pid {
                 let _ = crate::util::sys::reap_nohang(e.pid);
             }
@@ -456,6 +504,12 @@ mod tests {
         sent: Vec<(Duration, Sent)>,
         /// The launcher's handle fails every wait, as if someone else reaped it.
         wait_fails: bool,
+        /// Every other look at the table (the 1st, 3rd, …) misses `D`, as a
+        /// `/proc` scan that raced a reparenting does.
+        flicker: bool,
+        /// The table cannot be read at all.
+        unreadable: bool,
+        scans: u32,
     }
 
     type Shared = Rc<RefCell<World>>;
@@ -482,6 +536,9 @@ mod tests {
                 .collect(),
             sent: Vec::new(),
             wait_fails: false,
+            flicker: false,
+            unreadable: false,
+            scans: 0,
         }))
     }
 
@@ -512,14 +569,19 @@ mod tests {
     struct FakeOps(Shared);
 
     impl ProcOps for FakeOps {
-        fn descendants(&self) -> Vec<ProcRef> {
+        fn descendants(&self) -> io::Result<Vec<ProcRef>> {
             let now = Instant::now();
-            let w = self.0.borrow();
-            w.procs
+            let mut w = self.0.borrow_mut();
+            if w.unreadable {
+                return Err(io::Error::from_raw_os_error(13)); // EACCES
+            }
+            let miss_d = w.flicker && w.scans % 2 == 0;
+            w.scans += 1;
+            Ok(w.procs
                 .iter()
-                .filter(|p| p.alive(now))
+                .filter(|p| p.alive(now) && !(miss_d && p.r.pid == D))
                 .map(|p| p.r)
-                .collect()
+                .collect())
         }
 
         fn signal(&self, r: ProcRef, sig: Sig) {
@@ -802,9 +864,71 @@ mod tests {
     }
 
     #[test]
-    fn signals_are_only_sent_to_the_process_that_was_listed() {
-        // A leftover whose pid was reused between the listing and the signal
-        // gets nothing; the supervision does not care which, the fake checks it.
+    fn a_descendant_one_scan_misses_does_not_end_the_clean_up_early() {
+        // It ends by itself at 300 ms. The first look at the table misses it:
+        // taken alone, that look would end the clean-up at once.
+        let c = SuperviseCfg {
+            grace: ms(2000),
+            ..cfg()
+        };
+        let w = world(&[(L, Ends::At(0), 0), (D, Ends::At(300), 0)]);
+        w.borrow_mut().flicker = true;
+        let r = run_world(&w, &c, None);
+        assert!(r.took >= ms(300), "the clean-up ended early: {:?}", r.took);
+        assert_eq!(r.sent, []);
+        assert_eq!(r.got.residual_count, 0);
+        assert_eq!(r.got.observation, Observation::Exited(0));
+    }
+
+    #[test]
+    fn a_descendant_one_scan_misses_is_still_residual() {
+        let c = cfg();
+        let w = world(&[(L, Ends::At(0), 0), (D, Ends::Never, 0)]);
+        w.borrow_mut().flicker = true;
+        let r = run_world(&w, &c, None);
+        assert_eq!(r.got.residual_count, 1);
+        assert!(r.got.observed.residual);
+        assert!(
+            r.took >= c.grace + c.term_settle + c.verify,
+            "took {:?}",
+            r.took
+        );
+    }
+
+    #[test]
+    fn an_unreadable_process_table_is_never_a_clean_tree() {
+        // Nothing can be shown to be gone: the clean-up runs its full course and
+        // the attempt ends with a residual, whatever the launcher did.
+        let c = cfg();
+        let w = world(&[(L, Ends::At(0), 0)]);
+        w.borrow_mut().unreadable = true;
+        let r = run_world(&w, &c, None);
+        assert_eq!(r.got.observation, Observation::Exited(0));
+        assert_eq!(r.got.residual_count, 1);
+        assert_eq!(
+            r.got.observed,
+            Observed {
+                residual: true,
+                ..calm()
+            }
+        );
+        assert!(
+            r.took >= c.grace + c.term_settle + c.verify,
+            "took {:?}",
+            r.took
+        );
+        assert!(
+            r.took <= c.grace + c.term_settle + c.verify + ms(300),
+            "took {:?}",
+            r.took
+        );
+        assert_eq!(r.sent, [], "nothing was listed, so nothing was signalled");
+    }
+
+    #[test]
+    fn the_fake_drops_a_signal_to_a_pid_with_another_start_time() {
+        // Keeps the fake honest about what the real `signal` does (proven on a
+        // real process in `linux_proc_signal_checks_the_start_time`).
         let w = world(&[(L, Ends::At(0), 0)]);
         let ops = FakeOps(w.clone());
         ops.signal(
@@ -845,6 +969,55 @@ mod tests {
         assert!(matches!(state, 'R' | 'S' | 'D'), "{state}");
         assert_eq!(ppid as u32, std::os::unix::process::parent_id());
         assert!(start_time > 0);
+    }
+
+    /// A `sleep` this test started itself, killed and reaped however the test
+    /// ends.
+    #[cfg(target_os = "linux")]
+    struct OwnSleep(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnSleep {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_proc_signal_checks_the_start_time() {
+        // Only this test's own child is ever signalled, and only through its
+        // own subtree: never a pid this test did not start.
+        let child =
+            crate::util::retry_etxtbsy(|| std::process::Command::new("sleep").arg("30").spawn())
+                .unwrap();
+        let mut own = OwnSleep(child);
+        let pid = Launcher::pid(&own.0);
+        let ops = LinuxProcOps::launcher_subtree(pid);
+        let listed = ops.descendants().unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        let me = listed[0];
+        assert_eq!(me.pid, pid);
+
+        // The same pid with another start time is another process: nothing.
+        ops.signal(
+            ProcRef {
+                pid,
+                start_time: me.start_time + 1,
+            },
+            Sig::Kill,
+        );
+        std::thread::sleep(ms(200));
+        assert!(
+            own.0.try_wait().unwrap().is_none(),
+            "a mismatched ref was signalled"
+        );
+
+        // The ref as listed: it goes.
+        ops.signal(me, Sig::Kill);
+        let status = own.0.wait().unwrap();
+        assert_eq!(status.signal(), Some(9));
     }
 
     #[test]
