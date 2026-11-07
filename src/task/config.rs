@@ -128,7 +128,8 @@ impl CollectorSettings {
         }
         if !is_collector_id(&self.runner_instance_id) {
             bail!(
-                "invalid collector runner_instance_id: expected 1-200 characters of                  letters, digits, '_', '.', ':' or '-', starting with a letter or digit"
+                "invalid collector runner_instance_id: expected 1-200 characters of \
+                 letters, digits, '_', '.', ':' or '-', starting with a letter or digit"
             );
         }
         Ok(())
@@ -812,5 +813,14 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_bad_runner_instance_id_message_reads_with_single_spaces() {
+        let mut s = collector_settings();
+        s.runner_instance_id = "-r".into();
+        let msg = s.validate().unwrap_err().to_string();
+        assert!(!msg.contains("  "), "stray spaces in {msg:?}");
+        assert!(msg.contains("characters of letters, digits"), "{msg:?}");
     }
 }
