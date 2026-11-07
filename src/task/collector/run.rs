@@ -999,17 +999,24 @@ mod tests {
     mod launched {
         use super::*;
         use crate::account::creds;
+        use crate::task::collector::outcome::STDOUT_CAP_BYTES;
+        use crate::task::collector::test_support::KillGrandchild;
 
         fn digest() -> String {
             format!("sha256:{}", "a".repeat(64))
         }
 
-        /// A shell command that prints a valid outcome line.
-        fn print_outcome() -> String {
+        /// The JSON object of a valid outcome line, without its newline.
+        fn outcome_json() -> String {
             format!(
-                "printf '%s\\n' '{{\"schema\":\"geralt.launch-outcome\",\"version\":1,\"requestedModel\":\"m1\",\"effectiveModel\":\"m2\",\"effectivePolicyDigest\":\"{}\"}}'",
+                "{{\"schema\":\"geralt.launch-outcome\",\"version\":1,\"requestedModel\":\"m1\",\"effectiveModel\":\"m2\",\"effectivePolicyDigest\":\"{}\"}}",
                 digest()
             )
+        }
+
+        /// A shell command that prints a valid outcome line.
+        fn print_outcome() -> String {
+            format!("printf '%s\\n' '{}'", outcome_json())
         }
 
         /// A shell command that records argv (one word per line) and the config
@@ -1079,10 +1086,11 @@ mod tests {
                 ]
             );
 
-            // The launcher got this attempt's and this session's names, the
-            // contract argv, and no config dir (the live account).
+            // The launcher got this attempt's and this session's names and the
+            // contract argv.
             let dumped = std::fs::read_to_string(&dump).unwrap();
-            let words: Vec<&str> = dumped.lines().collect();
+            let mut words: Vec<&str> = dumped.lines().collect();
+            let cfg_line = words.pop().unwrap();
             let main_ts = fx.root().join("repo/src/launcher/main.ts");
             assert_eq!(
                 words,
@@ -1097,8 +1105,22 @@ mod tests {
                     attempt.as_str(),
                     "--session-id",
                     rec["sessionId"].as_str().unwrap(),
-                    "cfg=unset",
                 ]
+            );
+
+            // The live account runs in the user's own config dir: the runner leaves
+            // CLAUDE_CONFIG_DIR exactly as it inherited it, whatever that is, and
+            // never points it at an isolated dir under the fixture. (The messages
+            // carry no values: the variable belongs to the machine running the test.)
+            let inherited = std::env::var_os("CLAUDE_CONFIG_DIR")
+                .map_or_else(|| "unset".to_string(), |v| v.to_string_lossy().into_owned());
+            assert!(
+                cfg_line == format!("cfg={inherited}"),
+                "the live account must leave CLAUDE_CONFIG_DIR as inherited"
+            );
+            assert!(
+                !cfg_line.contains(fx.root().to_str().unwrap()),
+                "the live account must not run in an isolated config dir"
             );
         }
 
@@ -1174,6 +1196,17 @@ mod tests {
 
         #[test]
         fn stdout_that_is_not_one_valid_outcome_line_gives_no_models() {
+            // The oversized case is only a test of the `stdout_truncated` guard if
+            // the kept prefix would parse by itself: a valid line with no newline,
+            // padded with spaces (which JSON allows after a value) to the cap. Prove
+            // that premise here, so the case cannot pass for the wrong reason.
+            let mut prefix = outcome_json().into_bytes();
+            prefix.resize(STDOUT_CAP_BYTES, b' ');
+            assert!(
+                parse_outcome_line(&prefix).is_some(),
+                "the first {STDOUT_CAP_BYTES} bytes of the oversized case must parse alone"
+            );
+
             let cases: [(&str, String); 3] = [
                 ("garbage", "echo 'not json'".to_string()),
                 (
@@ -1181,9 +1214,13 @@ mod tests {
                     format!("{}\necho 'and more'", print_outcome()),
                 ),
                 (
-                    // The line is there but the output is over the 4096 byte cap.
-                    "an oversized output",
-                    format!("{}\nhead -c 8000 /dev/zero | tr '\\0' x", print_outcome()),
+                    // The valid line plus 8000 bytes of padding run past the cap, and
+                    // the kept prefix parses, so only the guard can reject it.
+                    "an oversized output whose first 4096 bytes parse",
+                    format!(
+                        "printf '%s' '{}'\nhead -c 8000 /dev/zero | tr '\\0' ' '",
+                        outcome_json()
+                    ),
                 ),
             ];
             for (name, script) in cases {
@@ -1206,10 +1243,19 @@ mod tests {
             assert_eq!(code, 0);
             let (_, rec) = only_export(&fx);
             assert_eq!(rec["status"], "exited_ok");
-            // Two zero-filled "lines" of stderr are counted, never printed.
-            assert!(
-                lines.iter().any(|l| l.contains("launcher_stderr_dropped")),
-                "{lines:?}"
+            // The megabyte of zeros on stderr has no newline, so it is one line, and
+            // that line is counted, never printed: the log is exactly the start, the
+            // one drop count, and the record.
+            let attempt = attempt_of(&rec);
+            assert_eq!(
+                lines,
+                [
+                    format!("cc-loadout-collector attempt_started attempt={attempt}"),
+                    format!("cc-loadout-collector launcher_stderr_dropped attempt={attempt} lines=1"),
+                    format!(
+                        "cc-loadout-collector attempt_recorded attempt={attempt} status=exited_ok safe_error=none"
+                    ),
+                ]
             );
             let body =
                 std::fs::read_to_string(fx.export_dir.join(export_file_name(&attempt_of(&rec), 1)))
@@ -1355,24 +1401,6 @@ mod tests {
 
             assert_eq!(std::fs::read(&tasks_file).unwrap(), tasks_before);
             assert_eq!(std::fs::read(fx.store.state_path()).unwrap(), state_before);
-        }
-
-        /// Kills the grandchild whose pid the stand-in wrote to `pid_file`, when
-        /// dropped, so a failing test leaves nothing running.
-        struct KillGrandchild(PathBuf);
-
-        impl Drop for KillGrandchild {
-            fn drop(&mut self) {
-                if let Ok(pid) = std::fs::read_to_string(&self.0) {
-                    let pid = pid.trim();
-                    if !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) {
-                        let _ = std::process::Command::new("sh")
-                            .arg("-c")
-                            .arg(format!("kill {pid}"))
-                            .status();
-                    }
-                }
-            }
         }
 
         #[test]

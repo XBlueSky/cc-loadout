@@ -65,7 +65,11 @@ pub fn launcher_command(
 }
 
 /// What was kept of the launcher's output.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is written by hand: `stdout` is the launcher's raw output, which is
+/// never printed, so a failed assertion or a stray `{:?}` shows sizes and flags
+/// only.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Captured {
     /// The first [`STDOUT_CAP_BYTES`] of stdout.
     pub stdout: Vec<u8>,
@@ -73,6 +77,16 @@ pub struct Captured {
     pub stdout_truncated: bool,
     /// Stderr lines that were counted but not forwarded.
     pub stderr_dropped: usize,
+}
+
+impl std::fmt::Debug for Captured {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Captured")
+            .field("stdout_len", &self.stdout.len())
+            .field("stdout_truncated", &self.stdout_truncated)
+            .field("stderr_dropped", &self.stderr_dropped)
+            .finish()
+    }
 }
 
 /// Both pipes of a started launcher, each drained by its own detached thread.
@@ -279,6 +293,8 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    use crate::task::collector::test_support::KillGrandchild;
 
     fn settings() -> CollectorSettings {
         CollectorSettings {
@@ -541,29 +557,47 @@ mod tests {
 
     #[test]
     fn finish_does_not_wait_for_a_grandchild_that_holds_the_pipes() {
-        // The shell prints its grandchild's pid and exits; the grandchild keeps
-        // stdout and stderr open for a while. `finish` must give up on it.
-        let mut child = sh("sleep 30 & echo $!");
+        // The shell writes its grandchild's pid to a file and exits; the
+        // grandchild keeps stdout and stderr open for a while. `finish` must give
+        // up on it. The pid goes to a file, not to the captured stdout, so the
+        // grandchild is stopped even if the pumps under test are what is broken.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("grandchild.pid");
+        let _cleanup = KillGrandchild(pid_file.clone());
+        let mut child = sh(&format!("sleep 30 &\necho $! > '{}'", pid_file.display()));
         let pumps = OutputPumps::start(&mut child.0, "att-test");
         wait(&mut child);
         let start = std::time::Instant::now();
         let got = pumps.finish(Duration::from_millis(200));
         let waited = start.elapsed();
 
-        // Stop the grandchild before judging, so a failed assertion leaves no
-        // process behind.
-        let pid = String::from_utf8_lossy(&got.stdout).trim().to_string();
-        if pid.bytes().all(|b| b.is_ascii_digit()) && !pid.is_empty() {
-            let _ = Command::new("sh")
-                .arg("-c")
-                .arg(format!("kill {pid}"))
-                .status();
-        }
-        assert!(!pid.is_empty(), "the shell printed no pid");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(
+            !pid.trim().is_empty() && pid.trim().bytes().all(|b| b.is_ascii_digit()),
+            "the shell wrote no pid"
+        );
+        assert!(got.stdout.is_empty(), "the shell printed to stdout");
         assert!(
             waited >= Duration::from_millis(150) && waited < Duration::from_secs(10),
             "finish took {waited:?}"
         );
+    }
+
+    #[test]
+    fn captured_debug_shows_sizes_and_flags_never_the_bytes() {
+        let captured = Captured {
+            stdout: b"SECRET-STDOUT-MARKER".to_vec(),
+            stdout_truncated: true,
+            stderr_dropped: 3,
+        };
+        for shown in [format!("{captured:?}"), format!("{captured:#?}")] {
+            assert!(!shown.contains("SECRET"), "{shown}");
+            // Neither as text nor as the list of byte values a derived Debug prints.
+            assert!(!shown.contains("83, 69, 67"), "{shown}");
+            assert!(shown.contains("stdout_len: 20"), "{shown}");
+            assert!(shown.contains("stdout_truncated: true"), "{shown}");
+            assert!(shown.contains("stderr_dropped: 3"), "{shown}");
+        }
     }
 
     #[test]

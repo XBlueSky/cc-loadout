@@ -7,3 +7,5 @@ pub mod launch;
 pub mod log;
 pub mod outcome;
 pub mod run;
+#[cfg(test)]
+mod test_support;
