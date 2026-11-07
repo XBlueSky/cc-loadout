@@ -813,6 +813,20 @@ impl App {
                     rx: job.rx,
                 });
             }
+            Action::RunTask(id)
+                if self
+                    .snap
+                    .tasks
+                    .iter()
+                    .any(|r| r.id == id && r.kind == crate::task::config::Kind::Collector) =>
+            {
+                // A collector runs only as its own `task run` process, which
+                // becomes a subreaper and installs a term handler; the TUI must
+                // do neither, so it refuses instead of running it here.
+                self.set_toast(format!(
+                    "'{id}' is a collector task; run it with `cc-loadout task run {id}`"
+                ));
+            }
             Action::RunTask(id) => {
                 let store = self.ctx.store.clone();
                 let data_root = self.ctx.data_root.clone();
@@ -3006,9 +3020,6 @@ mod tests {
     /// snapshot has at least one task row. Returns the TempDirs (to keep them
     /// alive), a seeded task id, and the App.
     fn app_with_task(initial_tab: usize) -> (tempfile::TempDir, tempfile::TempDir, String, App) {
-        let hdir = tempfile::tempdir().unwrap();
-        let ddir = tempfile::tempdir().unwrap();
-
         // Write a minimal tasks.json with one real task.
         let tasks_json = serde_json::json!({
             "version": 1,
@@ -3020,6 +3031,44 @@ mod tests {
                 }
             }
         });
+        app_with_tasks_json(initial_tab, &tasks_json, "test-task")
+    }
+
+    /// Like [`app_with_task`], but the one seeded task is a collector.
+    fn app_with_collector_task(
+        initial_tab: usize,
+    ) -> (tempfile::TempDir, tempfile::TempDir, String, App) {
+        let tasks_json = serde_json::json!({
+            "version": 2,
+            "collector": {
+                "node": "/usr/bin/node",
+                "geralt_repo": "/srv/geralt",
+                "export_dir": "/var/lib/geralt/export",
+                "runner_instance_id": "runner-1"
+            },
+            "tasks": {
+                "geralt-collect": {
+                    "kind": "collector",
+                    "account": "work",
+                    "times": ["07:00"],
+                    "collector": {
+                        "launcher_config": "/etc/geralt/launcher.json",
+                        "wall_timeout_secs": 3600,
+                        "grace_ms": 5000
+                    }
+                }
+            }
+        });
+        app_with_tasks_json(initial_tab, &tasks_json, "geralt-collect")
+    }
+
+    fn app_with_tasks_json(
+        initial_tab: usize,
+        tasks_json: &serde_json::Value,
+        id: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, String, App) {
+        let hdir = tempfile::tempdir().unwrap();
+        let ddir = tempfile::tempdir().unwrap();
         std::fs::write(
             ddir.path().join("tasks.json"),
             serde_json::to_vec_pretty(&tasks_json).unwrap(),
@@ -3036,7 +3085,41 @@ mod tests {
             cwd: hdir.path().to_path_buf(),
         };
         let app = App::new(ctx, initial_tab).unwrap();
-        (hdir, ddir, "test-task".to_string(), app)
+        (hdir, ddir, id.to_string(), app)
+    }
+
+    /// 'r' on a collector row must not run it in the TUI: a collector runs only
+    /// through `cc-loadout task run <id>` (its own process, its own subreaper
+    /// and term handler). No job is spawned and a toast names the entry point.
+    #[test]
+    fn tasks_tab_r_on_a_collector_row_refuses_without_a_job() {
+        let (_h, d, id, mut app) = app_with_collector_task(crate::tui::TAB_TASKS);
+        let tasks_before = std::fs::read(d.path().join("tasks.json")).unwrap();
+        app.handle_key(key(KeyCode::Char('r'))).unwrap();
+        assert!(
+            app.job.is_none(),
+            "'r' on a collector row must not spawn a run job"
+        );
+        let toast = app.toast.clone().unwrap_or_default();
+        assert!(
+            toast.contains(&format!("cc-loadout task run {id}")),
+            "the toast must name `cc-loadout task run {id}`, got {toast:?}"
+        );
+        assert_eq!(
+            std::fs::read(d.path().join("tasks.json")).unwrap(),
+            tasks_before,
+            "tasks.json must be unchanged"
+        );
+    }
+
+    /// The same 'r' on a normal task row still spawns the run job.
+    #[test]
+    fn tasks_tab_r_on_a_normal_row_spawns_a_job() {
+        let (_h, _d, _id, mut app) = app_with_task(crate::tui::TAB_TASKS);
+        app.handle_key(key(KeyCode::Char('r'))).unwrap();
+        assert!(app.job.is_some(), "'r' on a task row must spawn a run job");
+        // Let the job finish so it does not outlive the temp dirs.
+        let _ = app.job.as_ref().unwrap().rx.recv();
     }
 
     /// Switching to TAB_TASKS (index 4) works and the tab is correctly registered.

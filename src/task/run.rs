@@ -57,6 +57,12 @@ pub(crate) fn run_task_with(
         .ok_or_else(|| anyhow::anyhow!("unknown task '{id}'"))?
         .clone();
     def.validate()?;
+    // A collector runs only through its launcher (`task run` dispatches it to
+    // `task::collector`), never as a plain `claude -p`: refuse it here before
+    // any spawn, credentials handling or state write.
+    if def.kind == config::Kind::Collector {
+        bail!("task '{id}' is a collector task; run it with `cc-loadout task run {id}`");
+    }
 
     let state = store.load_state()?;
     if !state.accounts.contains_key(&def.account) {
@@ -642,6 +648,102 @@ mod tests {
             std::fs::read_to_string(cwd.path().join("env-dump")).unwrap(),
             "",
             "a scheduled task must NOT export CORTEX_SKIP_RECORD"
+        );
+    }
+
+    #[test]
+    fn a_collector_def_is_refused_on_the_normal_run_path() {
+        // A collector runs only through `cc-loadout task run <id>` and its
+        // launcher (contract §1). The normal path must refuse it before any
+        // claude spawn and without writing tasks.json or state.
+        use crate::account::store::{AccountMeta, Store};
+        use crate::task::config::{self, CollectorTask, Kind, TaskDef};
+        use std::os::unix::fs::PermissionsExt;
+
+        let data = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+
+        let marker = bin.path().join("spawned");
+        let claude = bin.path().join("claude");
+        std::fs::write(
+            &claude,
+            format!("#!/bin/sh\n: > '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let store = Store::new(data.path());
+        store.ensure_account_dir("work").unwrap();
+        let mut st = store.load_state().unwrap();
+        st.accounts.insert(
+            "work".into(),
+            AccountMeta {
+                email: "a@b".into(),
+                ..Default::default()
+            },
+        );
+        st.active_alias = Some("work".into());
+        store.save_state(&st).unwrap();
+
+        let tp = config::tasks_path(data.path());
+        let mut tasks = config::Tasks::default();
+        tasks.tasks.insert(
+            "geralt-collect".into(),
+            TaskDef {
+                kind: Kind::Collector,
+                account: "work".into(),
+                times: vec!["07:00".into()],
+                prompt: None,
+                cwd: None,
+                profile: None,
+                model: None,
+                collector: Some(CollectorTask {
+                    launcher_config: PathBuf::from("/etc/geralt/launcher.json"),
+                    wall_timeout_secs: 3600,
+                    grace_ms: 5000,
+                }),
+                last_session_id: None,
+                last_config_dir: None,
+                last_run: None,
+                last_status: None,
+            },
+        );
+        config::save(&tp, &tasks).unwrap();
+        let tasks_before = std::fs::read(&tp).unwrap();
+        let state_before = std::fs::read(store.state_path()).unwrap();
+
+        let live_plugins = home.path().join(".claude").join("plugins");
+        std::fs::create_dir_all(&live_plugins).unwrap();
+
+        let err = run_task_with(
+            &claude,
+            &store,
+            data.path(),
+            home.path(),
+            &live_plugins,
+            "geralt-collect",
+            1700,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cc-loadout task run geralt-collect"),
+            "the refusal must name the collector entry point: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "claude must not be spawned for a collector"
+        );
+        assert_eq!(
+            std::fs::read(&tp).unwrap(),
+            tasks_before,
+            "tasks.json must be unchanged"
+        );
+        assert_eq!(
+            std::fs::read(store.state_path()).unwrap(),
+            state_before,
+            "state must be unchanged"
         );
     }
 }
