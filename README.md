@@ -375,9 +375,17 @@ launcher terminate_grace  >=  Claude Code's shutdown window (about 500 ms)
 model fields of the record; it is never printed. Of its stderr, only lines
 starting with `geralt-launcher ` (at most 4096 bytes each, 64 KiB in total) are
 forwarded to cc-loadout's stderr. cc-loadout's own lines are fixed-code,
-`cc-loadout-collector <code> k=v ...`, with an attempt id, a status or an integer
-as the only values. With the usual cron redirect, that is all that reaches
-`prime.log`; the model's output never does.
+`cc-loadout-collector <code> k=v ...`. The only values are an attempt id, an
+integer, or a word from a closed list: `status=` is one of the statuses below;
+`safe_error=` is `none` or one of `assemble_failed`, `auth_required`,
+`cli_version_mismatch`, `config_invalid`, `control_protocol_error`,
+`launcher_error`, `lock_busy`, `preflight_failed`, `process_tree_residual`,
+`runtime_mismatch`, `session_error`, `spawn_enoent`, `spawn_failed`, `turn_limit`
+(the record's `safeErrorCode` words); `reason=` (on `prelaunch_failed`) is one of
+`invalid_task_id`, `unknown_task`, `invalid_task`, `unknown_account`,
+`state_unreadable`, `isolated_dir`, `unsupported_platform`, `lock_io`. With the
+usual cron redirect, that is all that reaches `prime.log`; the model's output
+never does.
 
 **Export directory.** One file per attempt, `<attemptId>.<recordRevision>.json`
 (revision always 1; cc-loadout writes no corrections), at most 16 KiB, 16 fixed
@@ -398,9 +406,11 @@ unreadable state, no spawn) is `launch_failed`.
   `.`-prefixed temporary file a crash left behind (the reporter ignores it, and
   nothing removes it). A directory that only grows is re-sent in full whenever
   the reporter restarts: safe, because the server is idempotent, but not free.
-- If cc-loadout cannot even tell where to write (`tasks.json` unreadable, no or
-  invalid collector settings, a task id outside the grammar), it writes no record
-  and exits 1 with one fixed-code line on stderr.
+- If cc-loadout cannot even tell where to write (no or invalid collector
+  settings, a task id outside the grammar), it writes no record and exits 1 with
+  one fixed-code line on stderr. If `tasks.json` itself cannot be read, the kind
+  of the task is unknown and the run falls through to the ordinary task path,
+  which prints its usual `error: ...` line instead; there is no record either.
 
 **What it leaves alone.** A collector run never writes `tasks.json` (no
 `last_run`, `last_status` or `last_session_id`) and never updates `last_primed`
