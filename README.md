@@ -369,7 +369,14 @@ launcher terminate_grace  >=  Claude Code's shutdown window (about 500 ms)
 - Anything that survives the SIGKILL is a residual: the record carries
   `process_tree_residual` (with `timed_out`, `killed` or `exited_ok`; after a
   launcher `exited_error` the residual is only logged). If `/proc` cannot be
-  read, the tree is treated as not clean rather than as empty.
+  read or does not show cc-loadout itself, the tree is treated as not clean
+  rather than as empty.
+- The tree is scanned every 50 ms for the whole run, not only during the
+  clean-up, so a long run costs a small, steady amount of CPU.
+- A SIGTERM or SIGINT that arrives before cc-loadout has installed its handler
+  (while it is still reading settings, taking the lock, reading state or
+  preparing an isolated config dir) ends cc-loadout with the default action: no
+  export is written for that attempt and nothing false is recorded.
 
 **Output.** The launcher's stdout is read (first 4096 bytes) and parsed for the
 model fields of the record; it is never printed. Of its stderr, only lines
@@ -415,7 +422,9 @@ unreadable state, no spawn) is `launch_failed`.
 **What it leaves alone.** A collector run never writes `tasks.json` (no
 `last_run`, `last_status` or `last_session_id`) and never updates `last_primed`
 in `state.json`; the export is the only record. `task resume` refuses a collector
-task. Rotated credentials of an isolated account are still written back. A
+task, and so does the plain task path: a collector never runs as `claude -p`. The
+TUI lists collector tasks but refuses `r` on them (run one with `cc-loadout task
+run <id>`). Rotated credentials of an isolated account are still written back. A
 `tasks.json` that has collector settings or a collector task is saved as
 `"version": 2`, so an older cc-loadout fails fast instead of silently dropping
 the new keys; a file that never used a collector stays version 1, byte for byte.
