@@ -1,7 +1,6 @@
 //! Unified scheduled-run subsystem: prime (ping) and task (real prompt) share
 //! one store (`tasks.json`), one execution engine, and one crontab block.
 
-#[allow(dead_code)] // wired in by the collector run path (Task 3)
 pub mod collector;
 pub mod config;
 pub mod exec;

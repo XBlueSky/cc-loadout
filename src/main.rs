@@ -1025,6 +1025,26 @@ fn run() -> Result<()> {
                         }
                         TaskAction::List { json } => task::ops::list(&data_root, json)?,
                         TaskAction::Run { id, quiet } => {
+                            // A collector run takes its own path: it never blocks on
+                            // the lock and records every attempt as an export file.
+                            // If tasks.json cannot be loaded the kind is unknown, so
+                            // fall through: `run_task` hits the same load error and
+                            // reports it exactly as it always has.
+                            if let Ok(tasks) =
+                                task::config::load(&task::config::tasks_path(&data_root))
+                            {
+                                if task::collector::run::routes_to_collector(&tasks, &id) {
+                                    let ctx = task::collector::run::RunCtx {
+                                        store: &store,
+                                        data_root: &data_root,
+                                        home: &home,
+                                        live_plugins: &live_plugins,
+                                    };
+                                    std::process::exit(task::collector::run::run_collector(
+                                        &ctx, &tasks, &id,
+                                    ));
+                                }
+                            }
                             let out = task::run::run_task(
                                 &store,
                                 &data_root,
