@@ -68,7 +68,6 @@ pub enum LogLine<'a> {
         code: Option<SafeErrorCode>,
     },
     /// Processes of the launcher's tree were still alive after the attempt.
-    #[allow(dead_code)] // emitted by the supervision code of Task 5
     Residual { attempt: &'a str, count: usize },
     /// Launcher stderr lines were counted but not forwarded.
     StderrDropped { attempt: &'a str, lines: usize },

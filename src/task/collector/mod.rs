@@ -9,3 +9,4 @@ pub mod outcome;
 pub mod run;
 #[cfg(test)]
 mod test_support;
+pub mod tree;

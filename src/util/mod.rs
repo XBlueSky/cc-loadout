@@ -1,8 +1,20 @@
-//! Shared utilities: atomic file writes and exclusive file locks.
+//! Shared utilities: atomic file writes, exclusive file locks, and (on Linux)
+//! the system calls of the collector's process-tree supervision.
 
 pub mod atomicfile;
 pub mod jsonmerge;
 pub mod lock;
+#[cfg(target_os = "linux")]
+pub mod sys;
+
+/// A signal the collector's supervision sends. Defined here rather than in
+/// [`sys`] because the supervision itself is platform-independent code that
+/// names signals on every platform; only sending one is Linux-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sig {
+    Term,
+    Kill,
+}
 
 use std::path::PathBuf;
 

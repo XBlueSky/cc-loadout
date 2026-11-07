@@ -7,6 +7,7 @@
 //! alone.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -19,6 +20,7 @@ use crate::task::collector::export::{
 use crate::task::collector::launch::{launcher_command, Captured, OutputPumps, CLOSE_WAIT_MS};
 use crate::task::collector::log::{LogLine, PrelaunchReason};
 use crate::task::collector::outcome::{classify, parse_outcome_line, Observation, Observed};
+use crate::task::collector::tree::{supervise, ProcOps, SuperviseCfg};
 use crate::task::config::{is_collector_id, CollectorSettings, CollectorTask, Kind, Tasks};
 use crate::task::run::{run_location, RunLocation};
 use crate::task::sandbox;
@@ -48,7 +50,47 @@ pub fn routes_to_collector(tasks: &Tasks, id: &str) -> bool {
 /// already been written as an export record or a runner-log line by the time
 /// this returns.
 pub fn run_collector(ctx: &RunCtx<'_>, tasks: &Tasks, id: &str) -> i32 {
-    run_with_log(ctx, tasks, id, &mut |line| line.emit())
+    #[cfg(target_os = "linux")]
+    let host: Option<&dyn Host> = Some(&ProcessHost);
+    #[cfg(not(target_os = "linux"))]
+    let host: Option<&dyn Host> = None;
+    run_with_log(ctx, tasks, id, host, &mut |line| line.emit())
+}
+
+/// What step 8 needs from the process it runs in. The runner's own process
+/// ([`ProcessHost`]) becomes the subreaper of the launcher's tree and turns a
+/// SIGTERM or SIGINT into a manual kill; a process that runs other things too
+/// (the unit tests) can do neither and supplies its own. Without a host, as on
+/// every platform but Linux, a collector run cannot be supervised and is not
+/// started.
+trait Host {
+    /// Prepare this process to supervise a launcher; called just before the
+    /// spawn. An error means no launcher is started (`spawn_failed`). Returns the
+    /// flag a manual kill sets.
+    fn arm(&self) -> std::io::Result<&AtomicBool>;
+    /// The process tree to watch and clean up for the launcher `pid`, which is
+    /// started and not yet reaped.
+    fn tree(&self, pid: i32) -> Box<dyn ProcOps>;
+    /// The time limits for `task`.
+    fn timing(&self, task: &CollectorTask) -> SuperviseCfg {
+        SuperviseCfg::for_task(task)
+    }
+}
+
+/// The runner's own process: everything below it is the attempt's tree.
+#[cfg(target_os = "linux")]
+struct ProcessHost;
+
+#[cfg(target_os = "linux")]
+impl Host for ProcessHost {
+    fn arm(&self) -> std::io::Result<&AtomicBool> {
+        crate::util::sys::become_child_subreaper()?;
+        crate::util::sys::install_term_flag()
+    }
+
+    fn tree(&self, _pid: i32) -> Box<dyn ProcOps> {
+        Box::new(crate::task::collector::tree::LinuxProcOps::own())
+    }
 }
 
 /// What `launch_and_watch` needs from the steps before it.
@@ -64,12 +106,14 @@ struct Launch<'a> {
     cfg_dir: Option<PathBuf>,
 }
 
-/// [`run_collector`] with the runner-log sink made explicit, so tests can read
-/// the lines instead of the process's stderr.
+/// [`run_collector`] with the supervising host and the runner-log sink made
+/// explicit, so tests can supply a host that is safe in a shared process and
+/// read the lines instead of the process's stderr.
 fn run_with_log(
     ctx: &RunCtx<'_>,
     tasks: &Tasks,
     id: &str,
+    host: Option<&dyn Host>,
     log: &mut dyn FnMut(&LogLine<'_>),
 ) -> i32 {
     // 1. Without valid machine-wide settings there is no export directory and
@@ -132,10 +176,11 @@ fn run_with_log(
         Err(_) => return launch_failed(PrelaunchReason::LockIo, log),
     };
 
-    // 6. The process-tree supervision of a collector run is Linux-only.
-    if cfg!(not(target_os = "linux")) {
+    // 6. The process-tree supervision of a collector run is Linux-only: no
+    //    other platform has a host for it.
+    let Some(host) = host else {
         return launch_failed(PrelaunchReason::UnsupportedPlatform, log);
-    }
+    };
     let task = match (&def.collector, def.kind == Kind::Collector, def.validate()) {
         (Some(task), true, Ok(())) => task,
         _ => return launch_failed(PrelaunchReason::InvalidTask, log),
@@ -162,6 +207,7 @@ fn run_with_log(
     // 8. Start the launcher and watch it.
     let record = launch_and_watch(
         ctx,
+        host,
         &Launch {
             task_id: id,
             settings,
@@ -182,10 +228,11 @@ fn run_with_log(
 /// describe how it ended.
 fn launch_and_watch(
     ctx: &RunCtx<'_>,
+    host: &dyn Host,
     launch: &Launch<'_>,
     log: &mut dyn FnMut(&LogLine<'_>),
 ) -> ExportRecord {
-    let watched = watch_launcher(launch, log);
+    let watched = watch_launcher(host, launch, log);
 
     // Rotated credentials are token state, not attempt state: keep them however
     // the attempt went.
@@ -229,13 +276,30 @@ struct Watched {
     ended: OffsetDateTime,
 }
 
-/// Start the launcher and wait for it to end.
-///
-/// This is the whole of the supervision for now: it waits for the launcher and
-/// does nothing about its descendants or its running time, so `seen` is always
-/// empty. The process-tree supervision of Task 5 replaces the wait and fills `seen`.
-fn watch_launcher(launch: &Launch<'_>, log: &mut dyn FnMut(&LogLine<'_>)) -> Watched {
+/// Start the launcher and supervise it and its process tree until the attempt
+/// is over: its own end, the task's wall timeout or a manual kill, then the
+/// clean-up of whatever it left behind (see [`supervise`]).
+fn watch_launcher(
+    host: &dyn Host,
+    launch: &Launch<'_>,
+    log: &mut dyn FnMut(&LogLine<'_>),
+) -> Watched {
     let started = OffsetDateTime::now_utc();
+    let not_started = |observation| Watched {
+        observation,
+        seen: Observed::default(),
+        captured: Captured {
+            stdout: Vec::new(),
+            stdout_truncated: false,
+            stderr_dropped: 0,
+        },
+        started,
+        ended: started,
+    };
+    // A launcher this process could not hold on to is not started at all.
+    let Ok(term) = host.arm() else {
+        return not_started(Observation::SpawnError { enoent: false });
+    };
     let spawned = crate::util::retry_etxtbsy(|| {
         launcher_command(
             launch.settings,
@@ -249,32 +313,24 @@ fn watch_launcher(launch: &Launch<'_>, log: &mut dyn FnMut(&LogLine<'_>)) -> Wat
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            return Watched {
-                observation: Observation::SpawnError {
-                    enoent: e.kind() == std::io::ErrorKind::NotFound,
-                },
-                seen: Observed::default(),
-                captured: Captured {
-                    stdout: Vec::new(),
-                    stdout_truncated: false,
-                    stderr_dropped: 0,
-                },
-                started,
-                ended: started,
-            };
+            return not_started(Observation::SpawnError {
+                enoent: e.kind() == std::io::ErrorKind::NotFound,
+            });
         }
     };
+    let tree = host.tree(crate::task::collector::tree::Launcher::pid(&child));
     let pumps = OutputPumps::start(&mut child, launch.attempt);
     log(&LogLine::Started {
         attempt: launch.attempt,
     });
 
-    let observation = match child.wait() {
-        Ok(status) => status
-            .code()
-            .map_or(Observation::Signaled, Observation::Exited),
-        Err(_) => Observation::NotReaped,
-    };
+    let supervised = supervise(&mut child, &*tree, term, &host.timing(launch.task));
+    if supervised.residual_count > 0 {
+        log(&LogLine::Residual {
+            attempt: launch.attempt,
+            count: supervised.residual_count,
+        });
+    }
     let captured = pumps.finish(Duration::from_millis(CLOSE_WAIT_MS));
     if captured.stderr_dropped > 0 {
         log(&LogLine::StderrDropped {
@@ -283,8 +339,8 @@ fn watch_launcher(launch: &Launch<'_>, log: &mut dyn FnMut(&LogLine<'_>)) -> Wat
         });
     }
     Watched {
-        observation,
-        seen: Observed::default(),
+        observation: supervised.observation,
+        seen: supervised.observed,
         captured,
         // Never earlier than the start, even if the wall clock stepped back.
         ended: OffsetDateTime::now_utc().max(started),
@@ -454,9 +510,22 @@ mod tests {
             t
         }
 
+        /// Run on the default [`TestHost`] (on Linux; elsewhere there is none).
         fn run(&self, tasks: &Tasks, id: &str) -> (i32, Vec<String>) {
+            #[cfg(target_os = "linux")]
+            let host = TestHost::default();
+            #[cfg(target_os = "linux")]
+            let host: Option<&dyn Host> = Some(&host);
+            #[cfg(not(target_os = "linux"))]
+            let host: Option<&dyn Host> = None;
+            self.run_on(tasks, id, host)
+        }
+
+        fn run_on(&self, tasks: &Tasks, id: &str, host: Option<&dyn Host>) -> (i32, Vec<String>) {
             let mut lines = Vec::new();
-            let code = run_with_log(&self.ctx(), tasks, id, &mut |l| lines.push(l.render()));
+            let code = run_with_log(&self.ctx(), tasks, id, host, &mut |l| {
+                lines.push(l.render())
+            });
             (code, lines)
         }
 
@@ -489,6 +558,83 @@ mod tests {
             v.sort_by(|a, b| a.0.cmp(&b.0));
             v
         }
+    }
+
+    /// The host of every unit test that may reach step 8.
+    ///
+    /// The test binary is one process whose tests run in parallel threads, so
+    /// this host never makes it a subreaper and never installs a signal handler;
+    /// the manual-kill flag is its own. It watches only the launcher's subtree and
+    /// reaps no orphan: a tree rooted at this process would hold every other
+    /// test's children, which must not be signalled or have their exit status
+    /// taken. Its limits are short so the tests stay fast.
+    #[cfg(target_os = "linux")]
+    struct TestHost {
+        term: AtomicBool,
+        cfg: SuperviseCfg,
+        /// `arm` fails, as a failed `prctl` would.
+        arm_fails: bool,
+        /// Watch a made-up tree with one process that never goes, instead of
+        /// the launcher's real one.
+        ghost: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Default for TestHost {
+        fn default() -> Self {
+            TestHost {
+                term: AtomicBool::new(false),
+                cfg: SuperviseCfg {
+                    wall: Duration::from_secs(60),
+                    grace: Duration::from_millis(500),
+                    poll: Duration::from_millis(10),
+                    term_settle: Duration::from_millis(200),
+                    verify: Duration::from_millis(1000),
+                },
+                arm_fails: false,
+                ghost: false,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Host for TestHost {
+        fn arm(&self) -> std::io::Result<&AtomicBool> {
+            if self.arm_fails {
+                return Err(std::io::Error::from_raw_os_error(1)); // EPERM
+            }
+            Ok(&self.term)
+        }
+
+        fn tree(&self, pid: i32) -> Box<dyn ProcOps> {
+            if self.ghost {
+                Box::new(GhostTree)
+            } else {
+                Box::new(crate::task::collector::tree::LinuxProcOps::launcher_subtree(pid))
+            }
+        }
+
+        fn timing(&self, _task: &CollectorTask) -> SuperviseCfg {
+            self.cfg
+        }
+    }
+
+    /// A tree with one process that outlives everything and that no signal
+    /// reaches; it signals nothing real.
+    #[cfg(target_os = "linux")]
+    struct GhostTree;
+
+    #[cfg(target_os = "linux")]
+    impl ProcOps for GhostTree {
+        fn descendants(&self) -> Vec<crate::task::collector::tree::ProcRef> {
+            vec![crate::task::collector::tree::ProcRef {
+                pid: i32::MAX,
+                start_time: 0,
+            }]
+        }
+        fn signal(&self, _: crate::task::collector::tree::ProcRef, _: crate::util::Sig) {}
+        fn signal_group(&self, _: i32, _: crate::util::Sig) {}
+        fn reap_orphans(&self, _: i32) {}
     }
 
     fn collector_def(account: &str) -> TaskDef {
@@ -575,6 +721,25 @@ mod tests {
         // the missing section is reported.
         assert!(routes_to_collector(&no_section, "c"));
         assert!(!routes_to_collector(&Tasks::default(), "anything"));
+    }
+
+    #[test]
+    fn without_a_host_the_run_is_unsupported_platform_and_starts_nothing() {
+        // What every platform but Linux gets: no host can supervise the tree.
+        let fx = Fx::new();
+        fx.write_state(Some("work"), &["work"]);
+        let tasks = fx.tasks(vec![("weekly", collector_def("work"))]);
+        let (code, lines) = fx.run_on(&tasks, "weekly", None);
+        assert_eq!(code, 1);
+        let (_, rec) = only_export(&fx);
+        assert_not_launched(&rec, "launch_failed", None);
+        assert_eq!(
+            lines,
+            [format!(
+                "cc-loadout-collector prelaunch_failed attempt={} reason=unsupported_platform",
+                attempt_of(&rec)
+            )]
+        );
     }
 
     #[test]
@@ -1401,6 +1566,141 @@ mod tests {
 
             assert_eq!(std::fs::read(&tasks_file).unwrap(), tasks_before);
             assert_eq!(std::fs::read(fx.store.state_path()).unwrap(), state_before);
+        }
+
+        /// Wait (up to 10 s) for the stand-in to write `pid_file`: it has set
+        /// its traps and started its child, so a signal from now on finds it
+        /// ready.
+        fn wait_for_file(pid_file: &Path) {
+            let until = std::time::Instant::now() + Duration::from_secs(10);
+            while !pid_file.exists() && std::time::Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[test]
+        fn a_launcher_past_its_wall_timeout_is_timed_out_and_its_group_stopped() {
+            let (fx, tasks) = live_fx();
+            let pid_file = fx.root().join("child.pid");
+            let _cleanup = KillGrandchild(pid_file.clone());
+            fx.write_node(&format!(
+                "sleep 30 &\necho $! > '{}'\nwait",
+                pid_file.display()
+            ));
+            let host = TestHost {
+                cfg: SuperviseCfg {
+                    wall: Duration::from_millis(300),
+                    ..TestHost::default().cfg
+                },
+                ..TestHost::default()
+            };
+            let start = std::time::Instant::now();
+            let (code, lines) = fx.run_on(&tasks, "weekly", Some(&host));
+            let took = start.elapsed();
+            assert_eq!(code, 1);
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "timed_out");
+            assert_eq!(rec["safeErrorCode"], Value::Null);
+            // The shell died of the group's SIGTERM: no exit code.
+            assert_eq!(rec["exitCode"], Value::Null);
+            assert!(took >= Duration::from_millis(300), "took {took:?}");
+            assert!(took < Duration::from_secs(5), "took {took:?}");
+            assert!(lines.last().unwrap().contains("status=timed_out"));
+            // The child was in the launcher's group and went with it.
+            let pid = std::fs::read_to_string(&pid_file).unwrap();
+            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+            assert!(
+                stat.map_or(true, |s| s.contains(") Z ")),
+                "the launcher's child outlived the attempt"
+            );
+        }
+
+        #[test]
+        fn a_manual_kill_stops_the_launcher_and_is_recorded_as_killed() {
+            let (fx, tasks) = live_fx();
+            let pid_file = fx.root().join("child.pid");
+            let _cleanup = KillGrandchild(pid_file.clone());
+            // On SIGTERM it ends with 30, as the Geralt launcher does.
+            fx.write_node(&format!(
+                "trap 'exit 30' TERM\nsleep 30 &\necho $! > '{}'\nwait",
+                pid_file.display()
+            ));
+            let host = TestHost::default();
+            let (code, _) = std::thread::scope(|s| {
+                s.spawn(|| {
+                    wait_for_file(&pid_file);
+                    host.term.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                fx.run_on(&tasks, "weekly", Some(&host))
+            });
+            assert_eq!(code, 1);
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "killed");
+            assert_eq!(rec["safeErrorCode"], Value::Null);
+            assert_eq!(rec["exitCode"], 30);
+        }
+
+        #[test]
+        fn a_failed_subreaper_setup_starts_nothing_and_is_spawn_failed() {
+            let (fx, tasks) = live_fx();
+            let marker = fx.root().join("ran");
+            fx.write_node(&format!("touch '{}'\nexit 0", marker.display()));
+            let host = TestHost {
+                arm_fails: true,
+                ..TestHost::default()
+            };
+            let (code, lines) = fx.run_on(&tasks, "weekly", Some(&host));
+            assert_eq!(code, 1);
+            assert!(!marker.exists(), "the launcher must not be started");
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "launch_failed");
+            assert_eq!(rec["safeErrorCode"], "spawn_failed");
+            assert_eq!(rec["exitCode"], Value::Null);
+            assert_eq!(rec["startedAt"], rec["endedAt"]);
+            assert_eq!(
+                lines,
+                [format!(
+                    "cc-loadout-collector attempt_recorded attempt={} status=launch_failed safe_error=spawn_failed",
+                    attempt_of(&rec)
+                )]
+            );
+        }
+
+        #[test]
+        fn a_tree_that_outlives_the_attempt_is_a_residual_record_and_log_line() {
+            let (fx, tasks) = live_fx();
+            fx.write_node("exit 0");
+            let host = TestHost {
+                ghost: true,
+                cfg: SuperviseCfg {
+                    grace: Duration::from_millis(50),
+                    term_settle: Duration::from_millis(50),
+                    verify: Duration::from_millis(50),
+                    ..TestHost::default().cfg
+                },
+                ..TestHost::default()
+            };
+            let (code, lines) = fx.run_on(&tasks, "weekly", Some(&host));
+            assert_eq!(code, 1, "a leftover process is visible in cron's exit");
+            let (_, rec) = only_export(&fx);
+            assert_launched(&rec);
+            assert_eq!(rec["status"], "exited_ok");
+            assert_eq!(rec["safeErrorCode"], "process_tree_residual");
+            assert_eq!(rec["exitCode"], 0);
+            let attempt = attempt_of(&rec);
+            assert_eq!(
+                lines,
+                [
+                    format!("cc-loadout-collector attempt_started attempt={attempt}"),
+                    format!("cc-loadout-collector tree_residual attempt={attempt} count=1"),
+                    format!(
+                        "cc-loadout-collector attempt_recorded attempt={attempt} status=exited_ok safe_error=process_tree_residual"
+                    ),
+                ]
+            );
         }
 
         #[test]
