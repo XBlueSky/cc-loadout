@@ -349,42 +349,58 @@ fn is_dead(state: char) -> bool {
     matches!(state, 'Z' | 'X' | 'x')
 }
 
+/// The live processes below `root` in one read of the process table: the pure
+/// half of [`LinuxProcOps::descendants`], apart so it can be checked on a
+/// table made up in a test.
 #[cfg(target_os = "linux")]
-impl ProcOps for LinuxProcOps {
-    fn descendants(&self) -> io::Result<Vec<ProcRef>> {
-        let table = Self::table()?;
-        let mut found = Vec::new();
-        let mut frontier = match self.root {
-            Root::Own(me) => vec![me],
-            #[cfg(test)]
-            Root::Launcher(r) => {
-                let Some(e) = table.iter().find(|e| e.pid == r.pid) else {
-                    return Ok(found);
-                };
-                if e.start_time != r.start_time {
-                    return Ok(found);
-                }
-                if !is_dead(e.state) {
-                    found.push(r);
-                }
-                vec![r.pid]
+fn descendants_in(table: &[Entry], root: &Root) -> io::Result<Vec<ProcRef>> {
+    let mut found = Vec::new();
+    let mut frontier = match *root {
+        Root::Own(me) => {
+            // We are alive while we look, so a /proc that does not list us is
+            // not one that can show the tree is gone: an error, never empty.
+            if !table.iter().any(|e| e.pid == me) {
+                return Err(io::Error::other(
+                    "the process table does not list this process",
+                ));
             }
-        };
-        let mut seen: std::collections::HashSet<i32> = frontier.iter().copied().collect();
-        while let Some(parent) = frontier.pop() {
-            for e in table.iter().filter(|e| e.ppid == parent) {
-                if seen.insert(e.pid) {
-                    frontier.push(e.pid);
-                    if !is_dead(e.state) {
-                        found.push(ProcRef {
-                            pid: e.pid,
-                            start_time: e.start_time,
-                        });
-                    }
+            vec![me]
+        }
+        #[cfg(test)]
+        Root::Launcher(r) => {
+            let Some(e) = table.iter().find(|e| e.pid == r.pid) else {
+                return Ok(found);
+            };
+            if e.start_time != r.start_time {
+                return Ok(found);
+            }
+            if !is_dead(e.state) {
+                found.push(r);
+            }
+            vec![r.pid]
+        }
+    };
+    let mut seen: std::collections::HashSet<i32> = frontier.iter().copied().collect();
+    while let Some(parent) = frontier.pop() {
+        for e in table.iter().filter(|e| e.ppid == parent) {
+            if seen.insert(e.pid) {
+                frontier.push(e.pid);
+                if !is_dead(e.state) {
+                    found.push(ProcRef {
+                        pid: e.pid,
+                        start_time: e.start_time,
+                    });
                 }
             }
         }
-        Ok(found)
+    }
+    Ok(found)
+}
+
+#[cfg(target_os = "linux")]
+impl ProcOps for LinuxProcOps {
+    fn descendants(&self) -> io::Result<Vec<ProcRef>> {
+        descendants_in(&Self::table()?, &self.root)
     }
 
     fn signal(&self, p: ProcRef, sig: Sig) {
@@ -1037,5 +1053,62 @@ mod tests {
                 verify: ms(5000),
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn entry(pid: i32, ppid: i32) -> Entry {
+        Entry {
+            pid,
+            state: 'S',
+            ppid,
+            start_time: 100 + pid as u64,
+        }
+    }
+
+    /// The real [`descendants_in`] over a table made up here, so the check
+    /// never reads this process's `/proc`.
+    #[cfg(target_os = "linux")]
+    struct TableOps(Vec<Entry>, Root);
+
+    #[cfg(target_os = "linux")]
+    impl ProcOps for TableOps {
+        fn descendants(&self) -> io::Result<Vec<ProcRef>> {
+            descendants_in(&self.0, &self.1)
+        }
+        fn signal(&self, _: ProcRef, _: Sig) {}
+        fn signal_group(&self, _: i32, _: Sig) {}
+        fn reap_orphans(&self, _: i32) {}
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_table_with_our_own_entry_lists_what_is_below_us() {
+        let ops = TableOps(
+            vec![entry(1, 0), entry(L, 1), entry(D, L), entry(D + 1, 1)],
+            Root::Own(L),
+        );
+        let got = ops.descendants().unwrap();
+        assert_eq!(
+            got,
+            vec![ProcRef {
+                pid: D,
+                start_time: 100 + D as u64
+            }]
+        );
+        assert_eq!(residual_count(&ops), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_table_without_our_own_entry_is_not_a_clean_tree() {
+        // We are alive while we look, so a correct /proc always lists us; a
+        // table that does not is not one that can show the tree is gone.
+        let ops = TableOps(vec![entry(1, 0), entry(D + 1, 1)], Root::Own(L));
+        assert!(
+            ops.descendants().is_err(),
+            "a table without our own entry must be an error, not an empty tree"
+        );
+        assert!(!tree_empty(&ops));
+        assert_eq!(residual_count(&ops), 1);
     }
 }
